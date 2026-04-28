@@ -149,6 +149,44 @@ def allocate_start_port(conn, node_id: str, count: int) -> int:
     return start_port
 
 
+def allocate_port_range_via_table(conn, *, node_id: str, job_id: str, count: int) -> tuple[int, int]:
+    """Reserve a port range via ``node_port_allocations`` and return (start, end).
+
+    Locks the node's allocation rows with FOR UPDATE so concurrent callers serialize.
+    The caller MUST already have an INSERT'd row in ``jobs`` for ``job_id``
+    (FK constraint requires it). The returned range is also written into
+    ``node_port_allocations`` with status='reserved' inside the same transaction.
+    """
+    if count <= 0:
+        raise ValueError("count must be positive")
+    cfg = get_config()
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            select coalesce(max(end_port), 0) as max_end
+            from node_port_allocations
+            where node_id = %s and status = 'reserved'
+            for update
+            """,
+            (node_id,),
+        )
+        row = cur.fetchone()
+        max_end = int((row or {}).get("max_end") or 0)
+        start_port = max(cfg.start_port_min, max_end + 1)
+        end_port = start_port + count - 1
+        if end_port > cfg.start_port_max:
+            raise RuntimeError("capacity_not_available")
+        cur.execute(
+            """
+            insert into node_port_allocations
+              (job_id, node_id, start_port, end_port, proxy_count, status)
+            values (%s, %s, %s, %s, %s, 'reserved')
+            """,
+            (job_id, node_id, start_port, end_port, count),
+        )
+    return start_port, end_port
+
+
 def normalize_proxy_items(items: list[dict[str, Any]]) -> list[str]:
     lines: list[str] = []
     for item in items:
