@@ -918,3 +918,15 @@ This document was finalized on 2026-04-28 after agreement on:
 - 4 GB / 2 CPU node hardware constraints
 
 Implementation starts with Wave B-0 prompt to be issued separately.
+
+---
+
+## Known issues from Wave B-2 (deferred to later Waves)
+
+| # | Issue | Where | Defer to |
+|---|---|---|---|
+| 1 | `deficit = target - available` без учёта queued/running → может cause overshoot если генерация медленная | `orchestrator/refill.py:_get_sku_projection` | Wave B-7 (watchdog скорректирует) |
+| 2 | RefillService.run_once() — все enqueue в одной транзакции; exception на N-м SKU откатывает 1..N-1 | `orchestrator/refill.py:run_once` | Wave B-7 (per-SKU commit) |
+| 3 | `bulk_insert_inventory_pending` через executemany — N round-trips к БД, медленно на batch=1500 | `orchestrator/jobs.py:bulk_insert_inventory_pending` | Wave B-5 (perf, переход на execute_values/COPY) |
+| 4 | `bulk_insert` и `mark_success` — отдельные транзакции; при сбое между ними inventory pending + job running | `orchestrator/worker.py:process_refill_job` | Wave B-7 (watchdog подхватит stuck running) |
+
