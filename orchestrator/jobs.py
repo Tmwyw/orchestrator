@@ -152,21 +152,28 @@ def allocate_start_port(conn, node_id: str, count: int) -> int:
 def allocate_port_range_via_table(conn, *, node_id: str, job_id: str, count: int) -> tuple[int, int]:
     """Reserve a port range via ``node_port_allocations`` and return (start, end).
 
-    Locks the node's allocation rows with FOR UPDATE so concurrent callers serialize.
-    The caller MUST already have an INSERT'd row in ``jobs`` for ``job_id``
-    (FK constraint requires it). The returned range is also written into
-    ``node_port_allocations`` with status='reserved' inside the same transaction.
+    Concurrent callers on the same node are serialized by a transaction-scoped
+    advisory lock (``pg_advisory_xact_lock`` keyed on ``node_ports:{node_id}``);
+    the lock auto-releases on commit/rollback. ``FOR UPDATE`` cannot be combined
+    with the ``MAX(...)`` aggregate, so we use the same advisory-lock pattern as
+    :func:`allocate_start_port`. The caller MUST already have an INSERT'd row in
+    ``jobs`` for ``job_id`` (FK constraint requires it). The returned range is
+    also written into ``node_port_allocations`` with status='reserved' inside
+    the same transaction.
     """
     if count <= 0:
         raise ValueError("count must be positive")
     cfg = get_config()
     with conn.cursor() as cur:
         cur.execute(
+            "select pg_advisory_xact_lock(hashtext(%s))",
+            (f"node_ports:{node_id}",),
+        )
+        cur.execute(
             """
             select coalesce(max(end_port), 0) as max_end
             from node_port_allocations
             where node_id = %s and status = 'reserved'
-            for update
             """,
             (node_id,),
         )
