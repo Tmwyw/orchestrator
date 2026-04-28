@@ -53,6 +53,10 @@ class Config:
     validation_batch_size: int
     validation_concurrency: int
     validation_poll_interval_sec: int
+    redis_url: str
+    reservation_default_ttl_sec: int
+    reservation_min_ttl_sec: int
+    reservation_max_ttl_sec: int
 
 
 def get_config() -> Config:
@@ -74,4 +78,8 @@ def get_config() -> Config:
         validation_batch_size=_int_env("VALIDATION_BATCH_SIZE", 50),
         validation_concurrency=_int_env("VALIDATION_CONCURRENCY", 20),
         validation_poll_interval_sec=_int_env("VALIDATION_POLL_INTERVAL_SEC", 5),
+        redis_url=os.getenv("REDIS_URL", "redis://127.0.0.1:6379/0").strip(),
+        reservation_default_ttl_sec=_int_env("RESERVATION_DEFAULT_TTL_SEC", 300),
+        reservation_min_ttl_sec=_int_env("RESERVATION_MIN_TTL_SEC", 30),
+        reservation_max_ttl_sec=_int_env("RESERVATION_MAX_TTL_SEC", 3600),
     )
