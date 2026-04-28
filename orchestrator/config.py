@@ -50,6 +50,9 @@ class Config:
     refill_default_priority: int
     refill_max_skus_per_cycle: int
     proxy_allow_degraded_nodes: bool
+    validation_batch_size: int
+    validation_concurrency: int
+    validation_poll_interval_sec: int
 
 
 def get_config() -> Config:
@@ -68,4 +71,7 @@ def get_config() -> Config:
         refill_default_priority=_int_env("REFILL_DEFAULT_PRIORITY", 10),
         refill_max_skus_per_cycle=_int_env("REFILL_MAX_SKUS_PER_CYCLE", 100),
         proxy_allow_degraded_nodes=_bool_env("PROXY_ALLOW_DEGRADED_NODES", False),
+        validation_batch_size=_int_env("VALIDATION_BATCH_SIZE", 50),
+        validation_concurrency=_int_env("VALIDATION_CONCURRENCY", 20),
+        validation_poll_interval_sec=_int_env("VALIDATION_POLL_INTERVAL_SEC", 5),
     )
