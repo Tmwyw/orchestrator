@@ -921,7 +921,7 @@ Implementation starts with Wave B-0 prompt to be issued separately.
 
 ---
 
-## Known issues from Wave B-2/B-3/B-4a (deferred to later Waves)
+## Known issues from Wave B-2/B-3/B-4a/B-5b (deferred to later Waves)
 
 | # | Issue | Where | Defer to |
 |---|---|---|---|
@@ -934,4 +934,5 @@ Implementation starts with Wave B-0 prompt to be issued separately.
 | 7 | reserve не атомарен: _sync_claim_per_node_with_rollback (commit) → _sync_insert_order (commit) — 2 transactions, race возможен | `orchestrator/allocator.py:reserve` | Wave B-7 (watchdog cleanup expired_reservations) |
 | 8 | `commit` expires_at check идёт в Python; SQL UPDATE не валидирует expires_at | `orchestrator/allocator.py:commit` | Wave B-7 (watchdog) |
 | 9 | MagicMock на приватных _sync_* методах в test_allocator.py — pragmatic unit testing | `tests/test_allocator.py` | Wave B-5 (real DB integration tests) |
+| 10 | `FOR UPDATE` with aggregate (MAX) in allocate_port_range_via_table → psycopg FeatureNotSupported | `orchestrator/jobs.py` | **FIXED in Wave B-5b** via pg_advisory_xact_lock |
 
