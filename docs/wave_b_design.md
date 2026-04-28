@@ -921,7 +921,7 @@ Implementation starts with Wave B-0 prompt to be issued separately.
 
 ---
 
-## Known issues from Wave B-2/B-3 (deferred to later Waves)
+## Known issues from Wave B-2/B-3/B-4a (deferred to later Waves)
 
 | # | Issue | Where | Defer to |
 |---|---|---|---|
@@ -931,4 +931,7 @@ Implementation starts with Wave B-0 prompt to be issued separately.
 | 4 | `bulk_insert` и `mark_success` — отдельные транзакции; при сбое между ними inventory pending + job running | `orchestrator/worker.py:process_refill_job` | Wave B-7 (watchdog подхватит stuck running) |
 | 5 | `verify=False` в `_probe_http_proxy` отключает SSL verify | `orchestrator/validation.py:128` | Wave B-7 (config flag `validation_strict_ssl`) |
 | 6 | Двойная конверсия `b"...".decode("ascii").encode("idna")` — косметика | `orchestrator/validation.py:176` | косметика, можно фиксить попутно |
+| 7 | reserve не атомарен: _sync_claim_per_node_with_rollback (commit) → _sync_insert_order (commit) — 2 transactions, race возможен | `orchestrator/allocator.py:reserve` | Wave B-7 (watchdog cleanup expired_reservations) |
+| 8 | `commit` expires_at check идёт в Python; SQL UPDATE не валидирует expires_at | `orchestrator/allocator.py:commit` | Wave B-7 (watchdog) |
+| 9 | MagicMock на приватных _sync_* методах в test_allocator.py — pragmatic unit testing | `tests/test_allocator.py` | Wave B-5 (real DB integration tests) |
 
