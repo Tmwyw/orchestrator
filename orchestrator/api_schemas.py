@@ -6,7 +6,7 @@ from datetime import datetime
 from decimal import Decimal
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from orchestrator.schemas import OrderStatus
 
@@ -94,6 +94,44 @@ class OrderResponse(BaseModel):
     released_at: datetime | None = None
     proxies_expires_at: datetime | None = None
     price_amount: Decimal | None = None
+
+
+# === /v1/orders/{ref}/extend ===
+
+
+class ExtendRequest(BaseModel):
+    model_config = _API_MODEL_CONFIG
+
+    duration_days: int = Field(ge=1, le=365)
+    inventory_ids: list[int] | None = Field(default=None, max_length=50_000)
+    geo_code: str | None = Field(default=None, min_length=2, max_length=8)
+
+    @model_validator(mode="after")
+    def _check_selectors_mutually_exclusive(self) -> ExtendRequest:
+        if self.inventory_ids is not None and self.geo_code is not None:
+            raise ValueError("inventory_ids and geo_code are mutually exclusive")
+        return self
+
+
+class ExtendResponse(BaseModel):
+    model_config = _API_MODEL_CONFIG
+
+    success: bool = True
+    order_ref: str
+    extended_count: int
+    new_proxies_expires_at: datetime
+
+
+# === /v1/orders/{ref}/proxies ===
+
+
+class ProxiesErrorResponse(BaseModel):
+    model_config = _API_MODEL_CONFIG
+
+    success: bool = False
+    error: str
+    locked_format: str | None = None
+    detail: str | None = None
 
 
 # === Generic error (RFC 7807-style) ===
