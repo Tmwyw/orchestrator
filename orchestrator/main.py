@@ -1,3 +1,4 @@
+import asyncio
 import json
 import logging
 import uuid
@@ -8,6 +9,17 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse
 from psycopg.types.json import Jsonb
 
+from orchestrator.allocator import AllocatorService
+from orchestrator.api_schemas import (
+    CommitRequest,
+    CommitResponse,
+    OrderResponse,
+    ProblemResponse,
+    ReleaseResponse,
+    ReserveErrorResponse,
+    ReserveRequest,
+    ReserveResponse,
+)
 from orchestrator.config import get_config
 from orchestrator.db import connect, fetch_all, fetch_one
 from orchestrator.jobs import log_job_event, node_health_diagnostics, node_health_ready, public_job
@@ -28,6 +40,8 @@ app = FastAPI(
 ALLOWED_PRODUCTS = {"android_ipv6_only", "smoke"}
 ALLOWED_JOB_FIELDS = {"count", "product", "idempotency_key"}
 ALLOWED_NODE_FIELDS = {"id", "name", "url", "geo", "capacity", "api_key", "force"}
+
+_allocator = AllocatorService()
 
 
 def require_api_key(x_netrun_api_key: str | None = Header(default=None)) -> None:
@@ -281,3 +295,88 @@ def download_proxies(job_id: str):
     if not path.exists():
         return error_response(404, "proxies_list_not_found")
     return FileResponse(path, media_type="text/plain", filename="proxies.list")
+
+
+# === /v1/orders endpoints (Wave B-4a) ===
+
+
+@app.post("/v1/orders/reserve", dependencies=[Depends(require_api_key)])
+async def reserve_order(payload: ReserveRequest):
+    result = await _allocator.reserve(
+        user_id=payload.user_id,
+        sku_id=payload.sku_id,
+        quantity=payload.quantity,
+        reservation_ttl_sec=payload.reservation_ttl_sec,
+        idempotency_key=payload.idempotency_key,
+    )
+    if not result.success:
+        status_code = 409 if result.error == "insufficient_stock" else 400
+        return JSONResponse(
+            status_code=status_code,
+            content=ReserveErrorResponse(
+                error=result.error or "unknown",
+                available_now=result.available_now,
+            ).model_dump(exclude_none=True, mode="json"),
+        )
+    assert result.order_ref is not None and result.expires_at is not None
+    return JSONResponse(
+        content=ReserveResponse(
+            order_ref=result.order_ref,
+            expires_at=result.expires_at,
+            proxies_count=result.proxies_count,
+            proxies_url=f"/v1/orders/{result.order_ref}/proxies",
+        ).model_dump(mode="json"),
+    )
+
+
+@app.post("/v1/orders/{order_ref}/commit", dependencies=[Depends(require_api_key)])
+async def commit_order(order_ref: str, payload: CommitRequest):
+    result = await _allocator.commit(order_ref=order_ref, duration_days=payload.duration_days)
+    if not result.success:
+        status_code = 404 if result.error == "order_not_found" else 409
+        return JSONResponse(
+            status_code=status_code,
+            content=ProblemResponse(error=result.error or "unknown").model_dump(
+                exclude_none=True, mode="json"
+            ),
+        )
+    assert result.proxies_expires_at is not None
+    return JSONResponse(
+        content=CommitResponse(
+            order_ref=result.order_ref,
+            status=result.status,
+            proxies_expires_at=result.proxies_expires_at,
+            proxies_url=f"/v1/orders/{result.order_ref}/proxies",
+        ).model_dump(mode="json"),
+    )
+
+
+@app.post("/v1/orders/{order_ref}/release", dependencies=[Depends(require_api_key)])
+async def release_order(order_ref: str):
+    result = await _allocator.release(order_ref=order_ref)
+    if not result.success:
+        status_code = 404 if result.error == "order_not_found" else 409
+        return JSONResponse(
+            status_code=status_code,
+            content=ProblemResponse(error=result.error or "unknown").model_dump(
+                exclude_none=True, mode="json"
+            ),
+        )
+    return JSONResponse(
+        content=ReleaseResponse(
+            order_ref=result.order_ref,
+            status=result.status,
+            released_count=result.released_count,
+        ).model_dump(mode="json"),
+    )
+
+
+@app.get("/v1/orders/{order_ref}", dependencies=[Depends(require_api_key)])
+async def get_order(order_ref: str):
+    order = await asyncio.to_thread(_allocator._sync_get_order, order_ref)
+    if not order:
+        return JSONResponse(
+            status_code=404,
+            content=ProblemResponse(error="order_not_found").model_dump(exclude_none=True, mode="json"),
+        )
+    return JSONResponse(content=OrderResponse.model_validate(order).model_dump(mode="json"))
