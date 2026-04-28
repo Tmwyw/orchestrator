@@ -19,9 +19,11 @@ def run_migrations() -> None:
             cur.execute("select 1 from schema_migrations where version = %s", (version,))
             if cur.fetchone():
                 continue
-            for statement in path.read_text(encoding="utf-8").split(";"):
-                if statement.strip():
-                    cur.execute(statement)
+            sql = path.read_text(encoding="utf-8").strip()
+            if sql:
+                # psycopg3 simple-query protocol handles multi-statement SQL
+                # (incl. DO $$...$$ blocks) when no parameters are bound.
+                cur.execute(sql)
             cur.execute("insert into schema_migrations(version) values (%s)", (version,))
             print(f"applied migration: {version}")
 
