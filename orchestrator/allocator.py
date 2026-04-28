@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import uuid
@@ -14,9 +15,10 @@ from psycopg.types.json import Jsonb
 
 from orchestrator.config import get_config
 from orchestrator.db import connect
+from orchestrator.delivery import generate_delivery_content
 from orchestrator.distribution import equal_share
 from orchestrator.redis_client import get_redis
-from orchestrator.schemas import OrderStatus
+from orchestrator.schemas import DeliveryFormat, OrderStatus
 
 logger = logging.getLogger("netrun-orchestrator-allocator")
 
@@ -48,6 +50,25 @@ class ReleaseResult:
     order_ref: str
     status: OrderStatus
     released_count: int
+    error: str | None = None
+
+
+@dataclass(slots=True)
+class ProxiesResult:
+    success: bool
+    content: str | None = None
+    content_type: str | None = None
+    line_count: int = 0
+    error: str | None = None
+    locked_format: str | None = None
+
+
+@dataclass(slots=True)
+class ExtendResult:
+    success: bool
+    order_ref: str
+    extended_count: int
+    new_proxies_expires_at: datetime | None
     error: str | None = None
 
 
@@ -263,6 +284,122 @@ class AllocatorService:
             order_ref=order_ref,
             status=OrderStatus.RELEASED,
             released_count=released_count,
+        )
+
+    async def get_proxies(self, *, order_ref: str, format: DeliveryFormat) -> ProxiesResult:
+        """Lazy-create or fetch the delivery file content for a committed order."""
+        order = await asyncio.to_thread(self._sync_get_order, order_ref)
+        if order is None:
+            return ProxiesResult(success=False, error="order_not_found")
+        if str(order["status"]) != OrderStatus.COMMITTED.value:
+            return ProxiesResult(success=False, error="order_not_committed")
+
+        existing = await asyncio.to_thread(self._sync_get_delivery_file, int(order["id"]))
+
+        if existing and str(existing["format"]) != format.value:
+            return ProxiesResult(
+                success=False,
+                error="format_locked",
+                locked_format=str(existing["format"]),
+            )
+
+        if existing and existing.get("content") is not None:
+            content = str(existing["content"])
+            content_type = "application/json" if format == DeliveryFormat.JSON else "text/plain"
+            return ProxiesResult(
+                success=True,
+                content=content,
+                content_type=content_type,
+                line_count=int(existing["line_count"]),
+            )
+
+        rows = await asyncio.to_thread(self._sync_list_inventory_for_order, int(order["id"]))
+        if not rows:
+            return ProxiesResult(success=False, error="inventory_empty")
+
+        content, content_type = generate_delivery_content(rows, format)
+        line_count = len(rows)
+        checksum = hashlib.sha256(content.encode("utf-8")).hexdigest()
+        content_expires_at = datetime.now(timezone.utc) + timedelta(days=30)
+
+        await asyncio.to_thread(
+            self._sync_upsert_delivery_file,
+            order_id=int(order["id"]),
+            format=format.value,
+            content=content,
+            line_count=line_count,
+            checksum=checksum,
+            content_expires_at=content_expires_at,
+        )
+
+        logger.info(
+            "delivery file generated order_ref=%s format=%s line_count=%s",
+            order_ref,
+            format.value,
+            line_count,
+        )
+        return ProxiesResult(
+            success=True,
+            content=content,
+            content_type=content_type,
+            line_count=line_count,
+        )
+
+    async def extend_order(
+        self,
+        *,
+        order_ref: str,
+        duration_days: int,
+        inventory_ids: list[int] | None = None,
+        geo_code: str | None = None,
+    ) -> ExtendResult:
+        """Extend ``expires_at`` for an order's inventory (whole / by_ids / by_geo)."""
+        order = await asyncio.to_thread(self._sync_get_order, order_ref)
+        if order is None:
+            return ExtendResult(
+                success=False,
+                order_ref=order_ref,
+                extended_count=0,
+                new_proxies_expires_at=None,
+                error="order_not_found",
+            )
+        if str(order["status"]) != OrderStatus.COMMITTED.value:
+            return ExtendResult(
+                success=False,
+                order_ref=order_ref,
+                extended_count=0,
+                new_proxies_expires_at=None,
+                error=f"order_state_{order['status']}",
+            )
+
+        extended, new_expires = await asyncio.to_thread(
+            self._sync_extend_inventory,
+            order_id=int(order["id"]),
+            duration_days=duration_days,
+            inventory_ids=inventory_ids,
+            geo_code=geo_code,
+        )
+
+        if extended == 0:
+            return ExtendResult(
+                success=False,
+                order_ref=order_ref,
+                extended_count=0,
+                new_proxies_expires_at=None,
+                error="no_inventory_matched",
+            )
+
+        logger.info(
+            "extend success order_ref=%s duration_days=%s extended=%s",
+            order_ref,
+            duration_days,
+            extended,
+        )
+        return ExtendResult(
+            success=True,
+            order_ref=order_ref,
+            extended_count=extended,
+            new_proxies_expires_at=new_expires,
         )
 
     # === Sync DB helpers (run inside asyncio.to_thread) ===
@@ -483,6 +620,102 @@ class AllocatorService:
             )
             released = len(cur.fetchall())
         return released, order
+
+    def _sync_get_delivery_file(self, order_id: int) -> dict[str, Any] | None:
+        with connect() as conn, conn.cursor() as cur:
+            cur.execute("select * from delivery_files where order_id = %s", (order_id,))
+            row = cur.fetchone()
+        return dict(row) if row else None
+
+    def _sync_list_inventory_for_order(self, order_id: int) -> list[dict[str, Any]]:
+        with connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                select id, host, port, login, password, expires_at, geo_country
+                from proxy_inventory
+                where order_id = %s and status in ('sold', 'expired_grace')
+                order by id
+                """,
+                (order_id,),
+            )
+            return [dict(r) for r in cur.fetchall()]
+
+    def _sync_upsert_delivery_file(
+        self,
+        *,
+        order_id: int,
+        format: str,
+        content: str,
+        line_count: int,
+        checksum: str,
+        content_expires_at: datetime,
+    ) -> None:
+        with connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                insert into delivery_files
+                  (order_id, format, line_count, checksum_sha256, content, content_expires_at)
+                values (%s, %s, %s, %s, %s, %s)
+                on conflict (order_id) do update set
+                  format = excluded.format,
+                  line_count = excluded.line_count,
+                  checksum_sha256 = excluded.checksum_sha256,
+                  content = excluded.content,
+                  content_expires_at = excluded.content_expires_at
+                """,
+                (order_id, format, line_count, checksum, content, content_expires_at),
+            )
+
+    def _sync_extend_inventory(
+        self,
+        *,
+        order_id: int,
+        duration_days: int,
+        inventory_ids: list[int] | None,
+        geo_code: str | None,
+    ) -> tuple[int, datetime | None]:
+        """Bulk UPDATE proxy_inventory + propagate orders.proxies_expires_at."""
+        with connect() as conn, conn.cursor() as cur:
+            params: list[Any] = [duration_days, order_id]
+            extra_where = ""
+            if inventory_ids is not None:
+                extra_where = " and id = any(%s)"
+                params.append(inventory_ids)
+            elif geo_code is not None:
+                extra_where = " and geo_country = %s"
+                params.append(geo_code)
+
+            sql = f"""
+                update proxy_inventory
+                set expires_at = expires_at + (%s || ' days')::interval,
+                    status = 'sold',
+                    updated_at = now()
+                where order_id = %s
+                  and status in ('sold', 'expired_grace')
+                  {extra_where}
+                returning id, expires_at
+            """
+            cur.execute(sql, params)
+            updated = list(cur.fetchall())
+
+            if not updated:
+                return 0, None
+
+            new_max = max(r["expires_at"] for r in updated)
+
+            cur.execute(
+                """
+                update orders
+                set proxies_expires_at = (
+                    select max(expires_at) from proxy_inventory
+                    where order_id = %s and status in ('sold', 'expired_grace')
+                ),
+                updated_at = now()
+                where id = %s
+                """,
+                (order_id, order_id),
+            )
+        return len(updated), new_max
 
     # === Redis idempotency ===
 
