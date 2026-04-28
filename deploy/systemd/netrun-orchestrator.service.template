@@ -1,0 +1,16 @@
+[Unit]
+Description=NETRUN Orchestrator
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/netrun-orchestrator
+EnvironmentFile=/opt/netrun-orchestrator/.env
+ExecStart=/opt/netrun-orchestrator/.venv/bin/python -m orchestrator.server
+Restart=always
+RestartSec=3
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
