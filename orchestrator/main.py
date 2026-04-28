@@ -6,15 +6,18 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
 from psycopg.types.json import Jsonb
 
 from orchestrator.allocator import AllocatorService
 from orchestrator.api_schemas import (
     CommitRequest,
     CommitResponse,
+    ExtendRequest,
+    ExtendResponse,
     OrderResponse,
     ProblemResponse,
+    ProxiesErrorResponse,
     ReleaseResponse,
     ReserveErrorResponse,
     ReserveRequest,
@@ -24,6 +27,7 @@ from orchestrator.config import get_config
 from orchestrator.db import connect, fetch_all, fetch_one
 from orchestrator.jobs import log_job_event, node_health_diagnostics, node_health_ready, public_job
 from orchestrator.node_client import check_health
+from orchestrator.schemas import DeliveryFormat
 from shared.contracts import FORBIDDEN_JOB_FIELDS, PRODUCTION_PROFILE
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -380,3 +384,60 @@ async def get_order(order_ref: str):
             content=ProblemResponse(error="order_not_found").model_dump(exclude_none=True, mode="json"),
         )
     return JSONResponse(content=OrderResponse.model_validate(order).model_dump(mode="json"))
+
+
+@app.get("/v1/orders/{order_ref}/proxies", dependencies=[Depends(require_api_key)])
+async def get_order_proxies(order_ref: str, format: str = "socks5_uri"):
+    try:
+        format_enum = DeliveryFormat(format)
+    except ValueError:
+        return JSONResponse(
+            status_code=400,
+            content=ProblemResponse(error="invalid_format", detail=f"format={format}").model_dump(
+                exclude_none=True, mode="json"
+            ),
+        )
+
+    result = await _allocator.get_proxies(order_ref=order_ref, format=format_enum)
+    if not result.success:
+        status_code = 404 if result.error in ("order_not_found", "inventory_empty") else 409
+        return JSONResponse(
+            status_code=status_code,
+            content=ProxiesErrorResponse(
+                error=result.error or "unknown",
+                locked_format=result.locked_format,
+            ).model_dump(exclude_none=True, mode="json"),
+        )
+
+    headers = {"X-Line-Count": str(result.line_count)}
+    return Response(
+        content=result.content,
+        media_type=result.content_type,
+        headers=headers,
+    )
+
+
+@app.post("/v1/orders/{order_ref}/extend", dependencies=[Depends(require_api_key)])
+async def extend_order_endpoint(order_ref: str, payload: ExtendRequest):
+    result = await _allocator.extend_order(
+        order_ref=order_ref,
+        duration_days=payload.duration_days,
+        inventory_ids=payload.inventory_ids,
+        geo_code=payload.geo_code,
+    )
+    if not result.success:
+        status_code = 404 if result.error == "order_not_found" else 409
+        return JSONResponse(
+            status_code=status_code,
+            content=ProblemResponse(error=result.error or "unknown").model_dump(
+                exclude_none=True, mode="json"
+            ),
+        )
+    assert result.new_proxies_expires_at is not None
+    return JSONResponse(
+        content=ExtendResponse(
+            order_ref=result.order_ref,
+            extended_count=result.extended_count,
+            new_proxies_expires_at=result.new_proxies_expires_at,
+        ).model_dump(mode="json"),
+    )
