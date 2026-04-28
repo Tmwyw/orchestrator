@@ -28,6 +28,13 @@ def _int_env(name: str, default: int) -> int:
         return default
 
 
+def _bool_env(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
 @dataclass(frozen=True)
 class Config:
     api_key: str
@@ -39,6 +46,10 @@ class Config:
     start_port_min: int
     start_port_max: int
     worker_poll_interval_sec: int
+    refill_interval_sec: int
+    refill_default_priority: int
+    refill_max_skus_per_cycle: int
+    proxy_allow_degraded_nodes: bool
 
 
 def get_config() -> Config:
@@ -53,4 +64,8 @@ def get_config() -> Config:
         start_port_min=_int_env("ORCHESTRATOR_START_PORT_MIN", 32000),
         start_port_max=_int_env("ORCHESTRATOR_START_PORT_MAX", 65000),
         worker_poll_interval_sec=_int_env("WORKER_POLL_INTERVAL_SEC", 2),
+        refill_interval_sec=_int_env("PROXY_REFILL_INTERVAL_SEC", 30),
+        refill_default_priority=_int_env("REFILL_DEFAULT_PRIORITY", 10),
+        refill_max_skus_per_cycle=_int_env("REFILL_MAX_SKUS_PER_CYCLE", 100),
+        proxy_allow_degraded_nodes=_bool_env("PROXY_ALLOW_DEGRADED_NODES", False),
     )
