@@ -130,6 +130,97 @@ def test_get_order_returns_404_when_missing() -> None:
     assert response.json()["error"] == "order_not_found"
 
 
+# === Wave B-4b: proxies + extend endpoints ===
+
+
+def test_get_proxies_endpoint_invalid_format() -> None:
+    client = _client()
+    response = client.get(
+        "/v1/orders/ord_test/proxies?format=xml",
+        headers={"X-NETRUN-API-KEY": "test-api-key"},
+    )
+    assert response.status_code == 400
+    assert response.json()["error"] == "invalid_format"
+
+
+def test_get_proxies_endpoint_returns_text() -> None:
+    from orchestrator.allocator import ProxiesResult
+
+    fake_result = ProxiesResult(
+        success=True,
+        content="socks5://u:p@h:1080",
+        content_type="text/plain",
+        line_count=1,
+    )
+    with patch("orchestrator.main._allocator.get_proxies", new=AsyncMock(return_value=fake_result)):
+        client = _client()
+        response = client.get(
+            "/v1/orders/ord_ok/proxies?format=socks5_uri",
+            headers={"X-NETRUN-API-KEY": "test-api-key"},
+        )
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/plain")
+    assert response.headers["x-line-count"] == "1"
+    assert response.text == "socks5://u:p@h:1080"
+
+
+def test_get_proxies_endpoint_format_locked() -> None:
+    from orchestrator.allocator import ProxiesResult
+
+    fake_result = ProxiesResult(
+        success=False,
+        error="format_locked",
+        locked_format="socks5_uri",
+    )
+    with patch("orchestrator.main._allocator.get_proxies", new=AsyncMock(return_value=fake_result)):
+        client = _client()
+        response = client.get(
+            "/v1/orders/ord_locked/proxies?format=json",
+            headers={"X-NETRUN-API-KEY": "test-api-key"},
+        )
+
+    assert response.status_code == 409
+    body = response.json()
+    assert body["error"] == "format_locked"
+    assert body["locked_format"] == "socks5_uri"
+
+
+def test_extend_endpoint_validates_mutually_exclusive_selectors() -> None:
+    client = _client()
+    response = client.post(
+        "/v1/orders/ord_x/extend",
+        json={"duration_days": 30, "inventory_ids": [1, 2], "geo_code": "US"},
+        headers={"X-NETRUN-API-KEY": "test-api-key"},
+    )
+    assert response.status_code == 422
+
+
+def test_extend_endpoint_calls_allocator() -> None:
+    from orchestrator.allocator import ExtendResult
+
+    future = datetime.now(timezone.utc) + timedelta(days=60)
+    fake_result = ExtendResult(
+        success=True,
+        order_ref="ord_ext1",
+        extended_count=42,
+        new_proxies_expires_at=future,
+    )
+    with patch("orchestrator.main._allocator.extend_order", new=AsyncMock(return_value=fake_result)):
+        client = _client()
+        response = client.post(
+            "/v1/orders/ord_ext1/extend",
+            json={"duration_days": 30},
+            headers={"X-NETRUN-API-KEY": "test-api-key"},
+        )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["success"] is True
+    assert body["order_ref"] == "ord_ext1"
+    assert body["extended_count"] == 42
+
+
 # Cleanup so other tests aren't affected by the env var.
 def _cleanup_marker() -> None:
     os.environ.pop("ORCHESTRATOR_API_KEY", None)

@@ -253,3 +253,178 @@ async def test_release_marks_inventory_available() -> None:
     assert result.success is True
     assert result.released_count == 100
     fake_redis.delete.assert_called_once_with("reservation:ord_release1234")
+
+
+# === Wave B-4b: get_proxies / extend_order tests ===
+
+
+async def test_get_proxies_order_not_committed_returns_error() -> None:
+    from orchestrator.allocator import AllocatorService
+    from orchestrator.schemas import DeliveryFormat
+
+    service = AllocatorService()
+    service._sync_get_order = MagicMock(  # type: ignore[method-assign]
+        return_value={
+            "id": 1,
+            "order_ref": "ord_test",
+            "status": "reserved",
+            "sku_id": 1,
+        }
+    )
+    result = await service.get_proxies(order_ref="ord_test", format=DeliveryFormat.SOCKS5_URI)
+    assert result.success is False
+    assert result.error == "order_not_committed"
+
+
+async def test_get_proxies_lazy_creates_delivery_file() -> None:
+    from orchestrator.allocator import AllocatorService
+    from orchestrator.schemas import DeliveryFormat
+
+    service = AllocatorService()
+    service._sync_get_order = MagicMock(  # type: ignore[method-assign]
+        return_value={"id": 5, "order_ref": "ord_lazy", "status": "committed", "sku_id": 1}
+    )
+    service._sync_get_delivery_file = MagicMock(return_value=None)  # type: ignore[method-assign]
+    service._sync_list_inventory_for_order = MagicMock(  # type: ignore[method-assign]
+        return_value=[
+            {
+                "id": 1,
+                "host": "h.example",
+                "port": 1080,
+                "login": "u",
+                "password": "p",
+                "expires_at": None,
+                "geo_country": "US",
+            }
+        ]
+    )
+    service._sync_upsert_delivery_file = MagicMock(return_value=None)  # type: ignore[method-assign]
+
+    result = await service.get_proxies(order_ref="ord_lazy", format=DeliveryFormat.SOCKS5_URI)
+
+    assert result.success is True
+    assert result.line_count == 1
+    assert result.content_type == "text/plain"
+    assert "socks5://u:p@h.example:1080" in (result.content or "")
+    service._sync_upsert_delivery_file.assert_called_once()
+    upsert_kwargs = service._sync_upsert_delivery_file.call_args.kwargs
+    assert upsert_kwargs["format"] == "socks5_uri"
+    assert upsert_kwargs["line_count"] == 1
+
+
+async def test_get_proxies_format_locked() -> None:
+    from orchestrator.allocator import AllocatorService
+    from orchestrator.schemas import DeliveryFormat
+
+    service = AllocatorService()
+    service._sync_get_order = MagicMock(  # type: ignore[method-assign]
+        return_value={"id": 9, "order_ref": "ord_lock", "status": "committed", "sku_id": 1}
+    )
+    service._sync_get_delivery_file = MagicMock(  # type: ignore[method-assign]
+        return_value={
+            "order_id": 9,
+            "format": "socks5_uri",
+            "line_count": 100,
+            "content": "socks5://...",
+        }
+    )
+
+    result = await service.get_proxies(order_ref="ord_lock", format=DeliveryFormat.JSON)
+    assert result.success is False
+    assert result.error == "format_locked"
+    assert result.locked_format == "socks5_uri"
+
+
+async def test_get_proxies_returns_cached_content() -> None:
+    from orchestrator.allocator import AllocatorService
+    from orchestrator.schemas import DeliveryFormat
+
+    service = AllocatorService()
+    service._sync_get_order = MagicMock(  # type: ignore[method-assign]
+        return_value={"id": 11, "order_ref": "ord_cache", "status": "committed", "sku_id": 1}
+    )
+    service._sync_get_delivery_file = MagicMock(  # type: ignore[method-assign]
+        return_value={
+            "order_id": 11,
+            "format": "socks5_uri",
+            "line_count": 42,
+            "content": "socks5://u:p@h:1",
+        }
+    )
+    upsert_mock = MagicMock(return_value=None)
+    service._sync_upsert_delivery_file = upsert_mock  # type: ignore[method-assign]
+
+    result = await service.get_proxies(order_ref="ord_cache", format=DeliveryFormat.SOCKS5_URI)
+    assert result.success is True
+    assert result.line_count == 42
+    assert result.content == "socks5://u:p@h:1"
+    upsert_mock.assert_not_called()
+
+
+async def test_extend_order_whole_no_filters() -> None:
+    from orchestrator.allocator import AllocatorService
+
+    service = AllocatorService()
+    future = datetime.now(timezone.utc) + timedelta(days=60)
+    service._sync_get_order = MagicMock(  # type: ignore[method-assign]
+        return_value={"id": 21, "order_ref": "ord_ext", "status": "committed", "sku_id": 1}
+    )
+    service._sync_extend_inventory = MagicMock(return_value=(150, future))  # type: ignore[method-assign]
+
+    result = await service.extend_order(order_ref="ord_ext", duration_days=30)
+    assert result.success is True
+    assert result.extended_count == 150
+    assert result.new_proxies_expires_at == future
+    call_kwargs = service._sync_extend_inventory.call_args.kwargs
+    assert call_kwargs["inventory_ids"] is None
+    assert call_kwargs["geo_code"] is None
+
+
+async def test_extend_order_by_geo() -> None:
+    from orchestrator.allocator import AllocatorService
+
+    service = AllocatorService()
+    future = datetime.now(timezone.utc) + timedelta(days=60)
+    service._sync_get_order = MagicMock(  # type: ignore[method-assign]
+        return_value={"id": 22, "order_ref": "ord_geo", "status": "committed", "sku_id": 1}
+    )
+    service._sync_extend_inventory = MagicMock(return_value=(40, future))  # type: ignore[method-assign]
+
+    result = await service.extend_order(order_ref="ord_geo", duration_days=30, geo_code="US")
+    assert result.success is True
+    assert result.extended_count == 40
+    call_kwargs = service._sync_extend_inventory.call_args.kwargs
+    assert call_kwargs["geo_code"] == "US"
+    assert call_kwargs["inventory_ids"] is None
+
+
+async def test_extend_order_by_ids() -> None:
+    from orchestrator.allocator import AllocatorService
+
+    service = AllocatorService()
+    future = datetime.now(timezone.utc) + timedelta(days=60)
+    service._sync_get_order = MagicMock(  # type: ignore[method-assign]
+        return_value={"id": 23, "order_ref": "ord_ids", "status": "committed", "sku_id": 1}
+    )
+    service._sync_extend_inventory = MagicMock(return_value=(3, future))  # type: ignore[method-assign]
+
+    result = await service.extend_order(order_ref="ord_ids", duration_days=15, inventory_ids=[1, 2, 3])
+    assert result.success is True
+    assert result.extended_count == 3
+    call_kwargs = service._sync_extend_inventory.call_args.kwargs
+    assert call_kwargs["inventory_ids"] == [1, 2, 3]
+    assert call_kwargs["geo_code"] is None
+
+
+async def test_extend_order_no_inventory_matched() -> None:
+    from orchestrator.allocator import AllocatorService
+
+    service = AllocatorService()
+    service._sync_get_order = MagicMock(  # type: ignore[method-assign]
+        return_value={"id": 24, "order_ref": "ord_nomatch", "status": "committed", "sku_id": 1}
+    )
+    service._sync_extend_inventory = MagicMock(return_value=(0, None))  # type: ignore[method-assign]
+
+    result = await service.extend_order(order_ref="ord_nomatch", duration_days=30, geo_code="ZZ")
+    assert result.success is False
+    assert result.error == "no_inventory_matched"
