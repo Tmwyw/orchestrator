@@ -1,0 +1,44 @@
+[tool.ruff]
+line-length = 110
+target-version = "py310"
+extend-exclude = [".venv", "jobs", "__pycache__", "dist", "build"]
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle errors
+    "F",   # pyflakes
+    "W",   # pycodestyle warnings
+    "I",   # isort (import order)
+    "B",   # flake8-bugbear
+    "N",   # pep8-naming
+    "UP",  # pyupgrade
+    "C4",  # flake8-comprehensions
+    "SIM", # flake8-simplify
+    "RET", # flake8-return
+]
+ignore = [
+    "E501",  # line length (handled by formatter)
+    "B008",  # FastAPI Depends() in defaults — нормальный паттерн
+]
+
+[tool.ruff.lint.per-file-ignores]
+"orchestrator/migrate.py" = ["T201"]  # print() OK в CLI миграторе
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+docstring-code-format = true
+
+[tool.mypy]
+python_version = "3.10"
+strict = false
+warn_return_any = true
+warn_unused_ignores = true
+ignore_missing_imports = true
+exclude = ["jobs/", ".venv/", "build/", "dist/"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+python_files = "test_*.py"
+addopts = ["-ra", "--strict-markers"]
