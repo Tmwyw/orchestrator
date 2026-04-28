@@ -921,7 +921,7 @@ Implementation starts with Wave B-0 prompt to be issued separately.
 
 ---
 
-## Known issues from Wave B-2 (deferred to later Waves)
+## Known issues from Wave B-2/B-3 (deferred to later Waves)
 
 | # | Issue | Where | Defer to |
 |---|---|---|---|
@@ -929,4 +929,6 @@ Implementation starts with Wave B-0 prompt to be issued separately.
 | 2 | RefillService.run_once() — все enqueue в одной транзакции; exception на N-м SKU откатывает 1..N-1 | `orchestrator/refill.py:run_once` | Wave B-7 (per-SKU commit) |
 | 3 | `bulk_insert_inventory_pending` через executemany — N round-trips к БД, медленно на batch=1500 | `orchestrator/jobs.py:bulk_insert_inventory_pending` | Wave B-5 (perf, переход на execute_values/COPY) |
 | 4 | `bulk_insert` и `mark_success` — отдельные транзакции; при сбое между ними inventory pending + job running | `orchestrator/worker.py:process_refill_job` | Wave B-7 (watchdog подхватит stuck running) |
+| 5 | `verify=False` в `_probe_http_proxy` отключает SSL verify | `orchestrator/validation.py:128` | Wave B-7 (config flag `validation_strict_ssl`) |
+| 6 | Двойная конверсия `b"...".decode("ascii").encode("idna")` — косметика | `orchestrator/validation.py:176` | косметика, можно фиксить попутно |
 
