@@ -1,4 +1,4 @@
-from typing import Any
+from typing import Any, cast
 
 import httpx
 
@@ -16,7 +16,7 @@ def check_health(url: str, api_key: str | None, timeout_sec: int = 10) -> dict[s
     with httpx.Client(timeout=timeout_sec) as client:
         response = client.get(endpoint, headers=_node_headers(api_key))
         response.raise_for_status()
-        return response.json()
+        return cast(dict[str, Any], response.json())
 
 
 def generate(
@@ -48,4 +48,4 @@ def generate(
     with httpx.Client(timeout=timeout_sec + 30) as client:
         response = client.post(endpoint, json=payload, headers=_node_headers(api_key))
         response.raise_for_status()
-        return response.json()
+        return cast(dict[str, Any], response.json())
