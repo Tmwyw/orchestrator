@@ -91,7 +91,7 @@ install_os_packages() {
   export DEBIAN_FRONTEND=noninteractive
   log "Installing OS dependencies"
   apt-get update
-  apt-get install -y python3 python3-venv python3-pip curl jq ca-certificates
+  apt-get install -y python3 python3-venv python3-pip curl jq ca-certificates redis-server
   if [ "$EXTERNAL_DB" -ne 1 ]; then
     apt-get install -y postgresql
   fi
@@ -132,6 +132,7 @@ NODE_REQUEST_TIMEOUT_SEC=1200
 ORCHESTRATOR_START_PORT_MIN=32000
 ORCHESTRATOR_START_PORT_MAX=65000
 WORKER_POLL_INTERVAL_SEC=2
+REDIS_URL=redis://127.0.0.1:6379/0
 EOF
   chmod 600 "$APP_HOME/.env"
 }
@@ -173,6 +174,15 @@ setup_local_postgres() {
 
   if ! runuser -u postgres -- psql -tAc "select 1 from pg_database where datname='${DB_NAME}'" | grep -q 1; then
     runuser -u postgres -- createdb -O "$DB_USER" "$DB_NAME"
+  fi
+}
+
+setup_local_redis() {
+  log "Configuring local Redis"
+  systemctl enable redis-server >/dev/null
+  systemctl start redis-server >/dev/null
+  if ! redis-cli ping | grep -q PONG; then
+    die "redis_ping_failed"
   fi
 }
 
@@ -225,6 +235,7 @@ main() {
   mkdir -p "${JOBS_ROOT:-$APP_HOME/jobs}"
   chmod +x "$APP_HOME/install_orchestrator.sh" "$APP_HOME/scripts/"*.sh
   setup_local_postgres
+  setup_local_redis
   setup_python_env
   run_migrations
   install_service
