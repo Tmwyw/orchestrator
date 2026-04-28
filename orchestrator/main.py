@@ -14,7 +14,6 @@ from orchestrator.jobs import log_job_event, node_health_diagnostics, node_healt
 from orchestrator.node_client import check_health
 from shared.contracts import FORBIDDEN_JOB_FIELDS, PRODUCTION_PROFILE
 
-
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("netrun-orchestrator")
 
@@ -151,13 +150,14 @@ async def create_node(request: Request):
     else:
         if not node_health_ready(node_health):
             if not node["force"]:
-                return error_response(409, "node_unavailable", node_health=node_health_diagnostics(node_health))
+                return error_response(
+                    409, "node_unavailable", node_health=node_health_diagnostics(node_health)
+                )
             node_status = "unavailable"
 
-    with connect() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
+    with connect() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
                 insert into nodes(id, name, url, geo, capacity, api_key, status, last_health_check)
                 values (%s, %s, %s, %s, %s, %s, %s, now())
                 on conflict (id) do update set
@@ -171,26 +171,25 @@ async def create_node(request: Request):
                   updated_at = now()
                 returning *
                 """,
-                (
-                    node["id"],
-                    node["name"],
-                    node["url"],
-                    node["geo"],
-                    node["capacity"],
-                    node["api_key"],
-                    node_status,
-                ),
-            )
-            row = cur.fetchone()
+            (
+                node["id"],
+                node["name"],
+                node["url"],
+                node["geo"],
+                node["capacity"],
+                node["api_key"],
+                node_status,
+            ),
+        )
+        row = cur.fetchone()
     return {"success": True, "status": "ready", "item": public_node(row)}
 
 
 @app.delete("/nodes/{node_id}", dependencies=[Depends(require_api_key)])
 def delete_node(node_id: str):
-    with connect() as conn:
-        with conn.cursor() as cur:
-            cur.execute("delete from nodes where id = %s returning id", (node_id,))
-            row = cur.fetchone()
+    with connect() as conn, conn.cursor() as cur:
+        cur.execute("delete from nodes where id = %s returning id", (node_id,))
+        row = cur.fetchone()
     if not row:
         return error_response(404, "node_not_found")
     return {"success": True, "status": "ready", "deleted": node_id}

@@ -8,7 +8,6 @@ from orchestrator.db import connect, fetch_all, fetch_one
 from orchestrator.node_client import check_health
 from shared.contracts import PRODUCTION_PROFILE
 
-
 logger = logging.getLogger("netrun-orchestrator")
 PROXY_LINE_RE = re.compile(r"^[^:]+:[0-9]{1,5}:[^:]+:[^:]+$")
 

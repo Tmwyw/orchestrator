@@ -17,7 +17,6 @@ from orchestrator.jobs import (
 from orchestrator.node_client import generate
 from shared.contracts import PRODUCTION_PROFILE
 
-
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("netrun-orchestrator-worker")
 
@@ -48,7 +47,9 @@ def claim_next_job() -> dict[str, Any] | None:
                 (job["id"],),
             )
             claimed = cur.fetchone()
-        log_job_event(conn, claimed["id"], "running", {"profile": PRODUCTION_PROFILE, "ipv6_policy": "ipv6_only"})
+        log_job_event(
+            conn, claimed["id"], "running", {"profile": PRODUCTION_PROFILE, "ipv6_policy": "ipv6_only"}
+        )
         return dict(claimed)
 
 
@@ -129,7 +130,9 @@ def process_job(job: dict[str, Any]) -> None:
 
         items = result.get("items")
         if not isinstance(items, list) or len(items) < int(job["count"]):
-            logger.warning("node_response_missing_items job_id=%s diagnostics=%s", job_id, response_diagnostics(result))
+            logger.warning(
+                "node_response_missing_items job_id=%s diagnostics=%s", job_id, response_diagnostics(result)
+            )
             mark_failed(job_id, "node_response_missing_items", event_base)
             return
 
@@ -139,14 +142,28 @@ def process_job(job: dict[str, Any]) -> None:
         logger.info("job success job_id=%s node=%s result=%s", job_id, node["id"], result_path)
 
     except httpx.RequestError as exc:
-        mark_failed(job_id, "node_unavailable", {"profile": PRODUCTION_PROFILE, "ipv6_policy": "ipv6_only", "detail": str(exc)})
+        mark_failed(
+            job_id,
+            "node_unavailable",
+            {"profile": PRODUCTION_PROFILE, "ipv6_policy": "ipv6_only", "detail": str(exc)},
+        )
         logger.warning("job failed job_id=%s error=node_unavailable detail=%s", job_id, exc)
     except RuntimeError as exc:
-        error = str(exc) if str(exc) in {"capacity_not_available", "generation_failed", "node_unavailable"} else "generation_failed"
-        mark_failed(job_id, error, {"profile": PRODUCTION_PROFILE, "ipv6_policy": "ipv6_only", "detail": str(exc)})
+        error = (
+            str(exc)
+            if str(exc) in {"capacity_not_available", "generation_failed", "node_unavailable"}
+            else "generation_failed"
+        )
+        mark_failed(
+            job_id, error, {"profile": PRODUCTION_PROFILE, "ipv6_policy": "ipv6_only", "detail": str(exc)}
+        )
         logger.warning("job failed job_id=%s error=%s", job_id, error)
     except Exception as exc:
-        mark_failed(job_id, "generation_failed", {"profile": PRODUCTION_PROFILE, "ipv6_policy": "ipv6_only", "detail": str(exc)})
+        mark_failed(
+            job_id,
+            "generation_failed",
+            {"profile": PRODUCTION_PROFILE, "ipv6_policy": "ipv6_only", "detail": str(exc)},
+        )
         logger.exception("job failed job_id=%s error=generation_failed", job_id)
 
 

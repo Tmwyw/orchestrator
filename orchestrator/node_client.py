@@ -16,8 +16,7 @@ def check_health(url: str, api_key: str | None, timeout_sec: int = 10) -> dict[s
     with httpx.Client(timeout=timeout_sec) as client:
         response = client.get(endpoint, headers=_node_headers(api_key))
         response.raise_for_status()
-        payload = response.json()
-    return payload
+        return response.json()
 
 
 def generate(

@@ -1,5 +1,6 @@
+from collections.abc import Iterable
 from contextlib import contextmanager
-from typing import Any, Iterable
+from typing import Any
 
 import psycopg
 from psycopg.rows import dict_row
@@ -24,21 +25,18 @@ def connect():
 
 
 def fetch_all(query: str, params: Iterable[Any] | None = None) -> list[dict[str, Any]]:
-    with connect() as conn:
-        with conn.cursor() as cur:
-            cur.execute(query, params or ())
-            return list(cur.fetchall())
+    with connect() as conn, conn.cursor() as cur:
+        cur.execute(query, params or ())
+        return list(cur.fetchall())
 
 
 def fetch_one(query: str, params: Iterable[Any] | None = None) -> dict[str, Any] | None:
-    with connect() as conn:
-        with conn.cursor() as cur:
-            cur.execute(query, params or ())
-            row = cur.fetchone()
-            return dict(row) if row else None
+    with connect() as conn, conn.cursor() as cur:
+        cur.execute(query, params or ())
+        row = cur.fetchone()
+        return dict(row) if row else None
 
 
 def execute(query: str, params: Iterable[Any] | None = None) -> None:
-    with connect() as conn:
-        with conn.cursor() as cur:
-            cur.execute(query, params or ())
+    with connect() as conn, conn.cursor() as cur:
+        cur.execute(query, params or ())
