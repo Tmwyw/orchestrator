@@ -208,3 +208,53 @@ def write_proxies_file(job_id: str, lines: list[str]) -> Path:
     result_path = job_dir / "proxies.list"
     result_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return result_path
+
+
+def bulk_insert_inventory_pending(
+    *,
+    sku_id: int,
+    node_id: str,
+    generation_job_id: str,
+    items: list[dict[str, Any]],
+) -> int:
+    """Insert generated proxies into ``proxy_inventory`` with status='pending_validation'.
+
+    Each item must have: ``host``, ``port``, ``login``, ``password``. Items
+    missing any field are skipped. Duplicate ``(login, password, host, port)``
+    tuples within the same batch are also skipped. Returns the number of rows
+    actually inserted.
+    """
+    seen: set[tuple[str, str, str, int]] = set()
+    rows: list[tuple[int, str, str, str, str, str, int]] = []
+    for item in items:
+        host = str(item.get("host") or "").strip()
+        port_raw = item.get("port")
+        login = str(item.get("login") or "").strip()
+        password = str(item.get("password") or "").strip()
+        if not host or not login or not password or port_raw is None:
+            continue
+        try:
+            port = int(port_raw)
+        except (TypeError, ValueError):
+            continue
+        if port <= 0 or port > 65535:
+            continue
+        key = (login, password, host, port)
+        if key in seen:
+            continue
+        seen.add(key)
+        rows.append((sku_id, node_id, generation_job_id, login, password, host, port))
+
+    if not rows:
+        return 0
+
+    with connect() as conn, conn.cursor() as cur:
+        cur.executemany(
+            """
+            insert into proxy_inventory
+              (sku_id, node_id, generation_job_id, login, password, host, port, status)
+            values (%s, %s, %s, %s, %s, %s, %s, 'pending_validation')
+            """,
+            rows,
+        )
+    return len(rows)

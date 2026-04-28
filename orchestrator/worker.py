@@ -8,6 +8,7 @@ from orchestrator.config import get_config
 from orchestrator.db import connect
 from orchestrator.jobs import (
     allocate_start_port,
+    bulk_insert_inventory_pending,
     log_job_event,
     normalize_proxy_items,
     response_diagnostics,
@@ -99,6 +100,15 @@ def assign_node_and_port(job: dict[str, Any]) -> tuple[dict[str, Any], int]:
 
 
 def process_job(job: dict[str, Any]) -> None:
+    sku_id = job.get("sku_id")
+    reason = job.get("reason") or "manual"
+    if sku_id is not None and reason == "refill":
+        process_refill_job(job)
+    else:
+        process_simple_job(job)
+
+
+def process_simple_job(job: dict[str, Any]) -> None:
     job_id = str(job["id"])
     try:
         node, start_port = assign_node_and_port(job)
@@ -165,6 +175,149 @@ def process_job(job: dict[str, Any]) -> None:
             {"profile": PRODUCTION_PROFILE, "ipv6_policy": "ipv6_only", "detail": str(exc)},
         )
         logger.exception("job failed job_id=%s error=generation_failed", job_id)
+
+
+def process_refill_job(job: dict[str, Any]) -> None:
+    """Process a refill job: bulk-insert generated proxies into ``proxy_inventory``.
+
+    Refill jobs (reason='refill', sku_id NOT NULL) are pre-assigned a node and
+    a port range at enqueue time by :class:`RefillService`. The worker only
+    invokes the node's ``/generate`` endpoint and imports the result into
+    ``proxy_inventory`` with status='pending_validation' for the validation
+    worker to process. No proxies file is written for refill jobs.
+    """
+    job_id = str(job["id"])
+    sku_id_raw = job.get("sku_id")
+    node_id = job.get("node_id")
+    start_port = job.get("start_port")
+    count = int(job["count"])
+
+    if sku_id_raw is None or not node_id or start_port is None:
+        mark_failed(job_id, "refill_job_missing_assignment", {"node_id": node_id, "start_port": start_port})
+        return
+
+    sku_id = int(sku_id_raw)
+    node_id = str(node_id)
+
+    try:
+        with connect() as conn, conn.cursor() as cur:
+            cur.execute("select * from nodes where id = %s", (node_id,))
+            node_row = cur.fetchone()
+        if not node_row:
+            mark_failed(job_id, "node_not_found", {"node_id": node_id})
+            return
+        node = dict(node_row)
+
+        logger.info(
+            "refill job generation start job_id=%s node=%s sku_id=%s count=%s start_port=%s",
+            job_id,
+            node_id,
+            sku_id,
+            count,
+            start_port,
+        )
+        result = generate(
+            url=node["url"],
+            api_key=node.get("api_key"),
+            job_id=job_id,
+            count=count,
+            start_port=int(start_port),
+            timeout_sec=get_config().node_request_timeout_sec,
+        )
+
+        event_base = {
+            "node": node_id,
+            "sku_id": sku_id,
+            "profile": PRODUCTION_PROFILE,
+            "ipv6_policy": "ipv6_only",
+            "node_response": response_diagnostics(result),
+        }
+        if result.get("success") is not True or result.get("status") != "ready":
+            logger.warning(
+                "refill generation_failed job_id=%s diagnostics=%s",
+                job_id,
+                response_diagnostics(result),
+            )
+            mark_failed(job_id, "generation_failed", event_base)
+            return
+
+        items = result.get("items")
+        if not isinstance(items, list) or len(items) < count:
+            logger.warning(
+                "refill node_response_missing_items job_id=%s diagnostics=%s",
+                job_id,
+                response_diagnostics(result),
+            )
+            mark_failed(job_id, "node_response_missing_items", event_base)
+            return
+
+        inserted = bulk_insert_inventory_pending(
+            sku_id=sku_id,
+            node_id=node_id,
+            generation_job_id=job_id,
+            items=items[:count],
+        )
+        if inserted == 0:
+            mark_failed(job_id, "inventory_insert_zero", event_base)
+            return
+
+        mark_success(
+            job_id,
+            "",
+            {**event_base, "imported_to_pending_validation": inserted},
+        )
+        logger.info(
+            "refill job success job_id=%s sku=%s node=%s inserted=%s",
+            job_id,
+            sku_id,
+            node_id,
+            inserted,
+        )
+
+    except httpx.RequestError as exc:
+        mark_failed(
+            job_id,
+            "node_unavailable",
+            {
+                "profile": PRODUCTION_PROFILE,
+                "ipv6_policy": "ipv6_only",
+                "detail": str(exc),
+                "node": node_id,
+                "sku_id": sku_id,
+            },
+        )
+        logger.warning("refill job failed job_id=%s error=node_unavailable detail=%s", job_id, exc)
+    except RuntimeError as exc:
+        error = (
+            str(exc)
+            if str(exc) in {"capacity_not_available", "generation_failed", "node_unavailable"}
+            else "generation_failed"
+        )
+        mark_failed(
+            job_id,
+            error,
+            {
+                "profile": PRODUCTION_PROFILE,
+                "ipv6_policy": "ipv6_only",
+                "detail": str(exc),
+                "node": node_id,
+                "sku_id": sku_id,
+            },
+        )
+        logger.warning("refill job failed job_id=%s error=%s", job_id, error)
+    except Exception as exc:
+        mark_failed(
+            job_id,
+            "internal_error",
+            {
+                "profile": PRODUCTION_PROFILE,
+                "ipv6_policy": "ipv6_only",
+                "detail": str(exc),
+                "node": node_id,
+                "sku_id": sku_id,
+            },
+        )
+        logger.exception("refill job failed job_id=%s error=internal_error", job_id)
 
 
 def run_once() -> bool:
