@@ -127,7 +127,7 @@ ensure_env_file() {
   db_password="$(random_token 32)"
   cat > "$APP_HOME/.env" <<EOF
 ORCHESTRATOR_API_KEY=$api_key
-ORCHESTRATOR_HOST=0.0.0.0
+ORCHESTRATOR_HOST=127.0.0.1
 ORCHESTRATOR_PORT=8090
 DB_NAME=netrun_orchestrator
 DB_USER=netrun_orchestrator
@@ -263,7 +263,8 @@ main() {
   log "REFILL_SERVICE=$REFILL_SERVICE_NAME"
   log "VALIDATION_SERVICE=$VALIDATION_SERVICE_NAME"
   log "WATCHDOG_SERVICE=$WATCHDOG_SERVICE_NAME"
-  log "HEALTH=http://127.0.0.1:${ORCHESTRATOR_PORT:-8090}/health"
+  log "HEALTH=http://127.0.0.1:${ORCHESTRATOR_PORT:-8090}/health (localhost only)"
+  log "For external access, run: bash scripts/install_nginx.sh"
   log "API key is stored in $APP_HOME/.env"
 }
 
