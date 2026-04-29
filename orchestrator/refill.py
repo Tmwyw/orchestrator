@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import logging
 import uuid
 from typing import Any
 
@@ -12,9 +11,10 @@ from orchestrator.config import get_config
 from orchestrator.db import connect
 from orchestrator.distribution import equal_share
 from orchestrator.jobs import allocate_port_range_via_table
+from orchestrator.logging_setup import get_logger
 from shared.contracts import PRODUCTION_PROFILE
 
-logger = logging.getLogger("netrun-orchestrator-refill")
+logger = get_logger("netrun-orchestrator-refill")
 
 # Map SKU.product_kind to the legacy "product" string the generation worker
 # already understands (used as job.product). Pay-per-GB SKUs (Wave B-8) will
@@ -74,7 +74,11 @@ class RefillService:
                     allow_degraded=cfg.proxy_allow_degraded_nodes,
                 )
                 if not bindings:
-                    logger.info("refill skip sku=%s: no active bindings", sku["code"])
+                    logger.info(
+                        "refill_sku_skipped",
+                        sku=sku["code"],
+                        reason="no_active_bindings",
+                    )
                     continue
 
                 caps = [int(b["effective_max_batch"]) for b in bindings]
@@ -88,11 +92,12 @@ class RefillService:
                     if in_flight >= int(binding["max_parallel_jobs"]):
                         counters["nodes_at_capacity"] += 1
                         logger.info(
-                            "refill skip node=%s sku=%s in_flight=%s max_parallel=%s",
-                            binding["node_id"],
-                            sku["code"],
-                            in_flight,
-                            binding["max_parallel_jobs"],
+                            "refill_node_skipped",
+                            node_id=binding["node_id"],
+                            sku=sku["code"],
+                            in_flight=in_flight,
+                            max_parallel=binding["max_parallel_jobs"],
+                            reason="in_flight_at_capacity",
                         )
                         continue
 
@@ -119,12 +124,12 @@ class RefillService:
 
                     counters["jobs_enqueued"] += 1
                     logger.info(
-                        "refill enqueued job_id=%s sku=%s node=%s count=%s start_port=%s",
-                        job_id,
-                        sku["code"],
-                        binding["node_id"],
-                        qty,
-                        start_port,
+                        "refill_job_enqueued",
+                        job_id=job_id,
+                        sku=sku["code"],
+                        node_id=binding["node_id"],
+                        count=qty,
+                        start_port=start_port,
                     )
 
         return counters
