@@ -4,15 +4,14 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import logging
 import signal
 
 from orchestrator.config import get_config
-from orchestrator.logging_setup import configure_logging
+from orchestrator.logging_setup import configure_logging, get_logger
 from orchestrator.validation_worker import ProxyValidationWorker
 
 configure_logging()
-logger = logging.getLogger("netrun-orchestrator-validation-scheduler")
+logger = get_logger("netrun-orchestrator-validation-scheduler")
 
 
 async def _run() -> None:
@@ -25,7 +24,7 @@ async def _run() -> None:
     stop_event = asyncio.Event()
 
     def _signal_handler() -> None:
-        logger.info("received stop signal")
+        logger.info("validation_scheduler_stop_signal_received")
         stop_event.set()
 
     loop = asyncio.get_running_loop()
