@@ -35,6 +35,7 @@ from orchestrator.jobs import log_job_event, node_health_diagnostics, node_healt
 from orchestrator.logging_setup import configure_logging, get_logger
 from orchestrator.metrics import HTTP_DURATION_SEC, HTTP_REQUESTS
 from orchestrator.node_client import check_health
+from orchestrator.pergb import pergb_router
 from orchestrator.schemas import DeliveryFormat
 from shared.contracts import FORBIDDEN_JOB_FIELDS, PRODUCTION_PROFILE
 
@@ -652,3 +653,6 @@ app.include_router(v1_router)
 
 # === /v1/admin/* — Wave B-7b.3 ===
 app.include_router(admin_router, dependencies=[Depends(require_api_key)])
+
+# === Pay-per-GB stubs — Wave B-8.1 (real impl in B-8.2) ===
+app.include_router(pergb_router, dependencies=[Depends(require_api_key)])
