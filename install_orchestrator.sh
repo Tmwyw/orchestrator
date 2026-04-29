@@ -4,8 +4,14 @@ set -euo pipefail
 APP_HOME="/opt/netrun-orchestrator"
 SERVICE_NAME="netrun-orchestrator"
 WORKER_SERVICE_NAME="netrun-orchestrator-worker"
+REFILL_SERVICE_NAME="netrun-orchestrator-refill"
+VALIDATION_SERVICE_NAME="netrun-orchestrator-validation"
+WATCHDOG_SERVICE_NAME="netrun-orchestrator-watchdog"
 SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
 WORKER_SERVICE_FILE="/etc/systemd/system/${WORKER_SERVICE_NAME}.service"
+REFILL_SERVICE_FILE="/etc/systemd/system/${REFILL_SERVICE_NAME}.service"
+VALIDATION_SERVICE_FILE="/etc/systemd/system/${VALIDATION_SERVICE_NAME}.service"
+WATCHDOG_SERVICE_FILE="/etc/systemd/system/${WATCHDOG_SERVICE_NAME}.service"
 EXTERNAL_DB=0
 TMP_SOURCE=""
 
@@ -202,11 +208,20 @@ install_service() {
   log "Installing systemd services"
   install -m 0644 "$APP_HOME/deploy/systemd/netrun-orchestrator.service.template" "$SERVICE_FILE"
   install -m 0644 "$APP_HOME/deploy/systemd/netrun-orchestrator-worker.service.template" "$WORKER_SERVICE_FILE"
+  install -m 0644 "$APP_HOME/deploy/systemd/netrun-orchestrator-refill.service.template" "$REFILL_SERVICE_FILE"
+  install -m 0644 "$APP_HOME/deploy/systemd/netrun-orchestrator-validation.service.template" "$VALIDATION_SERVICE_FILE"
+  install -m 0644 "$APP_HOME/deploy/systemd/netrun-orchestrator-watchdog.service.template" "$WATCHDOG_SERVICE_FILE"
   systemctl daemon-reload
   systemctl enable "$SERVICE_NAME" >/dev/null
   systemctl enable "$WORKER_SERVICE_NAME" >/dev/null
+  systemctl enable "$REFILL_SERVICE_NAME" >/dev/null
+  systemctl enable "$VALIDATION_SERVICE_NAME" >/dev/null
+  systemctl enable "$WATCHDOG_SERVICE_NAME" >/dev/null
   systemctl restart "$SERVICE_NAME"
   systemctl restart "$WORKER_SERVICE_NAME"
+  systemctl restart "$REFILL_SERVICE_NAME"
+  systemctl restart "$VALIDATION_SERVICE_NAME"
+  systemctl restart "$WATCHDOG_SERVICE_NAME"
 }
 
 wait_health() {
@@ -245,6 +260,9 @@ main() {
   log "APP_HOME=$APP_HOME"
   log "SERVICE=$SERVICE_NAME"
   log "WORKER_SERVICE=$WORKER_SERVICE_NAME"
+  log "REFILL_SERVICE=$REFILL_SERVICE_NAME"
+  log "VALIDATION_SERVICE=$VALIDATION_SERVICE_NAME"
+  log "WATCHDOG_SERVICE=$WATCHDOG_SERVICE_NAME"
   log "HEALTH=http://127.0.0.1:${ORCHESTRATOR_PORT:-8090}/health"
   log "API key is stored in $APP_HOME/.env"
 }
