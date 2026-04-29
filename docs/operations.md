@@ -62,6 +62,7 @@ template. Key variables:
 | `VALIDATION_BATCH_SIZE` | `50` | Validation worker claim batch size |
 | `VALIDATION_CONCURRENCY` | `20` | Concurrent probes per cycle |
 | `VALIDATION_POLL_INTERVAL_SEC` | `5` | Validation worker poll interval |
+| `VALIDATION_STRICT_SSL` | `true` | When `false`, SOCKS5/HTTP probe skips SSL cert verification. Set to `false` only in test environments with self-signed certs. |
 | `RESERVATION_DEFAULT_TTL_SEC` | `300` | Default TTL when client omits `reservation_ttl_sec` |
 | `RESERVATION_MIN_TTL_SEC` | `30` | Lower clamp |
 | `RESERVATION_MAX_TTL_SEC` | `3600` | Upper clamp |
