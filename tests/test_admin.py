@@ -25,9 +25,7 @@ def _no_auth():
     app.dependency_overrides.pop(require_api_key, None)
 
 
-def test_admin_stats_returns_response_shape(
-    monkeypatch: pytest.MonkeyPatch, _no_auth: None
-) -> None:
+def test_admin_stats_returns_response_shape(monkeypatch: pytest.MonkeyPatch, _no_auth: None) -> None:
     sales = {"orders": 5, "proxies": 25, "revenue": Decimal("12.50")}
     inventory = [
         {"code": "ipv6_us_socks5", "status": "available", "n": 10},
@@ -62,9 +60,7 @@ def test_admin_stats_returns_response_shape(
     assert body["nodes"] == {"ready": 3, "total": 3}
 
 
-def test_admin_orders_filters_by_user_id(
-    monkeypatch: pytest.MonkeyPatch, _no_auth: None
-) -> None:
+def test_admin_orders_filters_by_user_id(monkeypatch: pytest.MonkeyPatch, _no_auth: None) -> None:
     captured: dict[str, Any] = {}
 
     def fake_fetch_all(query: str, params: tuple[Any, ...]) -> list[dict[str, Any]]:
@@ -99,9 +95,7 @@ def test_admin_orders_filters_by_user_id(
     assert 42 in captured["params"]
 
 
-def test_admin_archive_filters_by_date_and_geo(
-    monkeypatch: pytest.MonkeyPatch, _no_auth: None
-) -> None:
+def test_admin_archive_filters_by_date_and_geo(monkeypatch: pytest.MonkeyPatch, _no_auth: None) -> None:
     captured: dict[str, Any] = {}
 
     def fake_fetch_all(query: str, params: tuple[Any, ...]) -> list[dict[str, Any]]:
