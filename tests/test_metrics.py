@@ -67,11 +67,5 @@ def test_scheduler_run_counter_labels() -> None:
     before_fail = SCHEDULER_RUN_TOTAL.labels(scheduler="refill", status="failed")._value.get()
     SCHEDULER_RUN_TOTAL.labels(scheduler="refill", status="success").inc()
     SCHEDULER_RUN_TOTAL.labels(scheduler="refill", status="failed").inc()
-    assert (
-        SCHEDULER_RUN_TOTAL.labels(scheduler="refill", status="success")._value.get()
-        == before_ok + 1
-    )
-    assert (
-        SCHEDULER_RUN_TOTAL.labels(scheduler="refill", status="failed")._value.get()
-        == before_fail + 1
-    )
+    assert SCHEDULER_RUN_TOTAL.labels(scheduler="refill", status="success")._value.get() == before_ok + 1
+    assert SCHEDULER_RUN_TOTAL.labels(scheduler="refill", status="failed")._value.get() == before_fail + 1

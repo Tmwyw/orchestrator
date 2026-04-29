@@ -72,6 +72,7 @@ async def track_http(request: Request, call_next):
 def metrics():
     return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
+
 ALLOWED_PRODUCTS = {"android_ipv6_only", "smoke"}
 ALLOWED_JOB_FIELDS = {"count", "product", "idempotency_key"}
 ALLOWED_NODE_FIELDS = {"id", "name", "url", "geo", "capacity", "api_key", "force"}
