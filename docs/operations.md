@@ -76,22 +76,57 @@ systemctl restart netrun-orchestrator netrun-orchestrator-worker
 
 ---
 
-## 3. Adding nodes
+## 3. Adding a node
+
+### Recommended: auto-enroll (Wave B-6)
 
 ```bash
 cd /opt/netrun-orchestrator
+bash scripts/enroll-node.sh http://NODE_IP:8085
+```
+
+The orchestrator calls the node's `GET /describe` (Wave B-6.1) and
+`GET /health`, then deterministically derives `node_id` from the URL,
+auto-fills `geo_code`, `capacity`, `generator_script`,
+`max_parallel_jobs`, and `max_batch_size`, and UPSERTs the row. Re-running
+on the same URL is idempotent.
+
+Common options:
+
+```bash
+# Auto-bind to every active SKU with the same geo:
+bash scripts/enroll-node.sh http://10.0.0.5:8085 --auto-bind
+
+# Force-save even if /health is not ready (status=unavailable):
+bash scripts/enroll-node.sh http://10.0.0.5:8085 --force
+
+# Override geo when /describe returns null:
+bash scripts/enroll-node.sh http://10.0.0.5:8085 --geo DE
+
+# Pass node-agent X-API-KEY (only if NODE_AGENT_API_KEY was set on the node):
+bash scripts/enroll-node.sh http://10.0.0.5:8085 --api-key SECRET --name node-de-1
+```
+
+Error responses:
+
+| HTTP | error                       | Meaning |
+|------|-----------------------------|---------|
+| 502  | `describe_unreachable`      | `GET /describe` failed (network, agent down, wrong URL) |
+| 400  | `api_key_required_by_node`  | Node requires `X-API-KEY` but `--api-key` was not passed |
+| 409  | `health_unreachable`        | `/health` did not respond — pass `--force` to save anyway |
+| 409  | `node_health_not_ready`     | Health responded but `success/status/ipv6` failed; `extra.diagnostics` shows what |
+
+### Manual fallback (legacy)
+
+`scripts/add_node.sh` is still available for environments where the node
+runtime predates `/describe` (no Wave B-6.1):
+
+```bash
 bash scripts/add_node.sh <url> [name] [geo] [capacity] [node_api_key] [force]
 ```
 
-Example:
-
-```bash
-bash scripts/add_node.sh https://node-de-1.example.com node-de-1 DE 1000 NODE_KEY_HERE
-```
-
-The script POSTs to `/nodes` (no `/v1` prefix — see §9 footnote) and the
-orchestrator calls the node's `/health` endpoint before persisting. Pass `true`
-as the 6th argument to bypass the health check.
+It POSTs to `/nodes` (no `/v1` prefix — see §9 footnote) and only checks
+`/health`. Pass `true` as the 6th argument to bypass the health check.
 
 Verify:
 
@@ -305,6 +340,7 @@ Wave B-7.
 
 **Sale-domain (`/v1/` prefix):**
 
+- `POST   /v1/nodes/enroll`
 - `POST   /v1/orders/reserve`
 - `POST   /v1/orders/{order_ref}/commit`
 - `POST   /v1/orders/{order_ref}/release`

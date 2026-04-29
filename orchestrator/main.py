@@ -9,12 +9,16 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse, Response
 from psycopg.types.json import Jsonb
 
+from orchestrator import node_client
 from orchestrator.allocator import AllocatorService
 from orchestrator.api_schemas import (
     CommitRequest,
     CommitResponse,
+    EnrollRequest,
+    EnrollResponse,
     ExtendRequest,
     ExtendResponse,
+    NodeSummary,
     OrderResponse,
     ProblemResponse,
     ProxiesErrorResponse,
@@ -211,6 +215,151 @@ def delete_node(node_id: str):
     if not row:
         return error_response(404, "node_not_found")
     return {"success": True, "status": "ready", "deleted": node_id}
+
+
+@app.post("/v1/nodes/enroll", dependencies=[Depends(require_api_key)])
+async def enroll_node(payload: EnrollRequest):
+    """Auto-enroll a node by fetching its /describe and validating /health."""
+    url = payload.agent_url.rstrip("/")
+    node_api_key: str | None = payload.api_key.strip() if payload.api_key else None
+    if node_api_key == "":
+        node_api_key = None
+
+    try:
+        describe = await asyncio.to_thread(node_client.describe, url, node_api_key, 15)
+    except Exception as exc:
+        return JSONResponse(
+            status_code=502,
+            content=ProblemResponse(error="describe_unreachable", detail=str(exc)).model_dump(
+                exclude_none=True, mode="json"
+            ),
+        )
+
+    if describe.get("api_key_required") and not node_api_key:
+        return JSONResponse(
+            status_code=400,
+            content=ProblemResponse(error="api_key_required_by_node").model_dump(
+                exclude_none=True, mode="json"
+            ),
+        )
+
+    try:
+        health = await asyncio.to_thread(check_health, url, node_api_key, 10)
+    except Exception as exc:
+        if not payload.force:
+            return JSONResponse(
+                status_code=409,
+                content=ProblemResponse(error="health_unreachable", detail=str(exc)).model_dump(
+                    exclude_none=True, mode="json"
+                ),
+            )
+        node_status = "unavailable"
+    else:
+        if not node_health_ready(health):
+            if not payload.force:
+                return JSONResponse(
+                    status_code=409,
+                    content=ProblemResponse(
+                        error="node_health_not_ready",
+                        extra={"diagnostics": node_health_diagnostics(health)},
+                    ).model_dump(exclude_none=True, mode="json"),
+                )
+            node_status = "unavailable"
+        else:
+            node_status = "ready"
+
+    geo = ((payload.geo_code or describe.get("geo_code") or "") or "").strip()
+    capacity = int(describe.get("capacity") or 1000)
+    name = (payload.name or "").strip()
+    url_hash = uuid.uuid5(uuid.NAMESPACE_URL, url).hex[:8]
+    if not name:
+        name = f"node-{geo.lower()}-{url_hash}" if geo else f"node-{url_hash}"
+    node_id = uuid.uuid5(uuid.NAMESPACE_URL, url).hex
+
+    generator_script = describe.get("generator_script") or ""
+    max_parallel = int(describe.get("max_parallel_jobs") or 1)
+    max_batch = int(describe.get("max_batch_size") or 1500)
+
+    with connect() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            insert into nodes (
+              id, name, url, geo, status, capacity, api_key,
+              generator_script, max_parallel_jobs, max_batch_size,
+              runtime_status, last_health_check
+            )
+            values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'active', now())
+            on conflict (id) do update set
+              name = excluded.name,
+              url = excluded.url,
+              geo = excluded.geo,
+              capacity = excluded.capacity,
+              api_key = excluded.api_key,
+              generator_script = excluded.generator_script,
+              max_parallel_jobs = excluded.max_parallel_jobs,
+              max_batch_size = excluded.max_batch_size,
+              status = excluded.status,
+              last_health_check = now(),
+              updated_at = now()
+            returning *
+            """,
+            (
+                node_id,
+                name,
+                url,
+                geo,
+                node_status,
+                capacity,
+                node_api_key,
+                generator_script,
+                max_parallel,
+                max_batch,
+            ),
+        )
+        cur.fetchone()
+
+    bound_skus: list[str] = []
+    if payload.auto_bind_active_skus and geo:
+        with connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                insert into sku_node_bindings (sku_id, node_id, weight, max_batch_size, is_active)
+                select s.id, %s, 100, least(%s, %s), true
+                from skus s
+                where s.is_active = true and s.geo_code = %s
+                on conflict (sku_id, node_id) do update set
+                  is_active = true,
+                  updated_at = now()
+                returning (select code from skus where id = sku_node_bindings.sku_id) as code
+                """,
+                (node_id, max_batch, capacity, geo),
+            )
+            bound_skus = [r["code"] for r in cur.fetchall() if r.get("code")]
+
+    logger.info(
+        "node enrolled id=%s name=%s url=%s geo=%s status=%s auto_bound=%s",
+        node_id,
+        name,
+        url,
+        geo,
+        node_status,
+        bound_skus,
+    )
+    return JSONResponse(
+        content=EnrollResponse(
+            node=NodeSummary(
+                id=node_id,
+                name=name,
+                url=url,
+                geo=geo,
+                status=node_status,
+                capacity=capacity,
+                runtime_status="active",
+            ),
+            describe_geo_code=describe.get("geo_code"),
+            auto_bound_skus=bound_skus,
+        ).model_dump(mode="json"),
+    )
 
 
 @app.post("/jobs", dependencies=[Depends(require_api_key)])

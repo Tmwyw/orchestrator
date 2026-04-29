@@ -19,6 +19,15 @@ def check_health(url: str, api_key: str | None, timeout_sec: int = 10) -> dict[s
         return cast(dict[str, Any], response.json())
 
 
+def describe(url: str, api_key: str | None, timeout_sec: int = 15) -> dict[str, Any]:
+    """GET /describe on the node-agent. Returns the JSON payload."""
+    endpoint = f"{url.rstrip('/')}/describe"
+    with httpx.Client(timeout=timeout_sec) as client:
+        response = client.get(endpoint, headers=_node_headers(api_key))
+        response.raise_for_status()
+        return cast(dict[str, Any], response.json())
+
+
 def generate(
     *,
     url: str,

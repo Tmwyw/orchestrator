@@ -144,3 +144,38 @@ class ProblemResponse(BaseModel):
     error: str
     detail: str | None = None
     extra: dict[str, Any] | None = None
+
+
+# === /v1/nodes/enroll (Wave B-6.2) ===
+
+
+class EnrollRequest(BaseModel):
+    model_config = _API_MODEL_CONFIG
+
+    agent_url: str = Field(min_length=8, max_length=512)
+    api_key: str | None = Field(default=None, max_length=128)
+    name: str | None = Field(default=None, max_length=128)
+    geo_code: str | None = Field(default=None, max_length=8)
+    force: bool = False
+    auto_bind_active_skus: bool = False
+
+
+class NodeSummary(BaseModel):
+    model_config = _API_MODEL_CONFIG
+
+    id: str
+    name: str
+    url: str
+    geo: str
+    status: str
+    capacity: int
+    runtime_status: str | None = None
+
+
+class EnrollResponse(BaseModel):
+    model_config = _API_MODEL_CONFIG
+
+    success: bool = True
+    node: NodeSummary
+    describe_geo_code: str | None = None
+    auto_bound_skus: list[str] = Field(default_factory=list)
