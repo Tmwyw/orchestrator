@@ -166,33 +166,38 @@ bash scripts/bind_node.sh ipv6_us_socks5 node-fr-1
 
 ---
 
-## 5. Starting schedulers (refill + validation)
+## 5. Schedulers + watchdog (Wave B-7a)
 
-Until Wave B-7 ships dedicated systemd units, the refill scheduler and
-validation worker run inside `screen` sessions:
+`install_orchestrator.sh` installs and starts five systemd units in total:
 
-```bash
-bash scripts/start_schedulers.sh
-```
+| Unit | Purpose |
+|------|---------|
+| `netrun-orchestrator.service` | FastAPI process |
+| `netrun-orchestrator-worker.service` | generation worker |
+| `netrun-orchestrator-refill.service` | refill scheduler (one-shot per `PROXY_REFILL_INTERVAL_SEC`) |
+| `netrun-orchestrator-validation.service` | proxy validation loop |
+| `netrun-orchestrator-watchdog.service` | recovers stuck `running` jobs, releases expired reservations, invalidates stale `pending_validation`, clears expired delivery content |
 
-This spawns:
-
-- `netrun-refill` → `python -m orchestrator.refill_scheduler`
-- `netrun-validation` → `python -m orchestrator.validation_scheduler`
+The wrappers `bash scripts/start_schedulers.sh` / `scripts/stop_schedulers.sh`
+auto-detect systemd: if all three (`refill`, `validation`, `watchdog`) units
+are installed, they call `systemctl restart`/`stop`; otherwise they fall back
+to legacy `screen` sessions (development boxes only).
 
 Inspect:
 
 ```bash
-screen -ls                         # both sessions should be listed
-screen -r netrun-refill            # attach (Ctrl+A, D to detach)
-screen -r netrun-validation
+systemctl status netrun-orchestrator-refill netrun-orchestrator-validation \
+                 netrun-orchestrator-watchdog --no-pager
+journalctl -u netrun-orchestrator-watchdog -f
 ```
 
-Stop:
+Watchdog tunables (in `.env`, all optional):
 
-```bash
-bash scripts/stop_schedulers.sh
-```
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `WATCHDOG_INTERVAL_SEC` | `60` | Loop interval (clamped to ≥10) |
+| `WATCHDOG_RUNNING_TIMEOUT_SEC` | `1800` | Mark `jobs.status='running'` rows older than this as `failed` |
+| `WATCHDOG_PENDING_VALIDATION_TIMEOUT_SEC` | `600` | Mark `proxy_inventory.status='pending_validation'` older than this as `invalid` |
 
 ---
 
@@ -323,29 +328,32 @@ curl -fsS "http://127.0.0.1:${ORCHESTRATOR_PORT:-8090}/v1/orders/$ORD" \
 
 ---
 
-## 9. Endpoint paths (footnote)
+## 9. Endpoint paths
 
-The orchestrator currently exposes two path styles. This will be unified in
-Wave B-7.
+Since Wave B-7a all endpoints are available under the unified `/v1/` prefix.
+The legacy unprefixed paths (`/health`, `/nodes`, `/jobs/...`) still work for
+backward compatibility and will be removed in the next major version — new
+clients and scripts should use `/v1/*`.
 
-**Legacy (no prefix):**
+**`/v1/` (canonical):**
 
-- `GET    /health`
-- `GET    /nodes`
-- `POST   /nodes`
-- `DELETE /nodes/{node_id}`
-- `POST   /jobs`
-- `GET    /jobs/{job_id}`
-- `GET    /jobs/{job_id}/proxies.list`
-
-**Sale-domain (`/v1/` prefix):**
-
+- `GET    /v1/health`
+- `GET    /v1/nodes`
+- `POST   /v1/nodes`
+- `DELETE /v1/nodes/{node_id}`
 - `POST   /v1/nodes/enroll`
+- `POST   /v1/jobs`
+- `GET    /v1/jobs/{job_id}`
+- `GET    /v1/jobs/{job_id}/proxies.list`
 - `POST   /v1/orders/reserve`
 - `POST   /v1/orders/{order_ref}/commit`
 - `POST   /v1/orders/{order_ref}/release`
 - `POST   /v1/orders/{order_ref}/extend`
 - `GET    /v1/orders/{order_ref}`
 - `GET    /v1/orders/{order_ref}/proxies?format=socks5_uri|host_port_user_pass|user_pass_at_host_port|json`
+
+**Legacy aliases (deprecated):** `/health`, `/nodes`, `/nodes/{id}`,
+`/jobs`, `/jobs/{id}`, `/jobs/{id}/proxies.list` — same handlers, scheduled
+for removal.
 
 All endpoints require `X-NETRUN-API-KEY` matching `ORCHESTRATOR_API_KEY`.

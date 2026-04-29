@@ -926,14 +926,17 @@ Implementation starts with Wave B-0 prompt to be issued separately.
 | # | Issue | Where | Defer to |
 |---|---|---|---|
 | 1 | `deficit = target - available` без учёта queued/running → может cause overshoot если генерация медленная | `orchestrator/refill.py:_get_sku_projection` | Wave B-7 (watchdog скорректирует) |
-| 2 | RefillService.run_once() — все enqueue в одной транзакции; exception на N-м SKU откатывает 1..N-1 | `orchestrator/refill.py:run_once` | Wave B-7 (per-SKU commit) |
+| 2 | RefillService.run_once() — все enqueue в одной транзакции; exception на N-м SKU откатывает 1..N-1 | `orchestrator/refill.py:run_once` | **FIXED in B-7a**: watchdog подхватит unfinished refill-jobs (stuck running → failed; expired reservations → released) |
 | 3 | `bulk_insert_inventory_pending` через executemany — N round-trips к БД, медленно на batch=1500 | `orchestrator/jobs.py:bulk_insert_inventory_pending` | Wave B-5 (perf, переход на execute_values/COPY) |
 | 4 | `bulk_insert` и `mark_success` — отдельные транзакции; при сбое между ними inventory pending + job running | `orchestrator/worker.py:process_refill_job` | Wave B-7 (watchdog подхватит stuck running) |
 | 5 | `verify=False` в `_probe_http_proxy` отключает SSL verify | `orchestrator/validation.py:128` | Wave B-7 (config flag `validation_strict_ssl`) |
 | 6 | Двойная конверсия `b"...".decode("ascii").encode("idna")` — косметика | `orchestrator/validation.py:176` | косметика, можно фиксить попутно |
-| 7 | reserve не атомарен: _sync_claim_per_node_with_rollback (commit) → _sync_insert_order (commit) — 2 transactions, race возможен | `orchestrator/allocator.py:reserve` | Wave B-7 (watchdog cleanup expired_reservations) |
+| 7 | reserve не атомарен: _sync_claim_per_node_with_rollback (commit) → _sync_insert_order (commit) — 2 transactions, race возможен | `orchestrator/allocator.py:reserve` | **FIXED in B-7a**: watchdog releases expired reservations (`status='reserved' AND expires_at < now()` → inventory `available`, order `released`) |
 | 8 | `commit` expires_at check идёт в Python; SQL UPDATE не валидирует expires_at | `orchestrator/allocator.py:commit` | Wave B-7 (watchdog) |
 | 9 | MagicMock на приватных _sync_* методах в test_allocator.py — pragmatic unit testing | `tests/test_allocator.py` | Wave B-5 (real DB integration tests) |
 | 10 | `FOR UPDATE` with aggregate (MAX) in allocate_port_range_via_table → psycopg FeatureNotSupported | `orchestrator/jobs.py` | **FIXED in Wave B-5b** via pg_advisory_xact_lock |
+| 13 | screen-based schedulers умирают при reboot orchestrator-сервера (нет автостарта, потеря refill/validation/watchdog) | `scripts/start_schedulers.sh` | **FIXED in B-7a**: 3 systemd units (`netrun-orchestrator-refill/validation/watchdog`) с `Restart=always`; screen остаётся как fallback для dev-боксов |
+| 14 | API paths inconsistent — `/nodes`, `/jobs` без префикса; `/v1/orders/*` с префиксом | `orchestrator/main.py` | **FIXED in B-7a**: `/v1/*` aliases добавлены для health/nodes/jobs; legacy paths остаются для backward compat, будут удалены в следующем major |
+| 17 | Orchestrator port 8090 publicly accessible (`ORCHESTRATOR_HOST=0.0.0.0`, no firewall). Bot scanners attempt RCE via Log4Shell-style URLs (404'd, but visible in logs) | `install_orchestrator.sh` / `.env` | Wave B-7b (production hardening): bind to 127.0.0.1 + nginx HTTPS reverse proxy, OR ufw allow 8090 only from known IPs |
 | 18 | enroll_node `ON CONFLICT (id)` падал с UniqueViolation на `nodes_url_key` когда нода уже была зарегистрирована через `add_node.sh` (random UUID) | `orchestrator/main.py:enroll_node` | **FIXED in Wave B-6.3**: switched to `ON CONFLICT (url)`, preserves existing id |
 
