@@ -5,7 +5,7 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Request
+from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse, Response
 from psycopg.types.json import Jsonb
 
@@ -592,3 +592,30 @@ async def extend_order_endpoint(order_ref: str, payload: ExtendRequest):
             new_proxies_expires_at=result.new_proxies_expires_at,
         ).model_dump(mode="json"),
     )
+
+
+# === /v1/* aliases for legacy endpoints (Wave B-7a) ===
+# Old paths (/health, /nodes, /jobs) remain wired for backward compatibility
+# and will be removed in the next major version. Sale-domain (/v1/orders/*,
+# /v1/nodes/enroll) is unaffected and not duplicated here.
+
+v1_router = APIRouter(prefix="/v1")
+v1_router.add_api_route("/health", health, methods=["GET"], dependencies=[Depends(require_api_key)])
+v1_router.add_api_route("/nodes", list_nodes, methods=["GET"], dependencies=[Depends(require_api_key)])
+v1_router.add_api_route("/nodes", create_node, methods=["POST"], dependencies=[Depends(require_api_key)])
+v1_router.add_api_route(
+    "/nodes/{node_id}",
+    delete_node,
+    methods=["DELETE"],
+    dependencies=[Depends(require_api_key)],
+)
+v1_router.add_api_route("/jobs", create_job, methods=["POST"], dependencies=[Depends(require_api_key)])
+v1_router.add_api_route("/jobs/{job_id}", get_job, methods=["GET"], dependencies=[Depends(require_api_key)])
+v1_router.add_api_route(
+    "/jobs/{job_id}/proxies.list",
+    download_proxies,
+    methods=["GET"],
+    dependencies=[Depends(require_api_key)],
+)
+
+app.include_router(v1_router)
