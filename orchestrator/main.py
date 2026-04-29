@@ -11,6 +11,7 @@ from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from psycopg.types.json import Jsonb
 
 from orchestrator import node_client
+from orchestrator.admin import admin_router
 from orchestrator.allocator import AllocatorService
 from orchestrator.api_schemas import (
     CommitRequest,
@@ -648,3 +649,6 @@ v1_router.add_api_route(
 )
 
 app.include_router(v1_router)
+
+# === /v1/admin/* — Wave B-7b.3 ===
+app.include_router(admin_router, dependencies=[Depends(require_api_key)])
