@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
-import logging
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -17,10 +16,11 @@ from orchestrator.config import get_config
 from orchestrator.db import connect
 from orchestrator.delivery import generate_delivery_content
 from orchestrator.distribution import equal_share
+from orchestrator.logging_setup import get_logger
 from orchestrator.redis_client import get_redis
 from orchestrator.schemas import DeliveryFormat, OrderStatus
 
-logger = logging.getLogger("netrun-orchestrator-allocator")
+logger = get_logger("netrun-orchestrator-allocator")
 
 _IDEM_CACHE_TTL_SEC = 24 * 60 * 60
 
@@ -87,7 +87,11 @@ class AllocatorService:
         if idempotency_key:
             cached = await self._idem_get(idempotency_key)
             if cached is not None:
-                logger.info("reserve idempotent hit key=%s ref=%s", idempotency_key, cached.order_ref)
+                logger.info(
+                    "allocator_reserve_idempotent_hit",
+                    idempotency_key=idempotency_key,
+                    order_ref=cached.order_ref,
+                )
                 return cached
 
         cfg = get_config()
@@ -183,12 +187,12 @@ class AllocatorService:
             await self._idem_set(idempotency_key, result)
 
         logger.info(
-            "reserve success order_ref=%s sku=%s qty=%s claimed=%s ttl=%s",
-            order_ref,
-            sku_id,
-            quantity,
-            total,
-            ttl,
+            "allocator_reserve_succeeded",
+            order_ref=order_ref,
+            sku_id=sku_id,
+            quantity=quantity,
+            claimed=total,
+            ttl_sec=ttl,
         )
         return result
 
@@ -240,10 +244,10 @@ class AllocatorService:
         await redis.delete(f"reservation:{order_ref}")
 
         logger.info(
-            "commit success order_ref=%s sku=%s expires_at=%s",
-            order_ref,
-            order["sku_id"],
-            updated.get("proxies_expires_at"),
+            "allocator_commit_succeeded",
+            order_ref=order_ref,
+            sku_id=order["sku_id"],
+            proxies_expires_at=updated.get("proxies_expires_at"),
         )
         return CommitResult(
             success=True,
@@ -278,7 +282,11 @@ class AllocatorService:
         redis = await get_redis()
         await redis.delete(f"reservation:{order_ref}")
 
-        logger.info("release success order_ref=%s released=%s", order_ref, released_count)
+        logger.info(
+            "allocator_release_succeeded",
+            order_ref=order_ref,
+            released_count=released_count,
+        )
         return ReleaseResult(
             success=True,
             order_ref=order_ref,
@@ -333,10 +341,10 @@ class AllocatorService:
         )
 
         logger.info(
-            "delivery file generated order_ref=%s format=%s line_count=%s",
-            order_ref,
-            format.value,
-            line_count,
+            "allocator_delivery_file_generated",
+            order_ref=order_ref,
+            format=format.value,
+            line_count=line_count,
         )
         return ProxiesResult(
             success=True,
@@ -390,10 +398,10 @@ class AllocatorService:
             )
 
         logger.info(
-            "extend success order_ref=%s duration_days=%s extended=%s",
-            order_ref,
-            duration_days,
-            extended,
+            "allocator_extend_succeeded",
+            order_ref=order_ref,
+            duration_days=duration_days,
+            extended_count=extended,
         )
         return ExtendResult(
             success=True,
@@ -727,7 +735,7 @@ class AllocatorService:
         try:
             data = json.loads(cached)
         except json.JSONDecodeError:
-            logger.warning("idem cache corrupt key=%s", key)
+            logger.warning("allocator_idem_cache_corrupt", key=key)
             return None
         expires_at_raw = data.get("expires_at")
         return ReserveResult(

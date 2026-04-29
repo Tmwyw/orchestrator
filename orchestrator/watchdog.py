@@ -2,12 +2,11 @@
 
 from __future__ import annotations
 
-import logging
-
 from orchestrator.config import get_config
 from orchestrator.db import connect
+from orchestrator.logging_setup import get_logger
 
-logger = logging.getLogger("netrun-orchestrator-watchdog")
+logger = get_logger("netrun-orchestrator-watchdog")
 
 
 class WatchdogService:
@@ -73,7 +72,7 @@ class WatchdogService:
                         (order["id"],),
                     )
                 counters["orders_released_expired"] += 1
-                logger.info("watchdog released expired order_ref=%s", order["order_ref"])
+                logger.info("watchdog_order_released", order_ref=order["order_ref"])
 
         with connect() as conn, conn.cursor() as cur:
             cur.execute(
