@@ -432,6 +432,13 @@ clients and scripts should use `/v1/*`.
 - `GET    /v1/orders/{order_ref}`
 - `GET    /v1/orders/{order_ref}/proxies?format=socks5_uri|host_port_user_pass|user_pass_at_host_port|json`
 
+**Pay-per-GB endpoints (stubs in B-8.1, full impl in B-8.2):**
+
+- `POST   /v1/orders/reserve_pergb`             (501 until B-8.2)
+- `POST   /v1/orders/{order_ref}/topup_pergb`   (501 until B-8.2)
+- `GET    /v1/orders/{order_ref}/traffic`       (501 until B-8.2)
+- `POST   /v1/admin/traffic/poll`               (501 until B-8.2)
+
 **Legacy aliases (deprecated):** `/health`, `/nodes`, `/nodes/{id}`,
 `/jobs`, `/jobs/{id}`, `/jobs/{id}/proxies.list` — same handlers, scheduled
 for removal.
