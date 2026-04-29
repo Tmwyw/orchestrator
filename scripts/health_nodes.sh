@@ -18,7 +18,7 @@ ORCH_URL="${ORCH_URL:-http://127.0.0.1:${ORCHESTRATOR_PORT:-8090}}"
 API_KEY="${ORCHESTRATOR_API_KEY:?ORCHESTRATOR_API_KEY is required}"
 NODE_API_KEY="${NODE_API_KEY:-}"
 
-nodes="$(curl -fsS "$ORCH_URL/nodes" -H "X-NETRUN-API-KEY: $API_KEY")"
+nodes="$(curl -fsS "$ORCH_URL/v1/nodes" -H "X-NETRUN-API-KEY: $API_KEY")"
 printf '%s\n' "$nodes" | jq '.items[] | {id,name,url,status,capacity,last_health_check}'
 
 printf '%s\n' "$nodes" | jq -r '.items[] | [.id,.url] | @tsv' | while IFS=$'\t' read -r node_id node_url; do

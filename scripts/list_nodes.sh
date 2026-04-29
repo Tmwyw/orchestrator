@@ -17,4 +17,4 @@ set +a
 ORCH_URL="${ORCH_URL:-http://127.0.0.1:${ORCHESTRATOR_PORT:-8090}}"
 API_KEY="${ORCHESTRATOR_API_KEY:?ORCHESTRATOR_API_KEY is required}"
 
-curl -fsS "$ORCH_URL/nodes" -H "X-NETRUN-API-KEY: $API_KEY" | jq .
+curl -fsS "$ORCH_URL/v1/nodes" -H "X-NETRUN-API-KEY: $API_KEY" | jq .

@@ -33,7 +33,7 @@ payload="$(jq -n \
   --argjson force "$FORCE" \
   '{name:$name,url:$url,geo:$geo,capacity:$capacity,force:$force} + (if $api_key == "" then {} else {api_key:$api_key} end)')"
 
-curl -fsS -X POST "$ORCH_URL/nodes" \
+curl -fsS -X POST "$ORCH_URL/v1/nodes" \
   -H "X-NETRUN-API-KEY: $API_KEY" \
   -H "Content-Type: application/json" \
   --data-binary "$payload" | jq .

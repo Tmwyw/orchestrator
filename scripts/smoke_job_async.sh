@@ -30,13 +30,13 @@ node_payload="$(jq -n \
   --argjson capacity "$NODE_CAPACITY" \
   '{name:$name,url:$url,geo:$geo,capacity:$capacity}')"
 
-curl -fsS -X POST "$ORCH_URL/nodes" \
+curl -fsS -X POST "$ORCH_URL/v1/nodes" \
   -H "X-NETRUN-API-KEY: $API_KEY" \
   -H "Content-Type: application/json" \
   --data-binary "$node_payload" >/dev/null
 
 job_payload="$(jq -n --arg idempotency_key "$IDEMPOTENCY_KEY" '{count:10,product:"smoke",idempotency_key:$idempotency_key}')"
-job_response="$(curl -fsS -X POST "$ORCH_URL/jobs" \
+job_response="$(curl -fsS -X POST "$ORCH_URL/v1/jobs" \
   -H "X-NETRUN-API-KEY: $API_KEY" \
   -H "Content-Type: application/json" \
   --data-binary "$job_payload")"
@@ -46,7 +46,7 @@ job_id="$(printf '%s\n' "$job_response" | jq -r '.job.id')"
 
 status=""
 for _ in $(seq 1 240); do
-  job_status="$(curl -fsS "$ORCH_URL/jobs/$job_id" -H "X-NETRUN-API-KEY: $API_KEY")"
+  job_status="$(curl -fsS "$ORCH_URL/v1/jobs/$job_id" -H "X-NETRUN-API-KEY: $API_KEY")"
   status="$(printf '%s\n' "$job_status" | jq -r '.job.status')"
   if [ "$status" = "success" ] || [ "$status" = "failed" ]; then
     break
@@ -72,7 +72,7 @@ printf '%s\n' "$job_status" | jq -e '
   and .job.profile.effective_client_os_profile == "not_controlled_by_proxy"
 ' >/dev/null
 
-curl -fsS "$ORCH_URL/jobs/$job_id/proxies.list" \
+curl -fsS "$ORCH_URL/v1/jobs/$job_id/proxies.list" \
   -H "X-NETRUN-API-KEY: $API_KEY" \
   -o "$OUT_FILE"
 
