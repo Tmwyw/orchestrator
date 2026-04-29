@@ -1,0 +1,157 @@
+"""Unit tests for WatchdogService.
+
+The watchdog only touches DB; we patch ``orchestrator.watchdog.connect`` with a
+fake context manager whose cursors return pre-staged SELECT/RETURNING rows.
+"""
+
+from __future__ import annotations
+
+from contextlib import contextmanager
+from typing import Any
+from unittest.mock import MagicMock, patch
+
+import pytest
+
+
+def _make_cursor(*, fetchall_queue: list[list[dict[str, Any]]]) -> MagicMock:
+    cursor = MagicMock(name="cursor")
+    cursor.execute = MagicMock()
+    cursor.fetchall = MagicMock(side_effect=lambda: fetchall_queue.pop(0) if fetchall_queue else [])
+    cursor.fetchone = MagicMock(return_value=None)
+    cursor.__enter__ = MagicMock(return_value=cursor)
+    cursor.__exit__ = MagicMock(return_value=None)
+    return cursor
+
+
+def _make_conn(cursor: MagicMock) -> MagicMock:
+    conn = MagicMock(name="conn")
+    conn.cursor = MagicMock(return_value=cursor)
+    return conn
+
+
+def _make_phased_connect(*phases: list[dict[str, Any]]):
+    """Build a fake ``connect()`` whose successive uses return cursors with the
+    given ``fetchall_queue`` contents.
+
+    Each phase corresponds to one ``with connect() as conn`` block in
+    watchdog.run_once. For the orders phase (phase 2) extra cursors may be
+    obtained from the same conn — those are returned by the same per-phase
+    cursor mock (its ``fetchall_queue`` empties after the first SELECT, and
+    subsequent ``execute`` calls in the per-order loop need no return value).
+    """
+    cursors: list[MagicMock] = []
+    conns: list[MagicMock] = []
+    for queue in phases:
+        cur = _make_cursor(fetchall_queue=list(queue))
+        cursors.append(cur)
+        conns.append(_make_conn(cur))
+
+    iterator = iter(conns)
+
+    @contextmanager
+    def fake_connect():
+        yield next(iterator)
+
+    return fake_connect, cursors
+
+
+@pytest.fixture
+def _cfg(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("WATCHDOG_RUNNING_TIMEOUT_SEC", "1800")
+    monkeypatch.setenv("WATCHDOG_PENDING_VALIDATION_TIMEOUT_SEC", "600")
+
+
+def test_watchdog_marks_stuck_running_jobs_failed(_cfg: None) -> None:
+    from orchestrator.watchdog import WatchdogService
+
+    fake_connect, cursors = _make_phased_connect(
+        [[{"id": "j1"}, {"id": "j2"}, {"id": "j3"}]],  # phase 1: jobs
+        [[]],  # phase 2: no expired orders
+        [[]],  # phase 3: no stale pending validation
+        [[]],  # phase 4: no expired delivery
+    )
+    with patch("orchestrator.watchdog.connect", new=fake_connect):
+        counters = WatchdogService().run_once()
+
+    assert counters["jobs_failed_running"] == 3
+    assert counters["orders_released_expired"] == 0
+    sql = cursors[0].execute.call_args[0][0]
+    assert "watchdog_running_timeout" in sql
+    assert "status = 'failed'" in sql
+
+
+def test_watchdog_releases_expired_reservations(_cfg: None) -> None:
+    from orchestrator.watchdog import WatchdogService
+
+    fake_connect, cursors = _make_phased_connect(
+        [[]],  # phase 1
+        [
+            [
+                {"id": 11, "order_ref": "ord_aaa", "reservation_key": "rk-aaa"},
+                {"id": 12, "order_ref": "ord_bbb", "reservation_key": "rk-bbb"},
+            ]
+        ],  # phase 2: 2 expired orders
+        [[]],  # phase 3
+        [[]],  # phase 4
+    )
+    with patch("orchestrator.watchdog.connect", new=fake_connect):
+        counters = WatchdogService().run_once()
+
+    assert counters["orders_released_expired"] == 2
+    # cursors[1] is the orders-phase cursor reused across the SELECT and the
+    # per-order UPDATE pair (2 orders × 2 statements + 1 SELECT = 5 executes).
+    assert cursors[1].execute.call_count == 5
+    last_calls = [call[0][0] for call in cursors[1].execute.call_args_list]
+    assert any("update orders" in s and "released" in s for s in last_calls)
+    assert any("update proxy_inventory" in s and "available" in s for s in last_calls)
+
+
+def test_watchdog_invalidates_stale_pending_validation(_cfg: None) -> None:
+    from orchestrator.watchdog import WatchdogService
+
+    fake_connect, cursors = _make_phased_connect(
+        [[]],  # phase 1
+        [[]],  # phase 2
+        [[{"id": 1}, {"id": 2}, {"id": 3}, {"id": 4}, {"id": 5}]],  # phase 3
+        [[]],  # phase 4
+    )
+    with patch("orchestrator.watchdog.connect", new=fake_connect):
+        counters = WatchdogService().run_once()
+
+    assert counters["inventory_invalidated_stale"] == 5
+    sql = cursors[2].execute.call_args[0][0]
+    assert "watchdog_pending_validation_timeout" in sql
+    assert "status = 'invalid'" in sql
+
+
+def test_watchdog_clears_expired_delivery_content(_cfg: None) -> None:
+    from orchestrator.watchdog import WatchdogService
+
+    fake_connect, cursors = _make_phased_connect(
+        [[]],  # phase 1
+        [[]],  # phase 2
+        [[]],  # phase 3
+        [[{"id": 100}, {"id": 101}]],  # phase 4: 2 cleared
+    )
+    with patch("orchestrator.watchdog.connect", new=fake_connect):
+        counters = WatchdogService().run_once()
+
+    assert counters["delivery_content_expired"] == 2
+    sql = cursors[3].execute.call_args[0][0]
+    assert "update delivery_files" in sql
+    assert "set content = null" in sql
+
+
+def test_watchdog_run_once_no_op_when_clean(_cfg: None) -> None:
+    from orchestrator.watchdog import WatchdogService
+
+    fake_connect, _ = _make_phased_connect([[]], [[]], [[]], [[]])
+    with patch("orchestrator.watchdog.connect", new=fake_connect):
+        counters = WatchdogService().run_once()
+
+    assert counters == {
+        "jobs_failed_running": 0,
+        "orders_released_expired": 0,
+        "inventory_invalidated_stale": 0,
+        "delivery_content_expired": 0,
+    }
