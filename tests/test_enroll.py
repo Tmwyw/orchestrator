@@ -200,3 +200,59 @@ def test_enroll_requires_orchestrator_api_key() -> None:
         json={"agent_url": "http://10.0.0.5:8085"},
     )
     assert response.status_code == 401
+
+
+def test_enroll_existing_url_updates_in_place() -> None:
+    """ON CONFLICT (url) preserves the existing node id (Wave B-6.3 hotfix).
+
+    Simulates a row that was originally inserted by the legacy add_node.sh path
+    with a random UUID. The enroll deterministic id (uuid5 of the URL) does not
+    match, but the UPSERT collides on the url unique key and RETURNING surfaces
+    the row's actual id. Two consecutive enrolls for the same URL must return
+    the same id.
+    """
+    describe_payload = {
+        "api_key_required": False,
+        "geo_code": "US",
+        "capacity": 1500,
+        "max_parallel_jobs": 1,
+        "max_batch_size": 1500,
+        "generator_script": "/opt/netrun/node_runtime/generator/proxyyy_automated.sh",
+    }
+    ready_health = {"success": True, "status": "ready", "ipv6": {"ok": True}, "ipv6Egress": {"ok": True}}
+
+    legacy_existing_id = "legacy-random-uuid-from-add_node-sh"
+    fake_connect, _ = _make_fake_connect(
+        upsert_row={"id": legacy_existing_id, "name": "node-de-1"},
+    )
+    with (
+        patch("orchestrator.main.node_client.describe", return_value=describe_payload),
+        patch("orchestrator.main.check_health", return_value=ready_health),
+        patch("orchestrator.main.connect", new=fake_connect),
+    ):
+        client = _client()
+        response_1 = client.post(
+            "/v1/nodes/enroll",
+            json={"agent_url": "http://10.0.0.5:8085"},
+            headers={"X-NETRUN-API-KEY": "test-api-key"},
+        )
+
+    fake_connect_2, _ = _make_fake_connect(
+        upsert_row={"id": legacy_existing_id, "name": "node-de-1"},
+    )
+    with (
+        patch("orchestrator.main.node_client.describe", return_value=describe_payload),
+        patch("orchestrator.main.check_health", return_value=ready_health),
+        patch("orchestrator.main.connect", new=fake_connect_2),
+    ):
+        response_2 = client.post(
+            "/v1/nodes/enroll",
+            json={"agent_url": "http://10.0.0.5:8085"},
+            headers={"X-NETRUN-API-KEY": "test-api-key"},
+        )
+
+    assert response_1.status_code == 200
+    assert response_2.status_code == 200
+    assert response_1.json()["node"]["id"] == legacy_existing_id
+    assert response_2.json()["node"]["id"] == legacy_existing_id
+    assert response_1.json()["node"]["name"] == "node-de-1"

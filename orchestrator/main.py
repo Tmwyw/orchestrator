@@ -289,9 +289,8 @@ async def enroll_node(payload: EnrollRequest):
               runtime_status, last_health_check
             )
             values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'active', now())
-            on conflict (id) do update set
+            on conflict (url) do update set
               name = excluded.name,
-              url = excluded.url,
               geo = excluded.geo,
               capacity = excluded.capacity,
               api_key = excluded.api_key,
@@ -316,7 +315,10 @@ async def enroll_node(payload: EnrollRequest):
                 max_batch,
             ),
         )
-        cur.fetchone()
+        node_row = cur.fetchone() or {}
+
+    actual_node_id = str(node_row.get("id") or node_id)
+    actual_name = str(node_row.get("name") or name)
 
     bound_skus: list[str] = []
     if payload.auto_bind_active_skus and geo:
@@ -332,14 +334,14 @@ async def enroll_node(payload: EnrollRequest):
                   updated_at = now()
                 returning (select code from skus where id = sku_node_bindings.sku_id) as code
                 """,
-                (node_id, max_batch, capacity, geo),
+                (actual_node_id, max_batch, capacity, geo),
             )
             bound_skus = [r["code"] for r in cur.fetchall() if r.get("code")]
 
     logger.info(
         "node enrolled id=%s name=%s url=%s geo=%s status=%s auto_bound=%s",
-        node_id,
-        name,
+        actual_node_id,
+        actual_name,
         url,
         geo,
         node_status,
@@ -348,8 +350,8 @@ async def enroll_node(payload: EnrollRequest):
     return JSONResponse(
         content=EnrollResponse(
             node=NodeSummary(
-                id=node_id,
-                name=name,
+                id=actual_node_id,
+                name=actual_name,
                 url=url,
                 geo=geo,
                 status=node_status,
