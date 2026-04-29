@@ -1,11 +1,13 @@
 import asyncio
 import json
+import time
 import uuid
 from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse, Response
+from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from psycopg.types.json import Jsonb
 
 from orchestrator import node_client
@@ -30,6 +32,7 @@ from orchestrator.config import get_config
 from orchestrator.db import connect, fetch_all, fetch_one
 from orchestrator.jobs import log_job_event, node_health_diagnostics, node_health_ready, public_job
 from orchestrator.logging_setup import configure_logging, get_logger
+from orchestrator.metrics import HTTP_DURATION_SEC, HTTP_REQUESTS
 from orchestrator.node_client import check_health
 from orchestrator.schemas import DeliveryFormat
 from shared.contracts import FORBIDDEN_JOB_FIELDS, PRODUCTION_PROFILE
@@ -44,6 +47,30 @@ app = FastAPI(
     redoc_url=None,
     openapi_url=None,
 )
+
+
+@app.middleware("http")
+async def track_http(request: Request, call_next):
+    start = time.monotonic()
+    response = await call_next(request)
+    duration = time.monotonic() - start
+    route = request.scope.get("route")
+    path = route.path if route is not None else request.url.path
+    HTTP_REQUESTS.labels(
+        method=request.method,
+        path=path,
+        status=str(response.status_code),
+    ).inc()
+    HTTP_DURATION_SEC.labels(method=request.method, path=path).observe(duration)
+    return response
+
+
+# /metrics intentionally has no API key — protected by network boundary
+# (bind 127.0.0.1 + optional nginx ACL via scripts/install_nginx.sh in
+# B-7b.5). DO NOT expose 8090 publicly.
+@app.get("/metrics")
+def metrics():
+    return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
 ALLOWED_PRODUCTS = {"android_ipv6_only", "smoke"}
 ALLOWED_JOB_FIELDS = {"count", "product", "idempotency_key"}
