@@ -10,7 +10,7 @@ from psycopg.types.json import Jsonb
 from orchestrator.config import get_config
 from orchestrator.db import connect
 from orchestrator.distribution import equal_share
-from orchestrator.jobs import allocate_port_range_via_table
+from orchestrator.jobs import allocate_port_range_via_table, log_job_event
 from orchestrator.logging_setup import get_logger
 from shared.contracts import PRODUCTION_PROFILE
 
@@ -103,34 +103,64 @@ class RefillService:
 
                     job_id = str(uuid.uuid4())
                     payload = self._build_refill_payload(sku=sku, count=qty)
+                    job_inserted = False
+                    try:
+                        self._insert_refill_job(
+                            conn,
+                            job_id=job_id,
+                            sku_id=int(sku["id"]),
+                            node_id=str(binding["node_id"]),
+                            count=qty,
+                            priority=cfg.refill_default_priority,
+                            product=_PRODUCT_BY_KIND.get(str(sku["product_kind"]), str(sku["code"])),
+                            payload=payload,
+                        )
+                        job_inserted = True
+                        start_port, _ = allocate_port_range_via_table(
+                            conn,
+                            node_id=str(binding["node_id"]),
+                            job_id=job_id,
+                            count=qty,
+                        )
+                        self._set_job_start_port(conn, job_id=job_id, start_port=start_port)
 
-                    self._insert_refill_job(
-                        conn,
-                        job_id=job_id,
-                        sku_id=int(sku["id"]),
-                        node_id=str(binding["node_id"]),
-                        count=qty,
-                        priority=cfg.refill_default_priority,
-                        product=_PRODUCT_BY_KIND.get(str(sku["product_kind"]), str(sku["code"])),
-                        payload=payload,
-                    )
-                    start_port, _ = allocate_port_range_via_table(
-                        conn,
-                        node_id=str(binding["node_id"]),
-                        job_id=job_id,
-                        count=qty,
-                    )
-                    self._set_job_start_port(conn, job_id=job_id, start_port=start_port)
-
-                    counters["jobs_enqueued"] += 1
-                    logger.info(
-                        "refill_job_enqueued",
-                        job_id=job_id,
-                        sku=sku["code"],
-                        node_id=binding["node_id"],
-                        count=qty,
-                        start_port=start_port,
-                    )
+                        counters["jobs_enqueued"] += 1
+                        logger.info(
+                            "refill_job_enqueued",
+                            job_id=job_id,
+                            sku=sku["code"],
+                            node_id=binding["node_id"],
+                            count=qty,
+                            start_port=start_port,
+                        )
+                    except Exception as exc:
+                        if job_inserted:
+                            try:
+                                log_job_event(
+                                    conn,
+                                    job_id,
+                                    "refill_failed",
+                                    {
+                                        "error": str(exc),
+                                        "error_type": type(exc).__name__,
+                                        "sku_id": int(sku["id"]),
+                                        "node_id": str(binding["node_id"]),
+                                        "count": qty,
+                                    },
+                                )
+                            except Exception:
+                                logger.exception(
+                                    "refill_log_job_event_failed", job_id=job_id
+                                )
+                        else:
+                            logger.warning(
+                                "refill_failed_pre_insert",
+                                sku_id=int(sku["id"]),
+                                node_id=str(binding["node_id"]),
+                                error=str(exc),
+                                error_type=type(exc).__name__,
+                            )
+                        # NO raise — continue with next binding.
 
         return counters
 

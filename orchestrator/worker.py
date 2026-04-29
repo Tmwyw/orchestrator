@@ -301,6 +301,9 @@ def process_refill_job(job: dict[str, Any]) -> None:
                 "detail": str(exc),
                 "node": node_id,
                 "sku_id": sku_id,
+                "error_type": type(exc).__name__,
+                "error_class": "request_error",
+                "attempts": 1,
             },
         )
         logger.warning(
@@ -308,7 +311,10 @@ def process_refill_job(job: dict[str, Any]) -> None:
             job_id=job_id,
             error="node_unavailable",
             detail=str(exc),
+            error_type=type(exc).__name__,
+            error_class="request_error",
         )
+        # NO raise — worker loop must continue claiming next jobs.
     except RuntimeError as exc:
         error = (
             str(exc)
@@ -324,9 +330,19 @@ def process_refill_job(job: dict[str, Any]) -> None:
                 "detail": str(exc),
                 "node": node_id,
                 "sku_id": sku_id,
+                "error_type": type(exc).__name__,
+                "error_class": "runtime_error",
+                "attempts": 1,
             },
         )
-        logger.warning("worker_refill_job_failed", job_id=job_id, error=error)
+        logger.warning(
+            "worker_refill_job_failed",
+            job_id=job_id,
+            error=error,
+            error_type=type(exc).__name__,
+            error_class="runtime_error",
+        )
+        # NO raise.
     except Exception as exc:
         mark_failed(
             job_id,
@@ -337,9 +353,19 @@ def process_refill_job(job: dict[str, Any]) -> None:
                 "detail": str(exc),
                 "node": node_id,
                 "sku_id": sku_id,
+                "error_type": type(exc).__name__,
+                "error_class": "unknown",
+                "attempts": 1,
             },
         )
-        logger.exception("worker_refill_job_failed", job_id=job_id, error="internal_error")
+        logger.exception(
+            "worker_refill_job_failed",
+            job_id=job_id,
+            error="internal_error",
+            error_type=type(exc).__name__,
+            error_class="unknown",
+        )
+        # NO raise.
 
 
 def run_once() -> bool:
