@@ -8,9 +8,11 @@ from typing import Any
 
 from orchestrator.db import connect
 from orchestrator.logging_setup import get_logger
+from orchestrator.metrics import SCHEDULER_RUN_DURATION_SEC, SCHEDULER_RUN_TOTAL
 from orchestrator.validation import ProxyValidationService, ValidationResult
 
 logger = get_logger("netrun-orchestrator-validation-worker")
+_SCHED = "validation"
 
 DEFAULT_BATCH_SIZE = 50
 DEFAULT_CONCURRENCY = 20
@@ -43,15 +45,18 @@ class ProxyValidationWorker:
             concurrency=self.concurrency,
         )
         while not stop_event.is_set():
-            try:
-                processed = await self.run_once()
-                if processed == 0:
+            with SCHEDULER_RUN_DURATION_SEC.labels(scheduler=_SCHED).time():
+                try:
+                    processed = await self.run_once()
+                    SCHEDULER_RUN_TOTAL.labels(scheduler=_SCHED, status="success").inc()
+                    if processed == 0:
+                        await asyncio.sleep(self.poll_interval_sec)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    SCHEDULER_RUN_TOTAL.labels(scheduler=_SCHED, status="failed").inc()
+                    logger.exception("validation_loop_error")
                     await asyncio.sleep(self.poll_interval_sec)
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                logger.exception("validation_loop_error")
-                await asyncio.sleep(self.poll_interval_sec)
 
     async def run_once(self) -> int:
         rows = await asyncio.to_thread(self._sync_claim_batch)
