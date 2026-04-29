@@ -149,9 +149,7 @@ class RefillService:
                                     },
                                 )
                             except Exception:
-                                logger.exception(
-                                    "refill_log_job_event_failed", job_id=job_id
-                                )
+                                logger.exception("refill_log_job_event_failed", job_id=job_id)
                         else:
                             logger.warning(
                                 "refill_failed_pre_insert",
