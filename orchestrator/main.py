@@ -11,7 +11,7 @@ from psycopg.types.json import Jsonb
 
 from orchestrator import node_client
 from orchestrator.allocator import AllocatorService
-from orchestrator.logging_setup import configure_logging
+from orchestrator.logging_setup import configure_logging, get_logger
 
 configure_logging()
 from orchestrator.api_schemas import (
@@ -37,7 +37,7 @@ from orchestrator.node_client import check_health
 from orchestrator.schemas import DeliveryFormat
 from shared.contracts import FORBIDDEN_JOB_FIELDS, PRODUCTION_PROFILE
 
-logger = logging.getLogger("netrun-orchestrator")
+logger = get_logger("netrun-orchestrator")
 
 app = FastAPI(
     title="NETRUN Orchestrator",
@@ -341,13 +341,13 @@ async def enroll_node(payload: EnrollRequest):
             bound_skus = [r["code"] for r in cur.fetchall() if r.get("code")]
 
     logger.info(
-        "node enrolled id=%s name=%s url=%s geo=%s status=%s auto_bound=%s",
-        actual_node_id,
-        actual_name,
-        url,
-        geo,
-        node_status,
-        bound_skus,
+        "main_node_enrolled",
+        node_id=actual_node_id,
+        name=actual_name,
+        url=url,
+        geo=geo,
+        status=node_status,
+        auto_bound_skus=bound_skus,
     )
     return JSONResponse(
         content=EnrollResponse(
@@ -425,10 +425,11 @@ async def create_job(request: Request):
         )
 
     logger.info(
-        "job queued job_id=%s idempotency_key=%s profile=%s ipv6_policy=ipv6_only",
-        job["id"],
-        idempotency_key,
-        PRODUCTION_PROFILE["fingerprint_profile_version"],
+        "main_job_queued",
+        job_id=job["id"],
+        idempotency_key=idempotency_key,
+        fingerprint_profile=PRODUCTION_PROFILE["fingerprint_profile_version"],
+        ipv6_policy="ipv6_only",
     )
     return {"success": True, "status": "queued", "idempotent": False, "job": public_job(job)}
 
