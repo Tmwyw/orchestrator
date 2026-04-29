@@ -437,3 +437,83 @@ clients and scripts should use `/v1/*`.
 for removal.
 
 All endpoints require `X-NETRUN-API-KEY` matching `ORCHESTRATOR_API_KEY`.
+
+---
+
+## 11. Nginx + TLS (Wave B-7b.5)
+
+By default the orchestrator binds to `127.0.0.1` only — no external
+access. For environments that need external access (production behind
+a reverse proxy), use the opt-in `scripts/install_nginx.sh`.
+
+### When to install nginx
+
+- You need external access to `/v1/*` endpoints from the bot or
+  operators outside the orchestrator host.
+- You want per-network ACLs on `/metrics` (the FastAPI process has no
+  auth on this endpoint by design).
+
+Skip nginx if all clients run on the orchestrator host (e.g. local
+development, single-machine deployments). The default 127.0.0.1 bind
+is sufficient.
+
+### Installing the reverse proxy
+
+Run as root on the orchestrator host:
+
+```bash
+cd /opt/netrun-orchestrator
+bash scripts/install_nginx.sh
+```
+
+Defaults:
+
+| Variable | Default | Effect |
+|----------|---------|--------|
+| `NGINX_LISTEN_PORT` | `8091` | Port nginx listens on. NOT 80 — that is intentionally avoided to coexist with other projects on this host. Run with `NGINX_LISTEN_PORT=443` if you have TLS configured. |
+| `NGINX_SERVER_NAME` | `orchestrator.localhost` | Explicit server_name so nginx can route by Host header without becoming a default vhost. |
+| `METRICS_ALLOW_NETWORKS` | (empty) | Comma-separated CIDRs allowed to scrape `/metrics` in addition to `127.0.0.1`. Example: `10.0.0.0/8,192.168.1.0/24`. |
+
+Override at install time:
+
+```bash
+NGINX_LISTEN_PORT=443 \
+NGINX_SERVER_NAME=api.example.com \
+METRICS_ALLOW_NETWORKS="10.0.0.0/8" \
+  bash scripts/install_nginx.sh
+```
+
+The script is idempotent — re-running updates the config and reloads
+nginx, never creates duplicates.
+
+### Adding TLS with certbot
+
+Certbot is NOT installed by `install_nginx.sh` — operators run it
+manually after pointing DNS at the host:
+
+```bash
+apt-get install -y certbot python3-certbot-nginx
+certbot --nginx -d api.example.com
+```
+
+Certbot rewrites `/etc/nginx/sites-available/netrun-orchestrator.conf`
+in place to add `listen 443 ssl;` and the cert paths. Re-running
+`scripts/install_nginx.sh` afterwards will OVERWRITE these certbot
+edits — apply env overrides directly when you next re-install, or
+re-run certbot.
+
+### Coexistence with other projects on the same host
+
+The template intentionally:
+- Uses an explicit `server_name` (no wildcard / no `default_server`).
+- Listens on a non-80 port by default.
+- Touches only `/etc/nginx/sites-available/netrun-orchestrator.conf`
+  and its symlink in `sites-enabled/`. Does NOT remove existing
+  `default` or other vhosts.
+
+Verify your other projects still respond after install:
+
+```bash
+nginx -T | grep -E '(server_name|listen)'   # see all vhosts
+curl -sI http://other-project.example.com/  # confirm reachable
+```
