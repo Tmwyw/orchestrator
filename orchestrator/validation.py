@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import ipaddress
-import logging
 import time
 from dataclasses import dataclass
 from typing import Any
@@ -13,7 +12,9 @@ from urllib.parse import quote
 
 import httpx
 
-logger = logging.getLogger("netrun-orchestrator-validation")
+from orchestrator.logging_setup import get_logger
+
+logger = get_logger("netrun-orchestrator-validation")
 
 
 @dataclass(slots=True)

@@ -3,14 +3,14 @@
 from __future__ import annotations
 
 import asyncio
-import logging
 import os
 from typing import Any
 
 from orchestrator.db import connect
+from orchestrator.logging_setup import get_logger
 from orchestrator.validation import ProxyValidationService, ValidationResult
 
-logger = logging.getLogger("netrun-orchestrator-validation-worker")
+logger = get_logger("netrun-orchestrator-validation-worker")
 
 DEFAULT_BATCH_SIZE = 50
 DEFAULT_CONCURRENCY = 20
@@ -37,10 +37,10 @@ class ProxyValidationWorker:
 
     async def run_loop(self, stop_event: asyncio.Event) -> None:
         logger.info(
-            "validation worker started worker_id=%s batch=%s concurrency=%s",
-            self.worker_id,
-            self.batch_size,
-            self.concurrency,
+            "validation_worker_started",
+            worker_id=self.worker_id,
+            batch_size=self.batch_size,
+            concurrency=self.concurrency,
         )
         while not stop_event.is_set():
             try:
@@ -50,7 +50,7 @@ class ProxyValidationWorker:
             except asyncio.CancelledError:
                 raise
             except Exception:
-                logger.exception("validation loop error")
+                logger.exception("validation_loop_error")
                 await asyncio.sleep(self.poll_interval_sec)
 
     async def run_once(self) -> int:
@@ -65,7 +65,7 @@ class ProxyValidationWorker:
                 try:
                     return await self.validator.validate_inventory_row(row)
                 except Exception as exc:
-                    logger.exception("validation exception inventory_id=%s", row.get("id"))
+                    logger.exception("validation_probe_exception", inventory_id=row.get("id"))
                     return ValidationResult(
                         inventory_id=int(row["id"]),
                         is_valid=False,
@@ -83,11 +83,11 @@ class ProxyValidationWorker:
         invalid = [r for r in results if not r.is_valid]
         await asyncio.to_thread(self._sync_mark_results, valid, invalid)
         logger.info(
-            "validation cycle worker_id=%s claimed=%s valid=%s invalid=%s",
-            self.worker_id,
-            len(rows),
-            len(valid),
-            len(invalid),
+            "validation_cycle_completed",
+            worker_id=self.worker_id,
+            claimed=len(rows),
+            valid=len(valid),
+            invalid=len(invalid),
         )
         return len(rows)
 
