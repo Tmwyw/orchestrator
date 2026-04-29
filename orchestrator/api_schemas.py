@@ -242,3 +242,66 @@ class ArchiveExportResponse(BaseModel):
     count: int
     from_date: str = Field(alias="from")
     to_date: str = Field(alias="to")
+
+
+# === Pay-per-GB (Wave B-8) ===
+
+
+class ReservePergbRequest(BaseModel):
+    user_id: int
+    sku_id: int
+    gb_amount: int = Field(ge=1)
+    idempotency_key: str | None = Field(default=None, max_length=128)
+
+
+class ReservePergbResponse(BaseModel):
+    success: bool
+    order_ref: str
+    expires_at: datetime
+    port: int
+    host: str
+    login: str
+    password: str
+    bytes_quota: int
+    price_amount: Decimal
+
+
+class TopupPergbRequest(BaseModel):
+    sku_id: int
+    gb_amount: int = Field(ge=1)
+    idempotency_key: str | None = Field(default=None, max_length=128)
+
+
+class TopupPergbResponse(BaseModel):
+    success: bool
+    order_ref: str
+    parent_order_ref: str
+    topup_sequence: int
+    bytes_quota_total: int
+    bytes_used: int
+    expires_at: datetime
+    price_amount: Decimal
+    tier_price_per_gb: Decimal
+
+
+class TrafficResponse(BaseModel):
+    order_ref: str
+    status: str
+    bytes_quota: int
+    bytes_used: int
+    bytes_remaining: int
+    usage_pct: float
+    last_polled_at: datetime | None = None
+    expires_at: datetime
+    depleted_at: datetime | None = None
+    node_id: str
+    port: int
+    over_usage_bytes: int = 0
+
+
+class AdminTrafficPollResponse(BaseModel):
+    accounts_polled: int
+    nodes_polled: int
+    bytes_observed_total: int
+    counter_resets_detected: int
+    accounts_marked_depleted: int
