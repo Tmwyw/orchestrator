@@ -179,3 +179,66 @@ class EnrollResponse(BaseModel):
     node: NodeSummary
     describe_geo_code: str | None = None
     auto_bound_skus: list[str] = Field(default_factory=list)
+
+
+# === /v1/admin/* (Wave B-7b.3) ===
+
+
+class StatsSales(BaseModel):
+    orders: int
+    proxies: int
+    revenue: Decimal
+
+
+class StatsInventoryRow(BaseModel):
+    code: str
+    status: str
+    n: int
+
+
+class StatsNodes(BaseModel):
+    ready: int
+    total: int
+
+
+class StatsResponse(BaseModel):
+    sales: StatsSales
+    inventory: list[StatsInventoryRow]
+    nodes: StatsNodes
+
+
+class OrderListItem(BaseModel):
+    order_ref: str
+    user_id: int
+    sku_id: int
+    status: str
+    requested_count: int
+    allocated_count: int
+    reserved_at: datetime
+    expires_at: datetime
+    committed_at: datetime | None = None
+    proxies_expires_at: datetime | None = None
+
+
+class OrdersListResponse(BaseModel):
+    items: list[OrderListItem]
+    count: int
+
+
+class ArchiveExportItem(BaseModel):
+    id: int
+    sku_code: str
+    host: str
+    port: int
+    login: str
+    password: str
+    geo_country: str | None = None
+    archived_at: datetime
+    order_id: int | None = None
+
+
+class ArchiveExportResponse(BaseModel):
+    items: list[ArchiveExportItem]
+    count: int
+    from_date: str = Field(alias="from")
+    to_date: str = Field(alias="to")
