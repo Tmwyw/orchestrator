@@ -1,4 +1,3 @@
-import logging
 import time
 from typing import Any
 
@@ -15,12 +14,12 @@ from orchestrator.jobs import (
     select_node,
     write_proxies_file,
 )
-from orchestrator.logging_setup import configure_logging
+from orchestrator.logging_setup import configure_logging, get_logger
 from orchestrator.node_client import generate
 from shared.contracts import PRODUCTION_PROFILE
 
 configure_logging()
-logger = logging.getLogger("netrun-orchestrator-worker")
+logger = get_logger("netrun-orchestrator-worker")
 
 
 def claim_next_job() -> dict[str, Any] | None:
@@ -114,10 +113,11 @@ def process_simple_job(job: dict[str, Any]) -> None:
     try:
         node, start_port = assign_node_and_port(job)
         logger.info(
-            "job generation start job_id=%s node=%s profile=%s ipv6_policy=ipv6_only",
-            job_id,
-            node["id"],
-            PRODUCTION_PROFILE["fingerprint_profile_version"],
+            "worker_generation_started",
+            job_id=job_id,
+            node_id=node["id"],
+            fingerprint_profile=PRODUCTION_PROFILE["fingerprint_profile_version"],
+            ipv6_policy="ipv6_only",
         )
         result = generate(
             url=node["url"],
@@ -135,14 +135,20 @@ def process_simple_job(job: dict[str, Any]) -> None:
             "node_response": response_diagnostics(result),
         }
         if result.get("success") is not True or result.get("status") != "ready":
-            logger.warning("generation_failed job_id=%s diagnostics=%s", job_id, response_diagnostics(result))
+            logger.warning(
+                "worker_generation_failed",
+                job_id=job_id,
+                diagnostics=response_diagnostics(result),
+            )
             mark_failed(job_id, "generation_failed", event_base)
             return
 
         items = result.get("items")
         if not isinstance(items, list) or len(items) < int(job["count"]):
             logger.warning(
-                "node_response_missing_items job_id=%s diagnostics=%s", job_id, response_diagnostics(result)
+                "worker_node_response_missing_items",
+                job_id=job_id,
+                diagnostics=response_diagnostics(result),
             )
             mark_failed(job_id, "node_response_missing_items", event_base)
             return
@@ -150,7 +156,12 @@ def process_simple_job(job: dict[str, Any]) -> None:
         proxy_lines = normalize_proxy_items(items[: int(job["count"])])
         result_path = write_proxies_file(job_id, proxy_lines)
         mark_success(job_id, str(result_path), event_base)
-        logger.info("job success job_id=%s node=%s result=%s", job_id, node["id"], result_path)
+        logger.info(
+            "worker_job_succeeded",
+            job_id=job_id,
+            node_id=node["id"],
+            result_path=str(result_path),
+        )
 
     except httpx.RequestError as exc:
         mark_failed(
@@ -158,7 +169,12 @@ def process_simple_job(job: dict[str, Any]) -> None:
             "node_unavailable",
             {"profile": PRODUCTION_PROFILE, "ipv6_policy": "ipv6_only", "detail": str(exc)},
         )
-        logger.warning("job failed job_id=%s error=node_unavailable detail=%s", job_id, exc)
+        logger.warning(
+            "worker_job_failed",
+            job_id=job_id,
+            error="node_unavailable",
+            detail=str(exc),
+        )
     except RuntimeError as exc:
         error = (
             str(exc)
@@ -168,14 +184,14 @@ def process_simple_job(job: dict[str, Any]) -> None:
         mark_failed(
             job_id, error, {"profile": PRODUCTION_PROFILE, "ipv6_policy": "ipv6_only", "detail": str(exc)}
         )
-        logger.warning("job failed job_id=%s error=%s", job_id, error)
-    except Exception as exc:
+        logger.warning("worker_job_failed", job_id=job_id, error=error)
+    except Exception:
         mark_failed(
             job_id,
             "generation_failed",
-            {"profile": PRODUCTION_PROFILE, "ipv6_policy": "ipv6_only", "detail": str(exc)},
+            {"profile": PRODUCTION_PROFILE, "ipv6_policy": "ipv6_only"},
         )
-        logger.exception("job failed job_id=%s error=generation_failed", job_id)
+        logger.exception("worker_job_failed", job_id=job_id, error="generation_failed")
 
 
 def process_refill_job(job: dict[str, Any]) -> None:
@@ -210,12 +226,12 @@ def process_refill_job(job: dict[str, Any]) -> None:
         node = dict(node_row)
 
         logger.info(
-            "refill job generation start job_id=%s node=%s sku_id=%s count=%s start_port=%s",
-            job_id,
-            node_id,
-            sku_id,
-            count,
-            start_port,
+            "worker_refill_generation_started",
+            job_id=job_id,
+            node_id=node_id,
+            sku_id=sku_id,
+            count=count,
+            start_port=start_port,
         )
         result = generate(
             url=node["url"],
@@ -235,9 +251,9 @@ def process_refill_job(job: dict[str, Any]) -> None:
         }
         if result.get("success") is not True or result.get("status") != "ready":
             logger.warning(
-                "refill generation_failed job_id=%s diagnostics=%s",
-                job_id,
-                response_diagnostics(result),
+                "worker_refill_generation_failed",
+                job_id=job_id,
+                diagnostics=response_diagnostics(result),
             )
             mark_failed(job_id, "generation_failed", event_base)
             return
@@ -245,9 +261,9 @@ def process_refill_job(job: dict[str, Any]) -> None:
         items = result.get("items")
         if not isinstance(items, list) or len(items) < count:
             logger.warning(
-                "refill node_response_missing_items job_id=%s diagnostics=%s",
-                job_id,
-                response_diagnostics(result),
+                "worker_refill_node_response_missing_items",
+                job_id=job_id,
+                diagnostics=response_diagnostics(result),
             )
             mark_failed(job_id, "node_response_missing_items", event_base)
             return
@@ -268,11 +284,11 @@ def process_refill_job(job: dict[str, Any]) -> None:
             {**event_base, "imported_to_pending_validation": inserted},
         )
         logger.info(
-            "refill job success job_id=%s sku=%s node=%s inserted=%s",
-            job_id,
-            sku_id,
-            node_id,
-            inserted,
+            "worker_refill_job_succeeded",
+            job_id=job_id,
+            sku_id=sku_id,
+            node_id=node_id,
+            inserted=inserted,
         )
 
     except httpx.RequestError as exc:
@@ -287,7 +303,12 @@ def process_refill_job(job: dict[str, Any]) -> None:
                 "sku_id": sku_id,
             },
         )
-        logger.warning("refill job failed job_id=%s error=node_unavailable detail=%s", job_id, exc)
+        logger.warning(
+            "worker_refill_job_failed",
+            job_id=job_id,
+            error="node_unavailable",
+            detail=str(exc),
+        )
     except RuntimeError as exc:
         error = (
             str(exc)
@@ -305,7 +326,7 @@ def process_refill_job(job: dict[str, Any]) -> None:
                 "sku_id": sku_id,
             },
         )
-        logger.warning("refill job failed job_id=%s error=%s", job_id, error)
+        logger.warning("worker_refill_job_failed", job_id=job_id, error=error)
     except Exception as exc:
         mark_failed(
             job_id,
@@ -318,7 +339,7 @@ def process_refill_job(job: dict[str, Any]) -> None:
                 "sku_id": sku_id,
             },
         )
-        logger.exception("refill job failed job_id=%s error=internal_error", job_id)
+        logger.exception("worker_refill_job_failed", job_id=job_id, error="internal_error")
 
 
 def run_once() -> bool:
@@ -331,7 +352,7 @@ def run_once() -> bool:
 
 def run_loop() -> None:
     poll_sec = max(1, get_config().worker_poll_interval_sec)
-    logger.info("worker loop started poll_sec=%s", poll_sec)
+    logger.info("worker_loop_started", poll_sec=poll_sec)
     while True:
         processed = run_once()
         if not processed:
