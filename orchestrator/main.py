@@ -1,6 +1,5 @@
 import asyncio
 import json
-import logging
 import uuid
 from pathlib import Path
 from typing import Any
@@ -11,9 +10,6 @@ from psycopg.types.json import Jsonb
 
 from orchestrator import node_client
 from orchestrator.allocator import AllocatorService
-from orchestrator.logging_setup import configure_logging, get_logger
-
-configure_logging()
 from orchestrator.api_schemas import (
     CommitRequest,
     CommitResponse,
@@ -33,10 +29,12 @@ from orchestrator.api_schemas import (
 from orchestrator.config import get_config
 from orchestrator.db import connect, fetch_all, fetch_one
 from orchestrator.jobs import log_job_event, node_health_diagnostics, node_health_ready, public_job
+from orchestrator.logging_setup import configure_logging, get_logger
 from orchestrator.node_client import check_health
 from orchestrator.schemas import DeliveryFormat
 from shared.contracts import FORBIDDEN_JOB_FIELDS, PRODUCTION_PROFILE
 
+configure_logging()
 logger = get_logger("netrun-orchestrator")
 
 app = FastAPI(

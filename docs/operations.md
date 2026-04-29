@@ -280,6 +280,19 @@ screen -r netrun-refill                       # refill loop output
 screen -r netrun-validation                   # validation loop output
 ```
 
+### Structured logs (Wave B-7b.1)
+
+Since Wave B-7b.1 the API + 4 schedulers emit JSON to stderr (one event
+per line). Use `jq` to filter:
+
+```bash
+journalctl -u netrun-orchestrator -o cat | jq 'select(.level == "error")'
+journalctl -u netrun-orchestrator-watchdog -o cat | jq 'select(.event | startswith("watchdog_"))'
+```
+
+Common fields: `event`, `level`, `logger`, `timestamp`. Service-specific
+context fields: `order_ref`, `sku_id`, `node_id`, `job_id`.
+
 Redis introspection:
 
 ```bash
