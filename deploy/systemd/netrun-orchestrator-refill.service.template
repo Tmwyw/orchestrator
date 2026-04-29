@@ -1,0 +1,19 @@
+[Unit]
+Description=NETRUN Orchestrator Refill Scheduler
+After=network-online.target postgresql.service redis-server.service netrun-orchestrator.service
+Wants=network-online.target
+Requires=postgresql.service redis-server.service
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/netrun-orchestrator
+EnvironmentFile=/opt/netrun-orchestrator/.env
+ExecStart=/opt/netrun-orchestrator/.venv/bin/python -m orchestrator.refill_scheduler
+Restart=always
+RestartSec=5
+LimitNOFILE=65536
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
