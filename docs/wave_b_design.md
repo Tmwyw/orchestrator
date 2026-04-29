@@ -560,6 +560,26 @@ class CommitRequest(BaseModel):
     duration_days: int | None = None  # override SKU default
 ```
 
+### 6.10. Decimal serialization convention (Wave B-7b.3)
+
+All money-typed fields use `Decimal` in Python and `NUMERIC(18,8)` in
+Postgres. When Pydantic v2 serializes via `model_dump(mode="json")`,
+Decimal becomes a **string** (not a JSON number) to preserve precision.
+
+Affected fields across the API: `revenue` (admin/stats), `price_amount`
+(orders), `price_per_piece` and `price_per_gb` (skus). Bot client (Wave C)
+MUST parse these as `Decimal(str_value)`, never `float(value)`.
+
+Example response fragment:
+
+```json
+{"sales": {"orders": 5, "proxies": 25, "revenue": "12.50000000"}}
+```
+
+Floats lose precision past 7-15 digits; user balances stored as Decimal
+accumulate rounding errors if money math goes through float. This
+convention is enforced at the Pydantic schema layer, not at runtime.
+
 ---
 
 ## 7. Lifecycle of a proxy
