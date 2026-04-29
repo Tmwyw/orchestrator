@@ -935,4 +935,5 @@ Implementation starts with Wave B-0 prompt to be issued separately.
 | 8 | `commit` expires_at check идёт в Python; SQL UPDATE не валидирует expires_at | `orchestrator/allocator.py:commit` | Wave B-7 (watchdog) |
 | 9 | MagicMock на приватных _sync_* методах в test_allocator.py — pragmatic unit testing | `tests/test_allocator.py` | Wave B-5 (real DB integration tests) |
 | 10 | `FOR UPDATE` with aggregate (MAX) in allocate_port_range_via_table → psycopg FeatureNotSupported | `orchestrator/jobs.py` | **FIXED in Wave B-5b** via pg_advisory_xact_lock |
+| 18 | enroll_node `ON CONFLICT (id)` падал с UniqueViolation на `nodes_url_key` когда нода уже была зарегистрирована через `add_node.sh` (random UUID) | `orchestrator/main.py:enroll_node` | **FIXED in Wave B-6.3**: switched to `ON CONFLICT (url)`, preserves existing id |
 
