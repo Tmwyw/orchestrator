@@ -293,6 +293,41 @@ journalctl -u netrun-orchestrator-watchdog -o cat | jq 'select(.event | startswi
 Common fields: `event`, `level`, `logger`, `timestamp`. Service-specific
 context fields: `order_ref`, `sku_id`, `node_id`, `job_id`.
 
+### Prometheus metrics (Wave B-7b.2)
+
+Orchestrator exposes Prometheus exposition format on `/metrics` (no
+auth — protected by network boundary, see B-7b.5 nginx ACL). Key
+metrics:
+
+| Metric | Type | Labels |
+|---|---|---|
+| `netrun_reserve_total` | counter | status, error |
+| `netrun_reserve_duration_sec` | histogram | — |
+| `netrun_commit_total` | counter | status |
+| `netrun_release_total` | counter | status |
+| `netrun_scheduler_run_total` | counter | scheduler, status |
+| `netrun_scheduler_run_duration_sec` | histogram | scheduler |
+| `netrun_watchdog_actions_total` | counter | action |
+| `netrun_http_requests_total` | counter | method, path, status |
+| `netrun_http_duration_sec` | histogram | method, path |
+
+Example scrape config (Prometheus side):
+
+```yaml
+scrape_configs:
+  - job_name: netrun-orchestrator
+    static_configs:
+      - targets: ['127.0.0.1:8090']
+    metrics_path: /metrics
+    scrape_interval: 15s
+```
+
+Verify locally:
+
+```bash
+curl -s http://127.0.0.1:8090/metrics | grep -E '^netrun_' | head -20
+```
+
 Redis introspection:
 
 ```bash
