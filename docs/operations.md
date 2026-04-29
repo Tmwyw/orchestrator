@@ -374,6 +374,37 @@ curl -fsS "http://127.0.0.1:${ORCHESTRATOR_PORT:-8090}/v1/orders/$ORD" \
   -H "X-NETRUN-API-KEY: $ORCHESTRATOR_API_KEY" | jq .
 ```
 
+### Admin endpoints (Wave B-7b.3)
+
+Three read-only admin endpoints are available under `/v1/admin/*` with the
+standard `X-NETRUN-API-KEY` header. All three serialize Decimal fields as
+strings (see `wave_b_design.md` § 6.10 — Decimal serialization convention).
+
+Daily sales summary:
+
+```bash
+. /opt/netrun-orchestrator/.env
+curl -fsS "http://127.0.0.1:${ORCHESTRATOR_PORT:-8090}/v1/admin/stats?range_days=7" \
+  -H "X-NETRUN-API-KEY: $ORCHESTRATOR_API_KEY" | jq .
+```
+
+Search a user's orders:
+
+```bash
+curl -fsS "http://127.0.0.1:${ORCHESTRATOR_PORT:-8090}/v1/admin/orders?user_id=42" \
+  -H "X-NETRUN-API-KEY: $ORCHESTRATOR_API_KEY" | jq '.items[] | {order_ref, status, allocated_count}'
+```
+
+Export archived proxies for accounting (date range required):
+
+```bash
+curl -fsS "http://127.0.0.1:${ORCHESTRATOR_PORT:-8090}/v1/admin/archive?from_date=2026-01-01&to_date=2026-04-30&geo=US" \
+  -H "X-NETRUN-API-KEY: $ORCHESTRATOR_API_KEY" | jq '.count'
+```
+
+Archive output is capped at 10000 rows; orders search at 1000. Use date
+ranges or status filter to paginate.
+
 ---
 
 ## 9. Endpoint paths
