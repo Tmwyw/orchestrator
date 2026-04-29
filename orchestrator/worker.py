@@ -15,10 +15,11 @@ from orchestrator.jobs import (
     select_node,
     write_proxies_file,
 )
+from orchestrator.logging_setup import configure_logging
 from orchestrator.node_client import generate
 from shared.contracts import PRODUCTION_PROFILE
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+configure_logging()
 logger = logging.getLogger("netrun-orchestrator-worker")
 
 

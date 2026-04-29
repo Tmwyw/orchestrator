@@ -6,9 +6,10 @@ import logging
 import time
 
 from orchestrator.config import get_config
+from orchestrator.logging_setup import configure_logging
 from orchestrator.watchdog import WatchdogService
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+configure_logging()
 logger = logging.getLogger("netrun-orchestrator-watchdog-scheduler")
 
 

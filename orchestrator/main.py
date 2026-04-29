@@ -11,6 +11,9 @@ from psycopg.types.json import Jsonb
 
 from orchestrator import node_client
 from orchestrator.allocator import AllocatorService
+from orchestrator.logging_setup import configure_logging
+
+configure_logging()
 from orchestrator.api_schemas import (
     CommitRequest,
     CommitResponse,
@@ -34,7 +37,6 @@ from orchestrator.node_client import check_health
 from orchestrator.schemas import DeliveryFormat
 from shared.contracts import FORBIDDEN_JOB_FIELDS, PRODUCTION_PROFILE
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("netrun-orchestrator")
 
 app = FastAPI(
