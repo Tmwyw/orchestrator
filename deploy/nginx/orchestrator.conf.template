@@ -1,0 +1,32 @@
+# NETRUN orchestrator nginx reverse proxy.
+# Installed via scripts/install_nginx.sh (opt-in).
+# Listens on a non-default port (8091 by default) with explicit server_name
+# to avoid clobbering other projects sharing the same host's nginx.
+#
+# NEVER add `default_server` here — that would override other vhosts on
+# this nginx instance.
+
+server {
+    listen __NGINX_LISTEN_PORT__;
+    server_name __NGINX_SERVER_NAME__;
+
+    client_max_body_size 10M;
+    proxy_read_timeout 1300s;
+    proxy_send_timeout 1300s;
+
+    location /metrics {
+        # Restrict /metrics to operator-defined networks.
+        # Default: localhost only. Extend via METRICS_ALLOW_NETWORKS env
+        # (comma-separated CIDRs) when running install_nginx.sh.
+__METRICS_ACL_BLOCK__
+        deny all;
+        proxy_pass http://127.0.0.1:__ORCHESTRATOR_PORT__;
+    }
+
+    location / {
+        proxy_pass http://127.0.0.1:__ORCHESTRATOR_PORT__;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    }
+}
