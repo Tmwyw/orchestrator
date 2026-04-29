@@ -12,6 +12,7 @@ from urllib.parse import quote
 
 import httpx
 
+from orchestrator.config import get_config
 from orchestrator.logging_setup import get_logger
 
 logger = get_logger("netrun-orchestrator-validation")
@@ -125,8 +126,11 @@ class ProxyValidationService:
         start = time.perf_counter()
         proxy_url = f"http://{quote(login, safe='')}:{quote(password, safe='')}@{host}:{port}"
         timeout = httpx.Timeout(self.ip_lookup_timeout_sec)
+        cfg = get_config()
         try:
-            async with httpx.AsyncClient(proxy=proxy_url, timeout=timeout, verify=False) as client:
+            async with httpx.AsyncClient(
+                proxy=proxy_url, timeout=timeout, verify=cfg.validation_strict_ssl
+            ) as client:
                 response = await client.get("https://api64.ipify.org?format=text")
                 if response.status_code != 200:
                     return {"error": f"http_probe_status_{response.status_code}"}

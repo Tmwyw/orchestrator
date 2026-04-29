@@ -60,6 +60,7 @@ class Config:
     watchdog_interval_sec: int
     watchdog_running_timeout_sec: int
     watchdog_pending_validation_timeout_sec: int
+    validation_strict_ssl: bool
 
 
 def get_config() -> Config:
@@ -88,4 +89,5 @@ def get_config() -> Config:
         watchdog_interval_sec=_int_env("WATCHDOG_INTERVAL_SEC", 60),
         watchdog_running_timeout_sec=_int_env("WATCHDOG_RUNNING_TIMEOUT_SEC", 1800),
         watchdog_pending_validation_timeout_sec=_int_env("WATCHDOG_PENDING_VALIDATION_TIMEOUT_SEC", 600),
+        validation_strict_ssl=_bool_env("VALIDATION_STRICT_SSL", True),
     )
