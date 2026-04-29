@@ -17,6 +17,12 @@ from orchestrator.db import connect
 from orchestrator.delivery import generate_delivery_content
 from orchestrator.distribution import equal_share
 from orchestrator.logging_setup import get_logger
+from orchestrator.metrics import (
+    COMMIT_TOTAL,
+    RELEASE_TOTAL,
+    RESERVE_DURATION_SEC,
+    RESERVE_TOTAL,
+)
 from orchestrator.redis_client import get_redis
 from orchestrator.schemas import DeliveryFormat, OrderStatus
 
@@ -76,6 +82,29 @@ class AllocatorService:
     """Equal-share allocator with Redis-backed reservation TTL and idempotency."""
 
     async def reserve(
+        self,
+        *,
+        user_id: int,
+        sku_id: int,
+        quantity: int,
+        reservation_ttl_sec: int,
+        idempotency_key: str | None = None,
+    ) -> ReserveResult:
+        with RESERVE_DURATION_SEC.time():
+            result = await self._reserve_impl(
+                user_id=user_id,
+                sku_id=sku_id,
+                quantity=quantity,
+                reservation_ttl_sec=reservation_ttl_sec,
+                idempotency_key=idempotency_key,
+            )
+        RESERVE_TOTAL.labels(
+            status="success" if result.success else "failed",
+            error=result.error or "",
+        ).inc()
+        return result
+
+    async def _reserve_impl(
         self,
         *,
         user_id: int,
@@ -197,6 +226,11 @@ class AllocatorService:
         return result
 
     async def commit(self, *, order_ref: str, duration_days: int | None) -> CommitResult:
+        result = await self._commit_impl(order_ref=order_ref, duration_days=duration_days)
+        COMMIT_TOTAL.labels(status="success" if result.success else "failed").inc()
+        return result
+
+    async def _commit_impl(self, *, order_ref: str, duration_days: int | None) -> CommitResult:
         order = await asyncio.to_thread(self._sync_get_order, order_ref)
         if order is None:
             return CommitResult(
@@ -257,6 +291,11 @@ class AllocatorService:
         )
 
     async def release(self, *, order_ref: str) -> ReleaseResult:
+        result = await self._release_impl(order_ref=order_ref)
+        RELEASE_TOTAL.labels(status="success" if result.success else "failed").inc()
+        return result
+
+    async def _release_impl(self, *, order_ref: str) -> ReleaseResult:
         order = await asyncio.to_thread(self._sync_get_order, order_ref)
         if order is None:
             return ReleaseResult(
