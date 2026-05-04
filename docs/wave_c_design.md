@@ -2,7 +2,7 @@
 
 Version: 1.0
 Date: 2026-05-04
-Status: DESIGN PASS COMPLETE — all decisions D1..D7 locked, ready for execution prompts
+Status: DESIGN PASS COMPLETE — all decisions D1..D8 locked, ready for execution prompts
 
 This document records the architectural agreement for Wave C of the
 NETRUN project: standing up `netrun-tg_bot` as the user-facing front
@@ -24,6 +24,7 @@ Decision tracker:
 | D5 | Money model (Decimal contract) | **DECIDED** — Decimal-as-string wire, NUMERIC(18,8) internal, Pydantic v2 validators, ROUND_HALF_EVEN |
 | D6 | Notification delivery model | **DECIDED** — poll-based, 1h expiry scan + 1h pergb poll + 5min sweep, aiogram throttling, 75/90/100 pergb thresholds |
 | D7 | User migration strategy | **DECIDED** — clean cutover, no legacy data migration |
+| D8 | Selective port from legacy | **DECIDED** — see § 11 (port crypto payments + topup FSM + admin logger concept; greenfield everything else) |
 
 ---
 
@@ -1930,20 +1931,18 @@ idempotent. Operator runs once at first deployment with their
 `BOOTSTRAP_TELEGRAM_ID` env var; subsequent admin promotions go
 through `/admin promote` command (super_admin only).
 
-### Sub-wave breakdown (C.1..C.10)
+### Sub-wave breakdown
 
-**Status**: All design-pass decisions (D1..D7) closed. Sub-wave
-breakdown unblocked.
+**Superseded by § 11** (D8 selective-port decision restructured the
+sub-wave plan). See § 11 "Updated execution plan" for the canonical
+sub-wave list with port-vs-greenfield disposition and duration
+estimates.
 
-Known dependencies:
-- Sub-wave **C.5 (saga + refund flow)** uses D5 Decimal contract; only
-  payment provider selection (specific crypto provider) outstanding —
-  picked at C.5 prompt time.
-- Sub-wave **C.8 (pay-per-GB UX)** is gated on orchestrator **B-8.2**
-  deploy (real implementation, not the B-8.1 stubs).
-
-Concrete sub-wave breakdown (deliverables, deps, estimated duration)
-to be filled in execution prompt sequence (one C-prompt per sub-wave).
+Known dependencies (still apply, listed here for cross-reference):
+- Payment provider selection (specific crypto provider) outstanding —
+  picked at C.3 / C.5b prompt time, when crypto_payments port lands.
+- Pay-per-GB sub-wave is gated on orchestrator **B-8.2** deploy (real
+  implementation, not the B-8.1 stubs).
 
 ---
 
@@ -2095,3 +2094,142 @@ sketch.
   `C:\__NETRUN__\TRASH\NETRUN_BACKUPS\ZIPKI NETRUN\NETRUN\NETRUN LEGASY\bot_database.db`
   if needed. **No separate migration sub-wave is required** — the
   clean-cutover decision in § 9 stays intact.
+
+---
+
+## 11. Selective port decisions (D8)
+
+D1 (greenfield rewrite) and § 2 ("Keep as REFERENCE") established
+that NETRUN FINAL legacy bot is study material, not an inheritance
+source. D8 narrows that further: a small, well-bounded set of
+modules carry enough working code (crypto provider integration,
+deposit-matching algorithm, FSM topup shape, admin-logger Telegram
+group pattern) to justify selective port with adaptation, rather
+than re-deriving them from scratch.
+
+Everything else stays greenfield per D1.
+
+### PORT (with adaptation)
+
+For each ported module: source path in `NETRUN FINAL/tg_bot/`,
+target path in greenfield `Tmwyw/netrun_bot`, required adaptations.
+
+#### `bot/services/exchange_client.py`
+
+- **Source**: `NETRUN FINAL/tg_bot/app/services/exchange_client.py`
+- **What it provides**: Bybit + Binance HTTP clients with HMAC-SHA256
+  request signing for authenticated endpoints (deposit history,
+  account balance).
+- **Adaptations**:
+  - `aiohttp` → `httpx` (matches D4.3 single HTTP-client choice).
+  - Add Pydantic v2 typed responses for each endpoint.
+  - English comments + log messages (legacy mojibake → clean).
+  - Inject as dependency via `dp["exchange_client"]` at startup, not
+    module-level singleton.
+
+#### `bot/services/crypto_payments.py`
+
+- **Source**: `NETRUN FINAL/tg_bot/app/services/payment_checker.py`
+- **What it provides**: deposit-matching algorithm — given a pending
+  payment expectation `(amount, coin, chain, time_window, status)`,
+  scans recent provider deposits and matches one to the expectation.
+- **Adaptations**:
+  - All money math `float` → `Decimal` per § 5 contract. No
+    intermediate float comparisons.
+  - Mojibake → English in comments and log lines.
+  - Pydantic responses replace raw dict access.
+  - Saga integration: matching success triggers `kind='topup'`
+    transaction insert per § 4 ledger contract.
+
+#### `bot/handlers/user/topup.py`
+
+- **Source**: `NETRUN FINAL/tg_bot/app/handlers/support_flow.py`
+- **What it provides**: FSM topup flow:
+  1. Ask deposit amount.
+  2. Validate min/max bounds.
+  3. Choose payment method (TRC20 / BEP20 / BINANCE / BYBIT).
+  4. Wait for matching deposit (background poll via
+     `crypto_payments.py`).
+  5. On match → confirm to user → atomic balance credit.
+  - One-pending-payment-per-user enforcement (rejects new topup if
+     prior pending exists).
+  - 15-minute auto-cancel timer for unfunded pending payments.
+- **Adaptations**:
+  - Rewrite under § 4 schema using `bot/db/orders_local` +
+    `bot/db/transactions` repositories. Drop legacy DB layer entirely.
+  - FSM uses RedisStorage per D4.3.
+  - Mojibake → English UI strings (template-rendered per § 7.7).
+  - Decimal money math throughout.
+  - Pending-payment state lives in `orders_local` (or a forward-compat
+    `pending_payments` table — finalize at C.5b prompt).
+
+#### `bot/services/admin_logger.py`
+
+- **Source**: `NETRUN FINAL/tg_bot/app/services/telegram_logger.py`
+- **What it provides — CONCEPT ONLY (not code)**: pattern of using a
+  Telegram admin group with topics for operational notifications
+  (deposit confirmations, refunds, errors), allowing admins to follow
+  events in real time without watching journalctl.
+- **Adaptations**:
+  - Rewrite ~80–100 LOC from scratch using the concept.
+  - Event types tailored to our flows: `deposit_confirmed`,
+    `purchase_committed`, `refund`, `new_user`, `commit_failed`,
+    `pergb_threshold` (later — sub-wave C.8).
+  - Each event type maps to a topic in the admin Telegram group;
+    bot posts structured messages with Decimal-formatted amounts.
+  - Independent of `notifications_state` — admin-group posts are
+     out-of-band, not user-facing notifications.
+
+### DON'T PORT (write greenfield)
+
+For each rejected module: source path, reason.
+
+| Source (`NETRUN FINAL/tg_bot/app/`) | Reason |
+|---|---|
+| `proxy_user/checkout.py` | Legacy monolith import structure, incompatible with D4.2 layered repo layout. |
+| `services/proxy_api.py` + `services/proxy_api_v2.py` | External login/cookie auth against a different upstream. Incompatible with `X-Netrun-Api-Key` contract. |
+| `services/proxy_order_delivery.py` | Orchestrator handles delivery; bot just forwards download URLs. Wrapper has no business logic to inherit. |
+| `services/task_scheduler.py` | `aiocron` pattern doesn't match D4.3's `asyncio.create_task` + `supervised()` model. Cleaner to rewrite. |
+| `services/exchange_utils.py` + `services/crypto_exchange.py` | Admin balance overviews / aggregation. Out of scope for user-facing topup flow. Greenfield admin commands cover the small admin slice we need. |
+| All `handlers/admin_*.py` | Out-of-scope features (suppliers, promocodes, expense tracking, channel gating, mobile/residential). Per § 2 out-of-scope module list. |
+| All `db/*.py` repositories + `Database` mixin classes | Legacy schema (28+ tables) doesn't match § 4 greenfield 6-table design. Mixin diamond-inheritance pattern rejected (§ 2). |
+
+### Updated execution plan
+
+Supersedes § 9 sub-wave breakdown. Renumbered around port-vs-greenfield
+boundaries.
+
+| Sub-wave | Scope | Source | Est. duration |
+|---|---|---|---|
+| **C.1** | Bot baseline (foundation) — repo init, config, DB pool, migrate.py + `0001_initial_schema.sql`, bootstrap_admin.py, structlog setup, CI scaffold | greenfield | ~1 day |
+| **C.2** | Orchestrator HTTP client — `OrchestratorClient`, vendored Pydantic schemas, retry policy, integration tests vs orchestrator-staging | greenfield | ~2 days |
+| **C.3** | Crypto payments — `exchange_client.py` + `crypto_payments.py` ports with adaptations | **PORT** | ~2 days |
+| **C.4** | Saga + balances + transactions repositories — atomic balance flow per § 5, sweep-job recovery scaffold | greenfield | ~2 days |
+| **C.5a** | User handlers — `/start`, `/balance`, `/history`, `/buy`, `/orders` | greenfield (reference legacy for UX patterns per § 2) | ~3–4 days |
+| **C.5b** | Topup handler — FSM topup flow port with § 4 schema rewire | **PORT** | ~1–2 days |
+| **C.6** | Admin commands + admin_logger concept rewrite | mostly greenfield, admin_logger concept-port | ~3 days |
+| **C.7** | Notifications scheduler + sweep loop — per § 8 + D6 cadence | greenfield | ~2 days |
+
+**Total**: 16–19 days execution.
+**Savings**: ~3–5 days vs full greenfield, plus reduced bug surface
+for crypto provider integration (HMAC signing + deposit matching are
+fiddly to derive from scratch).
+
+Pay-per-GB UX (originally C.8) and any extension-flow work (originally
+C.6) are **not in this 16–19 day scope** — they ship after orchestrator
+B-8.2 lands and B-extension matures, in subsequent C-prompts.
+
+### Port hygiene checklist (per ported module)
+
+Each port lands as a separate commit with a checklist verified:
+
+- [ ] Source file referenced with commit hash from legacy reading
+- [ ] All `float` → `Decimal` conversions audited line-by-line
+- [ ] All mojibake (cp1251-as-utf8 garbage) → English comments + strings
+- [ ] All `aiohttp` → `httpx` adapter calls
+- [ ] All legacy DB calls → § 4 repository calls
+- [ ] Pydantic v2 types replace raw dict access at API boundaries
+- [ ] Logging via `structlog.get_logger("bot.<module>")`, not legacy `logging.getLogger`
+- [ ] No `_fix_utf8_mojibake()` runtime recovery — clean writes only
+- [ ] Test coverage: at minimum the saga-relevant happy path + one error path
+- [ ] `import-linter` clean (no cross-domain imports per D4.1 split rule)
