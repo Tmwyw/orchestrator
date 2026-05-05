@@ -1,6 +1,6 @@
 # Wave B-8 — Pay-per-GB Billing (design pass)
 
-**Status:** design locked, awaiting execution split into B-8.1..B-8.4 sub-waves.
+**Status:** B-8.1 closed (schema + node-agent contract + stubs); B-8.2 in progress.
 **Companion to:** `docs/wave_b_design.md` (which has the preliminary § 4.3 schema, § 6.8 endpoints list, § 8 architecture sketch — all expanded here).
 
 ---
