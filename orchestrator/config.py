@@ -61,6 +61,10 @@ class Config:
     watchdog_running_timeout_sec: int
     watchdog_pending_validation_timeout_sec: int
     validation_strict_ssl: bool
+    traffic_poll_interval_sec: int
+    traffic_poll_min_interval_sec: int
+    traffic_poll_request_timeout_sec: int
+    traffic_poll_degrade_after: int
 
 
 def get_config() -> Config:
@@ -90,4 +94,8 @@ def get_config() -> Config:
         watchdog_running_timeout_sec=_int_env("WATCHDOG_RUNNING_TIMEOUT_SEC", 1800),
         watchdog_pending_validation_timeout_sec=_int_env("WATCHDOG_PENDING_VALIDATION_TIMEOUT_SEC", 600),
         validation_strict_ssl=_bool_env("VALIDATION_STRICT_SSL", True),
+        traffic_poll_interval_sec=_int_env("TRAFFIC_POLL_INTERVAL_SEC", 60),
+        traffic_poll_min_interval_sec=_int_env("TRAFFIC_POLL_MIN_INTERVAL_SEC", 30),
+        traffic_poll_request_timeout_sec=_int_env("TRAFFIC_POLL_REQUEST_TIMEOUT_SEC", 10),
+        traffic_poll_degrade_after=_int_env("TRAFFIC_POLL_DEGRADE_AFTER", 5),
     )
