@@ -167,9 +167,9 @@ bash scripts/bind_node.sh ipv6_us_socks5 node-fr-1
 
 ---
 
-## 5. Schedulers + watchdog (Wave B-7a)
+## 5. Schedulers + watchdog (Wave B-7a, extended in B-8.2)
 
-`install_orchestrator.sh` installs and starts five systemd units in total:
+`install_orchestrator.sh` installs and starts six systemd units in total:
 
 | Unit | Purpose |
 |------|---------|
@@ -177,7 +177,8 @@ bash scripts/bind_node.sh ipv6_us_socks5 node-fr-1
 | `netrun-orchestrator-worker.service` | generation worker |
 | `netrun-orchestrator-refill.service` | refill scheduler (one-shot per `PROXY_REFILL_INTERVAL_SEC`) |
 | `netrun-orchestrator-validation.service` | proxy validation loop |
-| `netrun-orchestrator-watchdog.service` | recovers stuck `running` jobs, releases expired reservations, invalidates stale `pending_validation`, clears expired delivery content |
+| `netrun-orchestrator-watchdog.service` | recovers stuck `running` jobs, releases expired reservations, invalidates stale `pending_validation`, clears expired delivery content; runs pergb cleanup phase 5 (B-8.2) |
+| `netrun-orchestrator-traffic-poll.service` | pergb traffic poller (B-8.2) — reads node-agent `/accounting`, writes `traffic_samples`, fires depletion-disable when an account crosses its quota |
 
 The wrappers `bash scripts/start_schedulers.sh` / `scripts/stop_schedulers.sh`
 auto-detect systemd: if all three (`refill`, `validation`, `watchdog`) units
@@ -199,6 +200,15 @@ Watchdog tunables (in `.env`, all optional):
 | `WATCHDOG_INTERVAL_SEC` | `60` | Loop interval (clamped to ≥10) |
 | `WATCHDOG_RUNNING_TIMEOUT_SEC` | `1800` | Mark `jobs.status='running'` rows older than this as `failed` |
 | `WATCHDOG_PENDING_VALIDATION_TIMEOUT_SEC` | `600` | Mark `proxy_inventory.status='pending_validation'` older than this as `invalid` |
+
+Traffic-poll tunables (in `.env`, all optional):
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `TRAFFIC_POLL_INTERVAL_SEC` | `60` | Loop interval. Clamped to ≥ `TRAFFIC_POLL_MIN_INTERVAL_SEC`. |
+| `TRAFFIC_POLL_MIN_INTERVAL_SEC` | `30` | Hard floor for the loop interval. |
+| `TRAFFIC_POLL_REQUEST_TIMEOUT_SEC` | `10` | Per-node `/accounting` request timeout. |
+| `TRAFFIC_POLL_DEGRADE_AFTER` | `5` | Consecutive failures before flipping `nodes.runtime_status='degraded'`. |
 
 ---
 
@@ -524,3 +534,91 @@ Verify your other projects still respond after install:
 nginx -T | grep -E '(server_name|listen)'   # see all vhosts
 curl -sI http://other-project.example.com/  # confirm reachable
 ```
+
+---
+
+## 12. Pay-per-GB operations (Wave B-8.2)
+
+Pay-per-GB is a second product line on top of per-piece IPv6. Each pergb
+buyer gets a dedicated port on a node; nftables per-port counters provide
+the byte-accounting source. The orchestrator polls `/accounting` on each
+node, writes `traffic_samples`, updates `traffic_accounts.bytes_used`, and
+disables the port via `POST /accounts/{port}/disable` when the account
+crosses its `bytes_quota`.
+
+### 12.1 End-to-end smoke (against a live test node)
+
+```bash
+# 1. Pre-condition: node-agent on host has nftables persistence
+#    (install_node.sh — B-8.1) and /describe.supports.accounting == true.
+
+# 2. Reserve a pergb account
+curl -sS -X POST http://127.0.0.1:8090/v1/orders/reserve_pergb \
+  -H "X-NETRUN-API-KEY: $ORCHESTRATOR_API_KEY" \
+  -H 'content-type: application/json' \
+  -d '{"user_id":1,"sku_id":42,"gb_amount":5}' | jq .
+
+# Response carries port, host, login, password — use those to send traffic.
+
+# 3. Wait one polling cycle (~60s default), then check usage:
+curl -sS -H "X-NETRUN-API-KEY: $ORCHESTRATOR_API_KEY" \
+  http://127.0.0.1:8090/v1/orders/<order_ref>/traffic | jq .
+
+# 4. Top-up to extend quota + lease:
+curl -sS -X POST http://127.0.0.1:8090/v1/orders/<order_ref>/topup_pergb \
+  -H "X-NETRUN-API-KEY: $ORCHESTRATOR_API_KEY" \
+  -H 'content-type: application/json' \
+  -d '{"sku_id":42,"gb_amount":10}' | jq .
+```
+
+### 12.2 Scheduler tuning
+
+The polling worker honors `TRAFFIC_POLL_INTERVAL_SEC` (default 60s,
+clamped to ≥ 30s). Lowering it costs node-side CPU on `nft -j list
+counters` per cycle; raising it delays detection of quota crossings.
+60s is the default lab-validated value.
+
+`TRAFFIC_POLL_DEGRADE_AFTER` controls how many consecutive `/accounting`
+failures flip the node's `runtime_status` to `degraded`. Default 5 — at
+60s cadence that is 5 minutes of confirmed badness before disabling new
+allocations to that node.
+
+### 12.3 Troubleshooting matrix
+
+| Symptom | Likely cause | Action |
+|---------|--------------|--------|
+| `traffic_counter_reset_detected` warnings spike on one node | nftables persistence missing on that node host (counters reset on reboot) | Re-run `bash install_node.sh` on the node — it sets `systemctl enable nftables` and `nft list ruleset > /etc/nftables.conf`. |
+| `traffic_poll_partial_response` warnings | node-agent returned 200 with only some of the requested ports populated. Usually transient (race with refill/clean) | No action — missing ports are skipped this cycle and picked up next cycle. |
+| Account stuck in `depleted` after a top-up | `post_enable` failed during the top-up reactivation (logged `pergb_account_reactivate_failed`) | Manually call `curl -X POST <NODE_URL>/accounts/<PORT>/enable`. The next poll will see traffic resume. |
+| Node `runtime_status='degraded'` after maintenance | 5 consecutive failures during a stop window | Restart the node-agent. The next successful cycle resets the in-process counter; flip back via `UPDATE nodes SET runtime_status='active' WHERE id=...` (or wait for the next refill cycle to re-enroll). |
+| `netrun_traffic_poll_lag_sec` rising | scheduler is failing or slow on every cycle | Check `journalctl -u netrun-orchestrator-traffic-poll -n 100` for stack traces; verify `pg_isready`. |
+| `netrun_traffic_over_usage_total` growing | account crossed quota in one big delta (slow polling + fast traffic, or recovery after node outage) | Expected behavior per design § 8.2 — accept the small over-billing tail or reduce `TRAFFIC_POLL_INTERVAL_SEC`. |
+
+### 12.4 Inspection queries
+
+```sql
+-- Active pergb accounts and their usage
+SELECT
+  o.order_ref, t.bytes_used, t.bytes_quota,
+  ROUND(100.0 * t.bytes_used / NULLIF(t.bytes_quota, 0), 1) AS pct,
+  t.last_polled_at, t.expires_at, i.node_id, i.port
+FROM traffic_accounts t
+JOIN orders o ON o.id = t.order_id
+JOIN proxy_inventory i ON i.id = t.inventory_id
+WHERE t.status = 'active'
+ORDER BY t.last_polled_at NULLS FIRST
+LIMIT 50;
+
+-- Recent counter resets (look for clustered node_id)
+SELECT account_id, collected_at
+FROM traffic_samples
+WHERE counter_reset_detected = true
+ORDER BY collected_at DESC
+LIMIT 20;
+```
+
+### 12.5 Out of scope (deferred to B-8.3 / B-8.4)
+
+- `POST /v1/admin/traffic/poll` synchronous force-poll endpoint (B-8.3 — currently 501 stub).
+- `/v1/admin/stats` pergb subsection (active accounts / 7-day bytes / top SKU revenue).
+- Real-money smoke against a live billing flow (B-8.4 once nodes return to service).
