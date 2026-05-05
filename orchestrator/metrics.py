@@ -74,3 +74,42 @@ INVENTORY_AVAILABLE = Gauge(
     "Available inventory rows",
     ["sku_code", "node_id"],
 )
+
+# === Pay-per-GB traffic poll (Wave B-8.2) ===
+
+TRAFFIC_POLL_TOTAL = Counter(
+    "netrun_traffic_poll_total",
+    "Per-node traffic poll attempts",
+    ["node_id", "status"],
+)
+TRAFFIC_POLL_DURATION_SEC = Histogram(
+    "netrun_traffic_poll_duration_sec",
+    "Per-node /accounting GET duration",
+    ["node_id"],
+)
+TRAFFIC_ACCOUNTS_ACTIVE = Gauge(
+    "netrun_traffic_accounts_active",
+    "traffic_accounts rows in status='active'",
+)
+TRAFFIC_ACCOUNTS_DEPLETED = Gauge(
+    "netrun_traffic_accounts_depleted",
+    "traffic_accounts rows in status='depleted'",
+)
+TRAFFIC_COUNTER_RESET_TOTAL = Counter(
+    "netrun_traffic_counter_reset_total",
+    "Counter-reset events detected (delta < 0)",
+    ["node_id"],
+)
+TRAFFIC_POLL_LAG_SEC = Gauge(
+    "netrun_traffic_poll_lag_sec",
+    "now() - oldest active.last_polled_at (seconds)",
+)
+TRAFFIC_OVER_USAGE_TOTAL = Counter(
+    "netrun_traffic_over_usage_total",
+    "Cycles where bytes_used > bytes_quota at depletion",
+)
+TRAFFIC_BYTES_TOTAL = Counter(
+    "netrun_traffic_bytes_total",
+    "Cumulative billed bytes by SKU + direction",
+    ["sku_code", "direction"],
+)
