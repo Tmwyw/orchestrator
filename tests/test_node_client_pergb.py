@@ -9,7 +9,9 @@ from orchestrator import node_client
 from orchestrator.node_client import NodeAgentError
 
 
-def _install_transport(monkeypatch: pytest.MonkeyPatch, transport: httpx.MockTransport) -> list[httpx.Request]:
+def _install_transport(
+    monkeypatch: pytest.MonkeyPatch, transport: httpx.MockTransport
+) -> list[httpx.Request]:
     """Replace httpx.Client construction so it always uses the mock transport.
 
     Returns a list that records every Request seen by the transport (mutated

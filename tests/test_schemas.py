@@ -49,7 +49,10 @@ def test_node_runtime_status_values() -> None:
 
 
 def test_proxy_inventory_status_covers_full_lifecycle() -> None:
-    """ProxyInventoryStatus has all 7 lifecycle states from migration 008."""
+    """ProxyInventoryStatus has all 8 lifecycle states (B-8.2 added allocated_pergb).
+
+    Mirrors the DB CHECK in migrations/008 + 022.
+    """
     from orchestrator.schemas import ProxyInventoryStatus
 
     assert {s.value for s in ProxyInventoryStatus} == {
@@ -60,6 +63,19 @@ def test_proxy_inventory_status_covers_full_lifecycle() -> None:
         "expired_grace",
         "archived",
         "invalid",
+        "allocated_pergb",
+    }
+
+
+def test_traffic_account_status_matches_migration() -> None:
+    """TrafficAccountStatus mirrors traffic_accounts.status CHECK (B-8.1 mig 020)."""
+    from orchestrator.schemas import TrafficAccountStatus
+
+    assert {s.value for s in TrafficAccountStatus} == {
+        "active",
+        "depleted",
+        "expired",
+        "archived",
     }
 
 
