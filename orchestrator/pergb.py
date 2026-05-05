@@ -7,6 +7,8 @@ body); 501 fires after validation passes.
 
 from __future__ import annotations
 
+from typing import Any
+
 from fastapi import APIRouter
 from fastapi.responses import JSONResponse
 
@@ -14,12 +16,25 @@ from orchestrator.api_schemas import (
     AdminTrafficPollResponse,  # noqa: F401  (used in B-8.2)
     ReservePergbRequest,
     ReservePergbResponse,  # noqa: F401  (used in B-8.2)
+    SkuTierTable,
     TopupPergbRequest,
     TopupPergbResponse,  # noqa: F401  (used in B-8.2)
     TrafficResponse,  # noqa: F401  (used in B-8.2)
 )
 
 pergb_router = APIRouter()
+
+
+def validate_pergb_metadata(metadata: Any) -> SkuTierTable:
+    """Validate skus.metadata for product_kind=datacenter_pergb.
+
+    Raises pydantic.ValidationError on malformed tiers; returns the parsed
+    SkuTierTable on success. Wired into admin SKU CRUD in B-8.2 — exposed
+    here so call sites can do `from orchestrator.pergb import ...`.
+
+    Expected shape: ``{"tiers": [{"gb": int, "price_per_gb": "9.99"}, ...]}``.
+    """
+    return SkuTierTable.model_validate(metadata)
 
 NOT_IMPLEMENTED_BODY = {
     "success": False,
