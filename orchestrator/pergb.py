@@ -36,6 +36,7 @@ def validate_pergb_metadata(metadata: Any) -> SkuTierTable:
     """
     return SkuTierTable.model_validate(metadata)
 
+
 NOT_IMPLEMENTED_BODY = {
     "success": False,
     "error": "not_implemented",

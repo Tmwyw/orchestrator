@@ -15,7 +15,6 @@ from orchestrator.api_schemas import (
 )
 from orchestrator.pergb import validate_pergb_metadata
 
-
 # === SkuTier ===
 
 
@@ -139,9 +138,7 @@ def test_validate_pergb_metadata_rejects_non_dict() -> None:
 
 def test_validate_pergb_metadata_rejects_unsorted_tiers() -> None:
     with pytest.raises(ValidationError, match="ascending"):
-        validate_pergb_metadata(
-            {"tiers": [{"gb": 5, "price_per_gb": "7"}, {"gb": 1, "price_per_gb": "9"}]}
-        )
+        validate_pergb_metadata({"tiers": [{"gb": 5, "price_per_gb": "7"}, {"gb": 1, "price_per_gb": "9"}]})
 
 
 # === Decimal-as-string field validators on response models ===
