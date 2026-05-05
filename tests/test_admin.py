@@ -32,15 +32,23 @@ def test_admin_stats_returns_response_shape(monkeypatch: pytest.MonkeyPatch, _no
         {"code": "ipv6_us_socks5", "status": "sold", "n": 15},
     ]
     nodes = {"ready": 3, "total": 3}
+    pergb_counts = {"active_accounts": 0, "depleted_accounts": 0, "expired_accounts": 0}
+    pergb_bytes = {"bytes_7d": 0}
 
     def fake_fetch_one(query: str, params: Any = None) -> dict[str, Any]:
-        if "from orders" in query:
+        if "from orders" in query and "where status = 'committed'" in query:
             return sales
         if "from nodes" in query:
             return nodes
+        if "from traffic_accounts" in query:
+            return pergb_counts
+        if "from traffic_samples" in query:
+            return pergb_bytes
         raise AssertionError(f"unexpected fetch_one query: {query[:60]!r}")
 
     def fake_fetch_all(query: str, params: Any = None) -> list[dict[str, Any]]:
+        if "from orders" in query and "datacenter_pergb" in query:
+            return []  # no pergb activity in this fixture
         return inventory
 
     monkeypatch.setattr("orchestrator.admin.fetch_one", fake_fetch_one)
@@ -58,6 +66,9 @@ def test_admin_stats_returns_response_shape(monkeypatch: pytest.MonkeyPatch, _no
     assert body["sales"]["revenue"] == "12.50"
     assert len(body["inventory"]) == 2
     assert body["nodes"] == {"ready": 3, "total": 3}
+    assert body["pergb"]["active_accounts"] == 0
+    assert body["pergb"]["bytes_consumed_7d"] == 0
+    assert body["pergb"]["top_skus_by_revenue_7d"] == []
 
 
 def test_admin_orders_filters_by_user_id(monkeypatch: pytest.MonkeyPatch, _no_auth: None) -> None:

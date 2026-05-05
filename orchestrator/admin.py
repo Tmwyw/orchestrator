@@ -13,6 +13,8 @@ from orchestrator.api_schemas import (
     ArchiveExportResponse,
     OrderListItem,
     OrdersListResponse,
+    PergbStatsSubsection,
+    PergbTopSku,
     StatsInventoryRow,
     StatsNodes,
     StatsResponse,
@@ -55,12 +57,70 @@ async def stats(range_days: int = 7) -> JSONResponse:
         from nodes
         """,
     )
+    pergb_section = await asyncio.to_thread(_fetch_pergb_stats)
     response = StatsResponse(
         sales=StatsSales(**(sales_row or {})),
         inventory=[StatsInventoryRow(**r) for r in inventory_rows],
         nodes=StatsNodes(**(nodes_row or {})),
+        pergb=pergb_section,
     )
     return JSONResponse(content=response.model_dump(mode="json"))
+
+
+def _fetch_pergb_stats() -> PergbStatsSubsection:
+    """Pay-per-GB summary block on /v1/admin/stats (B-8.3).
+
+    Three small SELECTs — count by status, 7-day bytes from samples, top 5
+    SKUs by 7-day revenue. ``traffic_accounts`` may be empty in fresh
+    environments; defaults handle that cleanly.
+    """
+    counts_row = fetch_one(
+        """
+        select
+          count(*) filter (where status = 'active')::int   as active_accounts,
+          count(*) filter (where status = 'depleted')::int as depleted_accounts,
+          count(*) filter (where status = 'expired')::int  as expired_accounts
+        from traffic_accounts
+        """,
+    ) or {"active_accounts": 0, "depleted_accounts": 0, "expired_accounts": 0}
+
+    bytes_row = fetch_one(
+        """
+        select coalesce(sum(bytes_in_delta + bytes_out_delta), 0)::bigint as bytes_7d
+        from traffic_samples
+        where collected_at > now() - interval '7 days'
+        """,
+    ) or {"bytes_7d": 0}
+
+    top_rows = fetch_all(
+        """
+        select s.code as sku_code,
+               coalesce(sum(o.price_amount), 0) as revenue,
+               count(distinct t.id)::int as accounts
+        from orders o
+        join skus s on s.id = o.sku_id
+        left join traffic_accounts t on t.order_id = o.id
+        where s.product_kind = 'datacenter_pergb'
+          and o.created_at > now() - interval '7 days'
+        group by s.code
+        order by revenue desc
+        limit 5
+        """,
+    )
+    return PergbStatsSubsection(
+        active_accounts=int(counts_row.get("active_accounts") or 0),
+        depleted_accounts=int(counts_row.get("depleted_accounts") or 0),
+        expired_accounts=int(counts_row.get("expired_accounts") or 0),
+        bytes_consumed_7d=int(bytes_row.get("bytes_7d") or 0),
+        top_skus_by_revenue_7d=[
+            PergbTopSku(
+                sku_code=str(r["sku_code"]),
+                revenue=r["revenue"],
+                accounts=int(r["accounts"]),
+            )
+            for r in top_rows
+        ],
+    )
 
 
 @admin_router.get("/orders")
