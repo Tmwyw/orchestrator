@@ -1,4 +1,4 @@
-"""Admin endpoints: stats, orders search, archive export."""
+"""Admin endpoints: stats, orders search, archive export, pergb force-poll."""
 
 from __future__ import annotations
 
@@ -9,6 +9,7 @@ from fastapi import APIRouter
 from fastapi.responses import JSONResponse
 
 from orchestrator.api_schemas import (
+    AdminTrafficPollResponse,
     ArchiveExportItem,
     ArchiveExportResponse,
     OrderListItem,
@@ -21,8 +22,14 @@ from orchestrator.api_schemas import (
     StatsSales,
 )
 from orchestrator.db import fetch_all, fetch_one
+from orchestrator.traffic_poll import TrafficPollService
 
 admin_router = APIRouter(prefix="/v1/admin")
+
+# Module-level singleton — the lock inside is per-process. The scheduler
+# unit lives in a different process and has its own lock; cross-process
+# overlap is rare (60s cadence) and the DB writes are atomic per row.
+_traffic_poll_service = TrafficPollService()
 
 
 @admin_router.get("/stats")
@@ -188,3 +195,34 @@ async def archive_export(
         **{"from": from_date, "to": to_date},
     )
     return JSONResponse(content=response.model_dump(mode="json", by_alias=True))
+
+
+# === Pay-per-GB admin force-poll (Wave B-8.3) ===
+
+
+@admin_router.post("/traffic/poll")
+async def force_poll(
+    node_id: str | None = None,
+    account_id: int | None = None,
+) -> JSONResponse:
+    """Synchronous force-poll over active pergb traffic accounts.
+
+    Useful for testing depletion → disable transitions and topup_pergb
+    reactivation without waiting for the 60s scheduler cadence. Optional
+    ``node_id`` / ``account_id`` query params scope the cycle to a single
+    node or single account; with neither, runs a full cycle (same shape
+    as the scheduler tick).
+    """
+    counters = await asyncio.to_thread(
+        _traffic_poll_service.run_once,
+        node_id_filter=node_id,
+        account_id_filter=account_id,
+    )
+    response = AdminTrafficPollResponse(
+        accounts_polled=counters.accounts_polled,
+        nodes_polled=counters.nodes_polled,
+        bytes_observed_total=counters.bytes_observed_total,
+        counter_resets_detected=counters.counter_resets_detected,
+        accounts_marked_depleted=counters.accounts_depleted,
+    )
+    return JSONResponse(content=response.model_dump(mode="json"))

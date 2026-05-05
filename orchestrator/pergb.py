@@ -7,7 +7,7 @@ Three endpoints land real handlers in B-8.2 backed by ``PergbService``:
   active or depleted account.
 - ``GET /v1/orders/{order_ref}/traffic`` — snapshot for the bot's poller.
 
-The admin force-poll endpoint stays a 501 stub — B-8.3 will wire it.
+``POST /v1/admin/traffic/poll`` lives in ``orchestrator/admin.py`` (B-8.3).
 """
 
 from __future__ import annotations
@@ -18,7 +18,6 @@ from fastapi import APIRouter
 from fastapi.responses import JSONResponse
 
 from orchestrator.api_schemas import (
-    AdminTrafficPollResponse,  # noqa: F401  (used in B-8.3)
     ReservePergbRequest,
     ReservePergbResponse,
     SkuTierTable,
@@ -177,14 +176,6 @@ async def get_traffic(order_ref: str) -> JSONResponse:
     return JSONResponse(content=response.model_dump(mode="json"))
 
 
-@pergb_router.post("/v1/admin/traffic/poll")
-async def admin_traffic_poll() -> JSONResponse:
-    """Stub — real implementation lands in B-8.3."""
-    return JSONResponse(
-        status_code=501,
-        content={
-            "success": False,
-            "error": "not_implemented",
-            "detail": "Wave B-8.3 will land the admin force-poll endpoint",
-        },
-    )
+# NOTE: /v1/admin/traffic/poll moved to orchestrator/admin.py admin_router
+# in B-8.3 (was a 501 stub here in B-8.1, now real). All other admin endpoints
+# live there; the route follows the prefix convention.

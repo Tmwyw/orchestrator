@@ -1,8 +1,9 @@
-"""Tests for pergb endpoint surface — auth gate + admin force-poll stub.
+"""Tests for pergb endpoint surface — auth gate + Pydantic 422 contracts.
 
 Real handler behavior (reserve / topup / traffic) is covered in
-``test_endpoints_pergb.py``. This file just keeps the auth-required and
-still-stubbed admin-poll contracts pinned.
+``test_endpoints_pergb.py``; admin force-poll in
+``test_endpoints_admin_traffic_poll.py``. This file pins just the
+auth gate + Pydantic 422 contracts.
 """
 
 from __future__ import annotations
@@ -25,14 +26,13 @@ def _no_auth():
     app.dependency_overrides.pop(require_api_key, None)
 
 
-def test_admin_traffic_poll_still_stub_returns_501(_no_auth: None) -> None:
-    """Admin force-poll lands in B-8.3 — must remain 501 in B-8.2."""
+def test_admin_traffic_poll_requires_auth() -> None:
+    """Admin force-poll (B-8.3) is gated by require_api_key like the rest of /v1/admin/*."""
     from orchestrator.main import app
 
     client = TestClient(app)
     r = client.post("/v1/admin/traffic/poll")
-    assert r.status_code == 501
-    assert r.json()["error"] == "not_implemented"
+    assert r.status_code == 401
 
 
 def test_reserve_pergb_validates_request_body(_no_auth: None) -> None:
