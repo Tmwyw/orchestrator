@@ -62,6 +62,14 @@ class ProxyInventoryStatus(str, Enum):
     EXPIRED_GRACE = "expired_grace"
     ARCHIVED = "archived"
     INVALID = "invalid"
+    ALLOCATED_PERGB = "allocated_pergb"
+
+
+class TrafficAccountStatus(str, Enum):
+    ACTIVE = "active"
+    DEPLETED = "depleted"
+    EXPIRED = "expired"
+    ARCHIVED = "archived"
 
 
 class OrderStatus(str, Enum):
