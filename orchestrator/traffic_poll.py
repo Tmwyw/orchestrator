@@ -48,6 +48,8 @@ class PollCounters:
     node_failures: int = 0
     counter_resets_detected: int = 0
     skipped_overlap: bool = False
+    nodes_polled: int = 0
+    bytes_observed_total: int = 0
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -83,21 +85,43 @@ class TrafficPollService:
         self._lock = threading.Lock()
         self._node_failures: dict[str, int] = {}
 
-    def run_once(self) -> PollCounters:
+    def run_once(
+        self,
+        *,
+        node_id_filter: str | None = None,
+        account_id_filter: int | None = None,
+    ) -> PollCounters:
+        """Run one polling cycle over active accounts.
+
+        ``node_id_filter`` / ``account_id_filter`` (B-8.3) narrow the SELECT to
+        a single node or single account — used by the admin force-poll
+        endpoint. The scheduler always calls ``run_once()`` with no filters.
+        """
         if not self._lock.acquire(blocking=False):
             logger.warning("traffic_poll_skipped_overlap")
             return PollCounters(skipped_overlap=True)
         try:
-            return self._poll_cycle()
+            return self._poll_cycle(
+                node_id_filter=node_id_filter,
+                account_id_filter=account_id_filter,
+            )
         finally:
             self._lock.release()
 
     # === core loop ===
 
-    def _poll_cycle(self) -> PollCounters:
+    def _poll_cycle(
+        self,
+        *,
+        node_id_filter: str | None = None,
+        account_id_filter: int | None = None,
+    ) -> PollCounters:
         counters = PollCounters()
         cfg = get_config()
-        rows = self._fetch_active_accounts()
+        rows = self._fetch_active_accounts(
+            node_id_filter=node_id_filter,
+            account_id_filter=account_id_filter,
+        )
         if not rows:
             return counters
 
@@ -105,6 +129,7 @@ class TrafficPollService:
         for row in rows:
             by_node.setdefault(row.node_id, []).append(row)
 
+        counters.nodes_polled = len(by_node)
         for node_id, accounts in by_node.items():
             self._poll_one_node(
                 node_id=node_id,
@@ -220,6 +245,7 @@ class TrafficPollService:
             new_bytes_used=new_bytes_used,
         )
         counters.accounts_polled += 1
+        counters.bytes_observed_total += delta_in + delta_out
 
         if account.sku_code:
             if delta_in:
@@ -324,29 +350,40 @@ class TrafficPollService:
 
     # === DB helpers ===
 
-    def _fetch_active_accounts(self) -> list[_AccountRow]:
+    def _fetch_active_accounts(
+        self,
+        *,
+        node_id_filter: str | None = None,
+        account_id_filter: int | None = None,
+    ) -> list[_AccountRow]:
         rows: list[_AccountRow] = []
+        sql = """
+            select t.id            as account_id,
+                   t.inventory_id  as inventory_id,
+                   t.bytes_quota   as bytes_quota,
+                   t.bytes_used    as bytes_used,
+                   t.last_polled_bytes_in,
+                   t.last_polled_bytes_out,
+                   i.node_id       as node_id,
+                   i.port          as port,
+                   n.url           as node_url,
+                   n.api_key       as node_api_key,
+                   s.code          as sku_code
+            from traffic_accounts t
+            join proxy_inventory i on i.id = t.inventory_id
+            join nodes n on n.id = i.node_id
+            join skus s on s.id = i.sku_id
+            where t.status = 'active'
+        """
+        params: list[Any] = []
+        if node_id_filter is not None:
+            sql += " and i.node_id = %s"
+            params.append(node_id_filter)
+        if account_id_filter is not None:
+            sql += " and t.id = %s"
+            params.append(account_id_filter)
         with connect() as conn, conn.cursor() as cur:
-            cur.execute(
-                """
-                select t.id            as account_id,
-                       t.inventory_id  as inventory_id,
-                       t.bytes_quota   as bytes_quota,
-                       t.bytes_used    as bytes_used,
-                       t.last_polled_bytes_in,
-                       t.last_polled_bytes_out,
-                       i.node_id       as node_id,
-                       i.port          as port,
-                       n.url           as node_url,
-                       n.api_key       as node_api_key,
-                       s.code          as sku_code
-                from traffic_accounts t
-                join proxy_inventory i on i.id = t.inventory_id
-                join nodes n on n.id = i.node_id
-                join skus s on s.id = i.sku_id
-                where t.status = 'active'
-                """
-            )
+            cur.execute(sql, tuple(params))
             for r in cur.fetchall():
                 rows.append(
                     _AccountRow(
