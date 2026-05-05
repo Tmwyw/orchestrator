@@ -7,11 +7,13 @@ WORKER_SERVICE_NAME="netrun-orchestrator-worker"
 REFILL_SERVICE_NAME="netrun-orchestrator-refill"
 VALIDATION_SERVICE_NAME="netrun-orchestrator-validation"
 WATCHDOG_SERVICE_NAME="netrun-orchestrator-watchdog"
+TRAFFIC_POLL_SERVICE_NAME="netrun-orchestrator-traffic-poll"
 SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
 WORKER_SERVICE_FILE="/etc/systemd/system/${WORKER_SERVICE_NAME}.service"
 REFILL_SERVICE_FILE="/etc/systemd/system/${REFILL_SERVICE_NAME}.service"
 VALIDATION_SERVICE_FILE="/etc/systemd/system/${VALIDATION_SERVICE_NAME}.service"
 WATCHDOG_SERVICE_FILE="/etc/systemd/system/${WATCHDOG_SERVICE_NAME}.service"
+TRAFFIC_POLL_SERVICE_FILE="/etc/systemd/system/${TRAFFIC_POLL_SERVICE_NAME}.service"
 EXTERNAL_DB=0
 TMP_SOURCE=""
 
@@ -211,17 +213,20 @@ install_service() {
   install -m 0644 "$APP_HOME/deploy/systemd/netrun-orchestrator-refill.service.template" "$REFILL_SERVICE_FILE"
   install -m 0644 "$APP_HOME/deploy/systemd/netrun-orchestrator-validation.service.template" "$VALIDATION_SERVICE_FILE"
   install -m 0644 "$APP_HOME/deploy/systemd/netrun-orchestrator-watchdog.service.template" "$WATCHDOG_SERVICE_FILE"
+  install -m 0644 "$APP_HOME/deploy/systemd/netrun-orchestrator-traffic-poll.service.template" "$TRAFFIC_POLL_SERVICE_FILE"
   systemctl daemon-reload
   systemctl enable "$SERVICE_NAME" >/dev/null
   systemctl enable "$WORKER_SERVICE_NAME" >/dev/null
   systemctl enable "$REFILL_SERVICE_NAME" >/dev/null
   systemctl enable "$VALIDATION_SERVICE_NAME" >/dev/null
   systemctl enable "$WATCHDOG_SERVICE_NAME" >/dev/null
+  systemctl enable "$TRAFFIC_POLL_SERVICE_NAME" >/dev/null
   systemctl restart "$SERVICE_NAME"
   systemctl restart "$WORKER_SERVICE_NAME"
   systemctl restart "$REFILL_SERVICE_NAME"
   systemctl restart "$VALIDATION_SERVICE_NAME"
   systemctl restart "$WATCHDOG_SERVICE_NAME"
+  systemctl restart "$TRAFFIC_POLL_SERVICE_NAME"
 }
 
 wait_health() {
@@ -263,6 +268,7 @@ main() {
   log "REFILL_SERVICE=$REFILL_SERVICE_NAME"
   log "VALIDATION_SERVICE=$VALIDATION_SERVICE_NAME"
   log "WATCHDOG_SERVICE=$WATCHDOG_SERVICE_NAME"
+  log "TRAFFIC_POLL_SERVICE=$TRAFFIC_POLL_SERVICE_NAME"
   log "HEALTH=http://127.0.0.1:${ORCHESTRATOR_PORT:-8090}/health (localhost only)"
   log "For external access, run: bash scripts/install_nginx.sh"
   log "API key is stored in $APP_HOME/.env"

@@ -1,0 +1,19 @@
+[Unit]
+Description=NETRUN Orchestrator Traffic Poll Worker (Pay-per-GB B-8.2)
+After=network-online.target postgresql.service redis-server.service netrun-orchestrator.service
+Wants=network-online.target
+Requires=postgresql.service redis-server.service
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/netrun-orchestrator
+EnvironmentFile=/opt/netrun-orchestrator/.env
+ExecStart=/opt/netrun-orchestrator/.venv/bin/python -m orchestrator.traffic_poll_scheduler
+Restart=always
+RestartSec=5
+LimitNOFILE=65536
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
