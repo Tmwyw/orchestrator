@@ -3,14 +3,23 @@
 from __future__ import annotations
 
 from datetime import datetime
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from orchestrator.schemas import OrderStatus
 
 _API_MODEL_CONFIG = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+
+def _coerce_decimal(value: Any) -> Any:
+    if isinstance(value, str):
+        try:
+            return Decimal(value)
+        except (InvalidOperation, ValueError) as exc:
+            raise ValueError(f"invalid decimal: {value!r}") from exc
+    return value
 
 
 # === /v1/orders/reserve ===
@@ -246,16 +255,59 @@ class ArchiveExportResponse(BaseModel):
 
 # === Pay-per-GB (Wave B-8) ===
 
+# Schema for skus.metadata['tiers'] when product_kind = datacenter_pergb.
+# Per docs/wave_b8_design.md § 2.4 + § 5.1; Decimal serialized as JSON
+# string per § 6.10 money convention.
+
+
+class SkuTier(BaseModel):
+    model_config = _API_MODEL_CONFIG
+
+    gb: int = Field(ge=1)
+    price_per_gb: Decimal
+
+    @field_validator("price_per_gb", mode="before")
+    @classmethod
+    def _parse_decimal(cls, v: Any) -> Any:
+        return _coerce_decimal(v)
+
+    @field_validator("price_per_gb")
+    @classmethod
+    def _positive(cls, v: Decimal) -> Decimal:
+        if v <= 0:
+            raise ValueError("price_per_gb must be > 0")
+        return v
+
+
+class SkuTierTable(BaseModel):
+    model_config = _API_MODEL_CONFIG
+
+    tiers: list[SkuTier] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def _check_sorted_unique(self) -> SkuTierTable:
+        prev_gb = 0
+        for tier in self.tiers:
+            if tier.gb <= prev_gb:
+                # Duplicates land here too (gb == prev_gb).
+                raise ValueError("tiers must be sorted ascending by gb (no duplicates)")
+            prev_gb = tier.gb
+        return self
+
 
 class ReservePergbRequest(BaseModel):
-    user_id: int
-    sku_id: int
+    model_config = _API_MODEL_CONFIG
+
+    user_id: int = Field(gt=0)
+    sku_id: int = Field(gt=0)
     gb_amount: int = Field(ge=1)
     idempotency_key: str | None = Field(default=None, max_length=128)
 
 
 class ReservePergbResponse(BaseModel):
-    success: bool
+    model_config = _API_MODEL_CONFIG
+
+    success: bool = True
     order_ref: str
     expires_at: datetime
     port: int
@@ -265,15 +317,24 @@ class ReservePergbResponse(BaseModel):
     bytes_quota: int
     price_amount: Decimal
 
+    @field_validator("price_amount", mode="before")
+    @classmethod
+    def _parse_decimal(cls, v: Any) -> Any:
+        return _coerce_decimal(v)
+
 
 class TopupPergbRequest(BaseModel):
-    sku_id: int
+    model_config = _API_MODEL_CONFIG
+
+    sku_id: int = Field(gt=0)
     gb_amount: int = Field(ge=1)
     idempotency_key: str | None = Field(default=None, max_length=128)
 
 
 class TopupPergbResponse(BaseModel):
-    success: bool
+    model_config = _API_MODEL_CONFIG
+
+    success: bool = True
     order_ref: str
     parent_order_ref: str
     topup_sequence: int
@@ -283,8 +344,15 @@ class TopupPergbResponse(BaseModel):
     price_amount: Decimal
     tier_price_per_gb: Decimal
 
+    @field_validator("price_amount", "tier_price_per_gb", mode="before")
+    @classmethod
+    def _parse_decimal(cls, v: Any) -> Any:
+        return _coerce_decimal(v)
+
 
 class TrafficResponse(BaseModel):
+    model_config = _API_MODEL_CONFIG
+
     order_ref: str
     status: str
     bytes_quota: int
@@ -300,6 +368,8 @@ class TrafficResponse(BaseModel):
 
 
 class AdminTrafficPollResponse(BaseModel):
+    model_config = _API_MODEL_CONFIG
+
     accounts_polled: int
     nodes_polled: int
     bytes_observed_total: int
