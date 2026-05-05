@@ -210,10 +210,38 @@ class StatsNodes(BaseModel):
     total: int
 
 
+class PergbTopSku(BaseModel):
+    """One row of /v1/admin/stats.pergb.top_skus_by_revenue_7d (B-8.3)."""
+
+    model_config = _API_MODEL_CONFIG
+
+    sku_code: str
+    revenue: Decimal
+    accounts: int
+
+    @field_validator("revenue", mode="before")
+    @classmethod
+    def _parse_decimal(cls, v: Any) -> Any:
+        return _coerce_decimal(v)
+
+
+class PergbStatsSubsection(BaseModel):
+    """Pay-per-GB summary on /v1/admin/stats (B-8.3)."""
+
+    model_config = _API_MODEL_CONFIG
+
+    active_accounts: int
+    depleted_accounts: int
+    expired_accounts: int
+    bytes_consumed_7d: int
+    top_skus_by_revenue_7d: list[PergbTopSku]
+
+
 class StatsResponse(BaseModel):
     sales: StatsSales
     inventory: list[StatsInventoryRow]
     nodes: StatsNodes
+    pergb: PergbStatsSubsection | None = None
 
 
 class OrderListItem(BaseModel):
