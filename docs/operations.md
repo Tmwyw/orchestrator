@@ -537,7 +537,7 @@ curl -sI http://other-project.example.com/  # confirm reachable
 
 ---
 
-## 12. Pay-per-GB operations (Wave B-8.2)
+## 12. Pay-per-GB operations (Wave B-8.2 + B-8.3)
 
 Pay-per-GB is a second product line on top of per-piece IPv6. Each pergb
 buyer gets a dedicated port on a node; nftables per-port counters provide
@@ -560,7 +560,11 @@ curl -sS -X POST http://127.0.0.1:8090/v1/orders/reserve_pergb \
 
 # Response carries port, host, login, password — use those to send traffic.
 
-# 3. Wait one polling cycle (~60s default), then check usage:
+# 3a. Force-poll instead of waiting 60s (B-8.3):
+curl -sS -X POST http://127.0.0.1:8090/v1/admin/traffic/poll \
+  -H "X-NETRUN-API-KEY: $ORCHESTRATOR_API_KEY" | jq .
+
+# 3b. Or wait one polling cycle (~60s default), then check usage:
 curl -sS -H "X-NETRUN-API-KEY: $ORCHESTRATOR_API_KEY" \
   http://127.0.0.1:8090/v1/orders/<order_ref>/traffic | jq .
 
@@ -570,6 +574,51 @@ curl -sS -X POST http://127.0.0.1:8090/v1/orders/<order_ref>/topup_pergb \
   -H 'content-type: application/json' \
   -d '{"sku_id":42,"gb_amount":10}' | jq .
 ```
+
+### 12.1.5 Admin force-poll (B-8.3)
+
+`POST /v1/admin/traffic/poll` runs one polling cycle synchronously and
+returns the same counters the scheduler logs each tick. Useful for:
+
+- Smoke-testing a fresh deploy without waiting 60s.
+- Verifying depletion → disable transitions immediately after triggering
+  enough traffic on a port.
+- Debugging stuck accounts: scope to one account with `?account_id=N` to
+  see exactly what that one account's poll cycle yields.
+
+```bash
+# Full cycle
+curl -sS -X POST http://127.0.0.1:8090/v1/admin/traffic/poll \
+  -H "X-NETRUN-API-KEY: $ORCHESTRATOR_API_KEY" | jq .
+
+# Scope to one node (UUID from /v1/nodes)
+curl -sS -X POST "http://127.0.0.1:8090/v1/admin/traffic/poll?node_id=<UUID>" \
+  -H "X-NETRUN-API-KEY: $ORCHESTRATOR_API_KEY" | jq .
+
+# Scope to one account (BIGSERIAL from traffic_accounts.id)
+curl -sS -X POST "http://127.0.0.1:8090/v1/admin/traffic/poll?account_id=42" \
+  -H "X-NETRUN-API-KEY: $ORCHESTRATOR_API_KEY" | jq .
+```
+
+Response shape:
+
+```json
+{
+  "accounts_polled": 4,
+  "nodes_polled": 2,
+  "bytes_observed_total": 1234567,
+  "counter_resets_detected": 0,
+  "accounts_marked_depleted": 1
+}
+```
+
+The endpoint shares an in-process `TrafficPollService` instance — its
+non-blocking lock prevents two concurrent admin calls from racing each
+other, but does NOT prevent racing the standalone scheduler unit
+(separate process, separate lock). At 60s cadence cross-process race
+is rare; if it happens, the worst case is a single sample double-write
+(rejected by the next anchor read since cumulative counters are
+monotonic).
 
 ### 12.2 Scheduler tuning
 
@@ -617,8 +666,35 @@ ORDER BY collected_at DESC
 LIMIT 20;
 ```
 
-### 12.5 Out of scope (deferred to B-8.3 / B-8.4)
+### 12.5 Admin stats pergb subsection (B-8.3)
 
-- `POST /v1/admin/traffic/poll` synchronous force-poll endpoint (B-8.3 — currently 501 stub).
-- `/v1/admin/stats` pergb subsection (active accounts / 7-day bytes / top SKU revenue).
+`GET /v1/admin/stats` includes a `pergb` block alongside the existing
+`sales` / `inventory` / `nodes`:
+
+```bash
+curl -sS -H "X-NETRUN-API-KEY: $ORCHESTRATOR_API_KEY" \
+  http://127.0.0.1:8090/v1/admin/stats | jq .pergb
+```
+
+```json
+{
+  "active_accounts": 17,
+  "depleted_accounts": 3,
+  "expired_accounts": 1,
+  "bytes_consumed_7d": 5497558138880,
+  "top_skus_by_revenue_7d": [
+    {"sku_code": "pergb_us_30gb", "revenue": "184.50", "accounts": 6},
+    {"sku_code": "pergb_us_5gb",  "revenue": "60.00",  "accounts": 12}
+  ]
+}
+```
+
+`bytes_consumed_7d` aggregates `bytes_in_delta + bytes_out_delta` from
+`traffic_samples` (NOT raw cumulative readings — counter resets would
+otherwise inflate). Top-SKU list is capped at 5 rows.
+
+### 12.6 Out of scope (deferred to B-8.4 / D)
+
 - Real-money smoke against a live billing flow (B-8.4 once nodes return to service).
+- Hard per-port nftables rate-limit cap (Wave D).
+- Cross-SKU top-up (D4.5 rejection — same `sku_id` required).

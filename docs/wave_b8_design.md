@@ -1,6 +1,6 @@
 # Wave B-8 — Pay-per-GB Billing (design pass)
 
-**Status:** B-8.1 closed; B-8.2 closed (polling worker + real reserve/topup/traffic endpoints + watchdog phase 5); B-8.3 awaiting (admin force-poll + admin stats pergb subsection).
+**Status:** B-8.1 closed; B-8.2 closed; B-8.3 closed (admin force-poll + admin stats pergb subsection + ops § 12 runbook); B-8.4 awaiting (real-money smoke against live nodes).
 **Companion to:** `docs/wave_b_design.md` (which has the preliminary § 4.3 schema, § 6.8 endpoints list, § 8 architecture sketch — all expanded here).
 
 ---
