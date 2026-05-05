@@ -69,6 +69,9 @@ def test_watchdog_marks_stuck_running_jobs_failed(_cfg: None) -> None:
         [[]],  # phase 2: no expired orders
         [[]],  # phase 3: no stale pending validation
         [[]],  # phase 4: no expired delivery
+        [[]],  # phase 5.1: no pergb expired
+        [[]],  # phase 5.2: no pergb archive
+        [[]],  # phase 5.3: no samples pruned
     )
     with patch("orchestrator.watchdog.connect", new=fake_connect):
         counters = WatchdogService().run_once()
@@ -93,6 +96,9 @@ def test_watchdog_releases_expired_reservations(_cfg: None) -> None:
         ],  # phase 2: 2 expired orders
         [[]],  # phase 3
         [[]],  # phase 4
+        [[]],  # phase 5.1
+        [[]],  # phase 5.2
+        [[]],  # phase 5.3
     )
     with patch("orchestrator.watchdog.connect", new=fake_connect):
         counters = WatchdogService().run_once()
@@ -114,6 +120,9 @@ def test_watchdog_invalidates_stale_pending_validation(_cfg: None) -> None:
         [[]],  # phase 2
         [[{"id": 1}, {"id": 2}, {"id": 3}, {"id": 4}, {"id": 5}]],  # phase 3
         [[]],  # phase 4
+        [[]],  # phase 5.1
+        [[]],  # phase 5.2
+        [[]],  # phase 5.3
     )
     with patch("orchestrator.watchdog.connect", new=fake_connect):
         counters = WatchdogService().run_once()
@@ -132,6 +141,9 @@ def test_watchdog_clears_expired_delivery_content(_cfg: None) -> None:
         [[]],  # phase 2
         [[]],  # phase 3
         [[{"id": 100}, {"id": 101}]],  # phase 4: 2 cleared
+        [[]],  # phase 5.1
+        [[]],  # phase 5.2
+        [[]],  # phase 5.3
     )
     with patch("orchestrator.watchdog.connect", new=fake_connect):
         counters = WatchdogService().run_once()
@@ -145,7 +157,7 @@ def test_watchdog_clears_expired_delivery_content(_cfg: None) -> None:
 def test_watchdog_run_once_no_op_when_clean(_cfg: None) -> None:
     from orchestrator.watchdog import WatchdogService
 
-    fake_connect, _ = _make_phased_connect([[]], [[]], [[]], [[]])
+    fake_connect, _ = _make_phased_connect([[]], [[]], [[]], [[]], [[]], [[]], [[]])
     with patch("orchestrator.watchdog.connect", new=fake_connect):
         counters = WatchdogService().run_once()
 
@@ -154,4 +166,7 @@ def test_watchdog_run_once_no_op_when_clean(_cfg: None) -> None:
         "orders_released_expired": 0,
         "inventory_invalidated_stale": 0,
         "delivery_content_expired": 0,
+        "pergb_accounts_expired": 0,
+        "pergb_accounts_archived": 0,
+        "pergb_samples_pruned": 0,
     }
