@@ -28,6 +28,8 @@ from orchestrator.api_schemas import (
     ReserveErrorResponse,
     ReserveRequest,
     ReserveResponse,
+    SkuItem,
+    SkusListResponse,
 )
 from orchestrator.config import get_config
 from orchestrator.db import connect, fetch_all, fetch_one
@@ -623,6 +625,59 @@ async def extend_order_endpoint(order_ref: str, payload: ExtendRequest):
             new_proxies_expires_at=result.new_proxies_expires_at,
         ).model_dump(mode="json"),
     )
+
+
+# === /v1/skus/active — public SKU catalog for bot ===
+
+PRODUCT_KIND_TO_BOT = {
+    "ipv6": "ipv6_per_piece",
+    "datacenter_pergb": "datacenter_pergb",
+}
+
+PRODUCT_KIND_NAMES = {
+    "ipv6": "IPv6 SOCKS5",
+    "datacenter_pergb": "Pay-per-GB Datacenter",
+}
+
+
+@app.get("/v1/skus/active", dependencies=[Depends(require_api_key)])
+def list_active_skus():
+    sql = """
+        SELECT
+          s.id as sku_id,
+          s.code,
+          s.geo_code,
+          s.product_kind,
+          s.duration_days,
+          s.price_per_piece,
+          s.price_per_gb,
+          COUNT(pi.id) FILTER (WHERE pi.status = 'available') AS stock_available
+        FROM skus s
+        LEFT JOIN proxy_inventory pi ON pi.sku_id = s.id
+        WHERE s.is_active = TRUE
+        GROUP BY s.id
+        ORDER BY s.id
+    """
+    rows = fetch_all(sql)
+    items = []
+    for row in rows:
+        kind = row["product_kind"]
+        bot_kind = PRODUCT_KIND_TO_BOT.get(kind, kind)
+        price = (row["price_per_gb"] if kind == "datacenter_pergb" else row["price_per_piece"]) or 0
+        items.append(
+            SkuItem(
+                sku_id=row["sku_id"],
+                code=row["code"],
+                geo_code=row["geo_code"],
+                name=PRODUCT_KIND_NAMES.get(kind, kind),
+                price_per_unit=price,
+                stock_available=int(row["stock_available"] or 0),
+                duration_days=row["duration_days"],
+                product_kind=bot_kind,
+                tiers=None,
+            )
+        )
+    return JSONResponse(content=SkusListResponse(items=items, count=len(items)).model_dump(mode="json"))
 
 
 # === /v1/* aliases for legacy endpoints (Wave B-7a) ===
