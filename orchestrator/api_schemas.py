@@ -89,7 +89,11 @@ class ReleaseResponse(BaseModel):
 
 
 class OrderResponse(BaseModel):
-    model_config = _API_MODEL_CONFIG
+    # extra="ignore" because this model consumes DB rows directly via
+    # OrderResponse.model_validate(order) and the orders table has more
+    # columns (id, reservation_key, idempotency_key, metadata, created_at,
+    # updated_at) than we expose on the wire.
+    model_config = ConfigDict(str_strip_whitespace=True, extra="ignore")
 
     order_ref: str
     user_id: int
