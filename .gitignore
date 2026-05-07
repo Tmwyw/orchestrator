@@ -8,3 +8,6 @@ __pycache__/
 .ruff_cache/
 dist/
 *.tar.gz
+
+# Claude Code session metadata (local only)
+.claude/
