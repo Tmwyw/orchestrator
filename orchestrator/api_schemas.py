@@ -407,3 +407,28 @@ class AdminTrafficPollResponse(BaseModel):
     bytes_observed_total: int
     counter_resets_detected: int
     accounts_marked_depleted: int
+
+
+# === /v1/skus/active (Wave B catalog endpoint) ===
+
+
+class SkuItem(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="ignore")
+
+    sku_id: int
+    code: str
+    geo_code: str
+    name: str
+    price_per_unit: Decimal
+    stock_available: int
+    duration_days: int
+    product_kind: str = "ipv6_per_piece"
+    tiers: list[dict[str, Any]] | None = None
+
+
+class SkusListResponse(BaseModel):
+    model_config = _API_MODEL_CONFIG
+
+    success: bool = True
+    items: list[SkuItem]
+    count: int
