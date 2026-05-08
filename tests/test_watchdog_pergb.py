@@ -62,6 +62,8 @@ def test_phase5_marks_expired_accounts_and_cascades_inventory() -> None:
         ],
         [[]],  # phase 5.2 archive
         [[]],  # phase 5.3 prune
+        [[]],  # phase 5.4 block retries
+        [[]],  # phase 5.5 unblock retries
     )
     with patch("orchestrator.watchdog.connect", new=fake_connect):
         counters = WatchdogService().run_once()
@@ -93,6 +95,8 @@ def test_phase5_archives_after_grace() -> None:
             ]
         ],
         [[]],  # 5.3 prune
+        [[]],  # 5.4 block retries
+        [[]],  # 5.5 unblock retries
     )
     with patch("orchestrator.watchdog.connect", new=fake_connect):
         counters = WatchdogService().run_once()
@@ -115,6 +119,8 @@ def test_phase5_prunes_old_samples() -> None:
         [[]],  # 5.2
         # 5.3: 7 sample rows pruned
         [[{"id": i} for i in range(7)]],
+        [[]],  # 5.4 block retries
+        [[]],  # 5.5 unblock retries
     )
     with patch("orchestrator.watchdog.connect", new=fake_connect):
         counters = WatchdogService().run_once()
@@ -139,6 +145,8 @@ def test_phase5_no_op_when_clean_does_not_cascade() -> None:
         [[]],  # 5.1: empty
         [[]],  # 5.2: empty
         [[]],  # 5.3: empty
+        [[]],  # 5.4: empty
+        [[]],  # 5.5: empty
     )
     with patch("orchestrator.watchdog.connect", new=fake_connect):
         counters = WatchdogService().run_once()
