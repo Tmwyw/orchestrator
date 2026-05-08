@@ -887,3 +887,127 @@ it behind nginx auth.
 
 The orchestrator's own units already go to journald — query with
 `journalctl -u netrun-orchestrator -f`.
+
+---
+
+## 14. Pay-per-GB safety net (Wave D)
+
+Goal: when a user's `bytes_used >= bytes_quota`, **the proxy must
+actually stop passing traffic on the node**, not just be flagged as
+depleted in the database. Without this, the user paid for 1 GB but
+keeps receiving unlimited until the next polling cycle (or forever,
+if the node missed the disable call).
+
+### 14.1 What's wired (end-to-end)
+
+1. **Polling cycle (`netrun-orchestrator-traffic-poll`)** flips an
+   account `active → depleted` when the new sample crosses
+   `bytes_quota`. In the same DB transaction it sets `depleted_at`.
+2. Immediately after the flip, the polling worker calls
+   `POST /accounts/{port}/disable` on the node-agent. The node's
+   nftables rule gets a `DROP` for that IPv6 alias.
+3. The orchestrator stamps `traffic_accounts.last_block_attempt_at`
+   regardless of outcome. On success it also flips
+   `node_blocked = TRUE`. On failure (timeout, 5xx, network
+   blip) `node_blocked` stays `FALSE`.
+4. Every watchdog cycle (60s) **phase 5.4** sweeps:
+   ```sql
+   SELECT … FROM traffic_accounts
+   WHERE status = 'depleted'
+     AND node_blocked = FALSE
+     AND (last_block_attempt_at IS NULL
+          OR last_block_attempt_at < now() - INTERVAL '5 minutes')
+   ```
+   For each row it retries `post_disable`. Throttle is 5 minutes
+   per attempt; batch limit is 100 rows per cycle.
+5. On reactivation (`POST /v1/orders/{ref}/topup_pergb` flips the
+   account `depleted → active`), `PergbService` calls
+   `POST /accounts/{port}/enable` to restore the `ACCEPT` rule.
+   Same persistence rules apply via `last_unblock_attempt_at`
+   and **phase 5.5** retries.
+
+### 14.2 Node-runtime requirement
+
+The node-agent must implement two endpoints (already shipped in
+`netrun-node` per Wave B-8.2 design § 3.2 / § 3.3):
+
+| Path | Method | Behavior |
+|------|--------|----------|
+| `/accounts/{port}/disable` | `POST` | Idempotent DROP rule install. Already-disabled returns 200. |
+| `/accounts/{port}/enable`  | `POST` | Idempotent ACCEPT restore. Already-enabled returns 200. |
+
+If a node doesn't implement these (or implements them buggy), the
+orchestrator's safety net cannot help — the watchdog will keep
+retrying with `last_block_attempt_at` advancing every 5 minutes,
+visible in the structured log under `watchdog_pergb_block_retry_failed`.
+
+### 14.3 Recovery from node restarts
+
+If a node restarts and loses its nftables state, the orchestrator
+considers all its currently-depleted accounts as still blocked
+(because `node_blocked = TRUE` from the last successful disable).
+The next polling cycle will not re-call `post_disable` because the
+flip has already happened. **This is the failure mode the watchdog
+phase 5.4 protects against** — but only when `node_blocked = FALSE`.
+
+For the case where a node restarts after a successful disable:
+either the operator runs a manual reconciliation, or we accept the
+small window until the user's lease expires (the watchdog phase 5.1
+will flip the account to `expired` at lease end and the inventory
+will recycle). In practice node restarts are rare; the more common
+case is a transient network blip during the disable RTT, which is
+exactly what phase 5.4 fixes.
+
+### 14.4 Apply migration 026
+
+```bash
+cd /opt/netrun-orchestrator
+sudo -u postgres psql -d netrun_orchestrator -f migrations/026_traffic_accounts_safety_net.sql
+sudo systemctl restart netrun-orchestrator netrun-orchestrator-traffic-poll \
+                       netrun-orchestrator-watchdog
+```
+
+The migration is `IF NOT EXISTS` on every column / index — re-applying
+is safe.
+
+### 14.5 Smoke test
+
+The operator script `deploy/scripts/pergb_smoke.sh` walks the entire
+flow: discover SKU, reserve 1 GB, push traffic, verify usage,
+exhaust quota, assert proxy actually stops.
+
+```bash
+ORCHESTRATOR_API_KEY="$(grep ^ORCHESTRATOR_API_KEY /opt/netrun-orchestrator/.env | cut -d= -f2-)" \
+  bash /opt/netrun-orchestrator/deploy/scripts/pergb_smoke.sh DE 1
+```
+
+Expected exit codes:
+
+| Exit | Meaning |
+|------|---------|
+| 0    | Quota was enforced (curl failed OR `/traffic` reports `depleted`). |
+| 1    | Setup error (missing SKU, missing inventory, missing API key). |
+| 2    | **Safety net broken** — proxy still served traffic past 1.1×quota. Investigate. |
+
+If you hit exit code 2, the structured log to look at:
+
+```bash
+journalctl -u netrun-orchestrator-traffic-poll -n 100 | grep -E '(traffic_account_disable_failed|traffic_account_depleted)'
+journalctl -u netrun-orchestrator-watchdog     -n 100 | grep watchdog_pergb_block_retry
+```
+
+### 14.6 Inspecting current state
+
+```sql
+-- Accounts where the safety net is still settling.
+SELECT id, status, bytes_used, bytes_quota, node_blocked,
+       last_block_attempt_at, last_unblock_attempt_at
+FROM traffic_accounts
+WHERE (status = 'depleted' AND node_blocked = FALSE)
+   OR (status = 'active'   AND node_blocked = TRUE)
+ORDER BY id;
+```
+
+A persistently non-empty result set across multiple watchdog cycles
+means a node is wedged refusing disable/enable — investigate the
+node-agent logs on the host pointed to by `nodes.url`.
