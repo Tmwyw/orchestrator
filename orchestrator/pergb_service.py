@@ -721,8 +721,10 @@ class PergbService:
         port: int,
         account_id: int,
     ) -> None:
+        succeeded = False
         try:
             node_client.post_enable(node_url, node_api_key, port)
+            succeeded = True
             logger.info("pergb_account_reactivated", account_id=account_id, port=port)
         except NodeAgentError as exc:
             logger.warning(
@@ -732,6 +734,26 @@ class PergbService:
                 error=str(exc),
                 status_code=exc.status_code,
             )
+        # Stamp last_unblock_attempt_at unconditionally so the watchdog can
+        # throttle retries; clear node_blocked only when we got the ack.
+        with connect() as conn, conn.cursor() as cur:
+            if succeeded:
+                cur.execute(
+                    "update traffic_accounts "
+                    "set node_blocked = FALSE, "
+                    "    last_unblock_attempt_at = now(), "
+                    "    updated_at = now() "
+                    "where id = %s",
+                    (account_id,),
+                )
+            else:
+                cur.execute(
+                    "update traffic_accounts "
+                    "set last_unblock_attempt_at = now(), "
+                    "    updated_at = now() "
+                    "where id = %s",
+                    (account_id,),
+                )
 
     # ===========================================================
     # Redis idempotency helpers

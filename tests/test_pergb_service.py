@@ -445,10 +445,14 @@ def test_topup_pergb_reactivation_calls_post_enable() -> None:
             },
         ]
     )
+    # Fourth phase: _best_effort_post_enable now records the unblock attempt
+    # (node_blocked=FALSE on success, last_unblock_attempt_at always stamped).
+    unblock_record = _make_cursor()
     fake_connect = _make_phased_connect(
         _make_conn(parent_cursor),
         _make_conn(sku_cursor),
         _make_conn(apply_cursor),
+        _make_conn(unblock_record),
     )
 
     enable_calls: list[tuple[Any, ...]] = []
@@ -467,6 +471,88 @@ def test_topup_pergb_reactivation_calls_post_enable() -> None:
     assert result.success is True
     assert result.reactivated is True
     assert enable_calls == [("http://node-x:8085", "k1", 32001)]
+
+    # Success path: node_blocked=FALSE + last_unblock_attempt_at stamped.
+    record_calls = [c.args[0] for c in unblock_record.execute.call_args_list]
+    assert any("node_blocked = FALSE" in s and "last_unblock_attempt_at = now()" in s for s in record_calls)
+
+
+def test_topup_pergb_reactivation_post_enable_failure_keeps_node_blocked() -> None:
+    """post_enable failing on reactivation: last_unblock_attempt_at stamped
+    so the watchdog can throttle, but node_blocked stays TRUE so the
+    watchdog will retry."""
+    from orchestrator.node_client import NodeAgentError
+
+    parent_cursor = _make_cursor(
+        fetchone_queue=[
+            {
+                "order_id": 999,
+                "order_ref": "ord_abc",
+                "user_id": 1,
+                "sku_id": 5,
+                "account_id": 7,
+                "account_status": "depleted",
+                "bytes_quota": 1_000_000_000,
+                "bytes_used": 1_000_000_000,
+                "expires_at": datetime(2026, 6, 1, tzinfo=timezone.utc),
+                "node_id": "node-x",
+                "port": 32001,
+                "node_url": "http://node-x:8085",
+                "node_api_key": "k1",
+            }
+        ]
+    )
+    sku_cursor = _make_cursor(
+        fetchone_queue=[
+            {
+                "id": 5,
+                "product_kind": "datacenter_pergb",
+                "metadata": _PERGB_SKU_METADATA,
+                "duration_days": 30,
+                "is_active": True,
+            }
+        ]
+    )
+    apply_cursor = _make_cursor(
+        fetchone_queue=[
+            {"c": 0},
+            {"id": 1234},
+            {
+                "bytes_quota": 11_000_000_000,
+                "bytes_used": 1_000_000_000,
+                "expires_at": datetime(2026, 7, 1, tzinfo=timezone.utc),
+                "status": "active",
+                "just_reactivated": True,
+            },
+        ]
+    )
+    unblock_record = _make_cursor()
+    fake_connect = _make_phased_connect(
+        _make_conn(parent_cursor),
+        _make_conn(sku_cursor),
+        _make_conn(apply_cursor),
+        _make_conn(unblock_record),
+    )
+
+    def boom_post_enable(url, api_key, port, timeout_sec=10):
+        raise NodeAgentError("enable_failed", status_code=502)
+
+    with (
+        patch("orchestrator.pergb_service.connect", new=fake_connect),
+        patch("orchestrator.pergb_service.get_redis", new=AsyncMock(return_value=_make_redis_mock())),
+        patch("orchestrator.pergb_service.node_client.post_enable", side_effect=boom_post_enable),
+    ):
+        result = _run(PergbService().topup_pergb(parent_order_ref="ord_abc", sku_id=5, gb_amount=10))
+
+    # Top-up itself still succeeds — quota grew, account flipped to active.
+    assert result.success is True
+    assert result.reactivated is True
+
+    record_calls = [c.args[0] for c in unblock_record.execute.call_args_list]
+    # last_unblock_attempt_at stamped (so watchdog throttles); node_blocked NOT
+    # cleared (so watchdog will retry post_enable).
+    assert any("last_unblock_attempt_at = now()" in s for s in record_calls)
+    assert not any("node_blocked = FALSE" in s for s in record_calls)
 
 
 def test_topup_pergb_idempotency_unique_violation_path_b() -> None:
