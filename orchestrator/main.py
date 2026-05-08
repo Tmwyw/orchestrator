@@ -663,7 +663,18 @@ def list_active_skus():
     for row in rows:
         kind = row["product_kind"]
         bot_kind = PRODUCT_KIND_TO_BOT.get(kind, kind)
-        price = (row["price_per_gb"] if kind == "datacenter_pergb" else row["price_per_piece"]) or 0
+        if kind == "datacenter_pergb":
+            price = row["price_per_gb"] or 0
+            tier_rows = fetch_all(
+                "SELECT gb, price_per_gb FROM sku_tiers WHERE sku_id = %s AND is_active = TRUE ORDER BY gb",
+                (row["sku_id"],),
+            )
+            tiers: list[dict[str, Any]] | None = [
+                {"gb": int(t["gb"]), "price_per_gb": str(t["price_per_gb"])} for t in tier_rows
+            ]
+        else:
+            price = row["price_per_piece"] or 0
+            tiers = None
         items.append(
             SkuItem(
                 sku_id=row["sku_id"],
@@ -674,7 +685,7 @@ def list_active_skus():
                 stock_available=int(row["stock_available"] or 0),
                 duration_days=row["duration_days"],
                 product_kind=bot_kind,
-                tiers=None,
+                tiers=tiers,
             )
         )
     return JSONResponse(content=SkusListResponse(items=items, count=len(items)).model_dump(mode="json"))
