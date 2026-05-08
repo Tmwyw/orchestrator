@@ -3,18 +3,28 @@
 Phase 5 (B-8.2) folds pergb account lifecycle in here per design § 4.5:
 mark expired traffic_accounts, cascade proxy_inventory state, archive
 after grace, prune old samples.
+
+Phase 5.4 / 5.5 (Wave D safety net) retry node-side block / unblock
+calls that did not ack on the polling cycle: depleted accounts whose
+node_blocked is FALSE need another post_disable; active accounts whose
+node_blocked is TRUE need another post_enable. Throttled by
+last_(un)block_attempt_at >= 5 minutes ago.
 """
 
 from __future__ import annotations
 
+from orchestrator import node_client
 from orchestrator.config import get_config
 from orchestrator.db import connect
 from orchestrator.logging_setup import get_logger
+from orchestrator.node_client import NodeAgentError
 
 logger = get_logger("netrun-orchestrator-watchdog")
 
 _PERGB_GRACE_DAYS = 3
 _PERGB_SAMPLE_RETENTION_DAYS = 30
+_PERGB_BLOCK_RETRY_THROTTLE_MINUTES = 5
+_PERGB_BLOCK_RETRY_BATCH_LIMIT = 100
 
 
 class WatchdogService:
@@ -30,6 +40,10 @@ class WatchdogService:
             "pergb_accounts_expired": 0,
             "pergb_accounts_archived": 0,
             "pergb_samples_pruned": 0,
+            "pergb_block_retries_attempted": 0,
+            "pergb_block_retries_succeeded": 0,
+            "pergb_unblock_retries_attempted": 0,
+            "pergb_unblock_retries_succeeded": 0,
         }
         cfg = get_config()
 
@@ -189,4 +203,187 @@ class WatchdogService:
                 samples_pruned=counters["pergb_samples_pruned"],
             )
 
+        # === Phase 5.4: retry post_disable on depleted accounts whose node
+        # didn't ack — "user paying for 1 GB but receiving unlimited" is the
+        # failure mode this prevents.
+        self._retry_pending_blocks(counters)
+
+        # === Phase 5.5: mirror — retry post_enable after a top-up reactivation
+        # whose enable RTT didn't ack. Without this the user pays for a top-up
+        # but stays locked out at the nftables layer.
+        self._retry_pending_unblocks(counters)
+
+        if counters["pergb_block_retries_attempted"] or counters["pergb_unblock_retries_attempted"]:
+            logger.info(
+                "watchdog_pergb_safety_net",
+                blocks_attempted=counters["pergb_block_retries_attempted"],
+                blocks_succeeded=counters["pergb_block_retries_succeeded"],
+                unblocks_attempted=counters["pergb_unblock_retries_attempted"],
+                unblocks_succeeded=counters["pergb_unblock_retries_succeeded"],
+            )
+
         return counters
+
+    # === safety-net retries (Wave D) ===
+
+    def _retry_pending_blocks(self, counters: dict[str, int]) -> None:
+        """Find depleted accounts whose post_disable hasn't been acked and retry."""
+        with connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    select t.id           as account_id,
+                           i.port         as port,
+                           n.url          as node_url,
+                           n.api_key      as node_api_key,
+                           i.node_id      as node_id
+                    from traffic_accounts t
+                    join proxy_inventory i on i.id = t.inventory_id
+                    join nodes n on n.id = i.node_id
+                    where t.status = 'depleted'
+                      and t.node_blocked = false
+                      and (t.last_block_attempt_at is null
+                           or t.last_block_attempt_at < now() - (%s || ' minutes')::interval)
+                    order by t.last_block_attempt_at nulls first
+                    limit %s
+                    """,
+                    (_PERGB_BLOCK_RETRY_THROTTLE_MINUTES, _PERGB_BLOCK_RETRY_BATCH_LIMIT),
+                )
+                pending = list(cur.fetchall())
+
+            for row in pending:
+                counters["pergb_block_retries_attempted"] += 1
+                ok = self._call_disable(
+                    node_url=str(row["node_url"]),
+                    node_api_key=(str(row["node_api_key"]) if row.get("node_api_key") else None),
+                    port=int(row["port"]),
+                    account_id=int(row["account_id"]),
+                    node_id=str(row["node_id"]),
+                )
+                with conn.cursor() as cur:
+                    if ok:
+                        counters["pergb_block_retries_succeeded"] += 1
+                        cur.execute(
+                            """
+                            update traffic_accounts
+                            set node_blocked = true,
+                                last_block_attempt_at = now(),
+                                updated_at = now()
+                            where id = %s
+                            """,
+                            (int(row["account_id"]),),
+                        )
+                    else:
+                        cur.execute(
+                            """
+                            update traffic_accounts
+                            set last_block_attempt_at = now(),
+                                updated_at = now()
+                            where id = %s
+                            """,
+                            (int(row["account_id"]),),
+                        )
+
+    def _retry_pending_unblocks(self, counters: dict[str, int]) -> None:
+        """Find active accounts still flagged blocked and retry post_enable."""
+        with connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    select t.id           as account_id,
+                           i.port         as port,
+                           n.url          as node_url,
+                           n.api_key      as node_api_key,
+                           i.node_id      as node_id
+                    from traffic_accounts t
+                    join proxy_inventory i on i.id = t.inventory_id
+                    join nodes n on n.id = i.node_id
+                    where t.status = 'active'
+                      and t.node_blocked = true
+                      and (t.last_unblock_attempt_at is null
+                           or t.last_unblock_attempt_at < now() - (%s || ' minutes')::interval)
+                    order by t.last_unblock_attempt_at nulls first
+                    limit %s
+                    """,
+                    (_PERGB_BLOCK_RETRY_THROTTLE_MINUTES, _PERGB_BLOCK_RETRY_BATCH_LIMIT),
+                )
+                pending = list(cur.fetchall())
+
+            for row in pending:
+                counters["pergb_unblock_retries_attempted"] += 1
+                ok = self._call_enable(
+                    node_url=str(row["node_url"]),
+                    node_api_key=(str(row["node_api_key"]) if row.get("node_api_key") else None),
+                    port=int(row["port"]),
+                    account_id=int(row["account_id"]),
+                    node_id=str(row["node_id"]),
+                )
+                with conn.cursor() as cur:
+                    if ok:
+                        counters["pergb_unblock_retries_succeeded"] += 1
+                        cur.execute(
+                            """
+                            update traffic_accounts
+                            set node_blocked = false,
+                                last_unblock_attempt_at = now(),
+                                updated_at = now()
+                            where id = %s
+                            """,
+                            (int(row["account_id"]),),
+                        )
+                    else:
+                        cur.execute(
+                            """
+                            update traffic_accounts
+                            set last_unblock_attempt_at = now(),
+                                updated_at = now()
+                            where id = %s
+                            """,
+                            (int(row["account_id"]),),
+                        )
+
+    def _call_disable(
+        self,
+        *,
+        node_url: str,
+        node_api_key: str | None,
+        port: int,
+        account_id: int,
+        node_id: str,
+    ) -> bool:
+        try:
+            node_client.post_disable(node_url, node_api_key, port)
+        except NodeAgentError as exc:
+            logger.warning(
+                "watchdog_pergb_block_retry_failed",
+                account_id=account_id,
+                node_id=node_id,
+                port=port,
+                error=str(exc),
+                status_code=exc.status_code,
+            )
+            return False
+        return True
+
+    def _call_enable(
+        self,
+        *,
+        node_url: str,
+        node_api_key: str | None,
+        port: int,
+        account_id: int,
+        node_id: str,
+    ) -> bool:
+        try:
+            node_client.post_enable(node_url, node_api_key, port)
+        except NodeAgentError as exc:
+            logger.warning(
+                "watchdog_pergb_unblock_retry_failed",
+                account_id=account_id,
+                node_id=node_id,
+                port=port,
+                error=str(exc),
+                status_code=exc.status_code,
+            )
+            return False
+        return True

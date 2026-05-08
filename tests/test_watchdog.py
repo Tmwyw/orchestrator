@@ -72,6 +72,8 @@ def test_watchdog_marks_stuck_running_jobs_failed(_cfg: None) -> None:
         [[]],  # phase 5.1: no pergb expired
         [[]],  # phase 5.2: no pergb archive
         [[]],  # phase 5.3: no samples pruned
+        [[]],  # phase 5.4: no block retries pending
+        [[]],  # phase 5.5: no unblock retries pending
     )
     with patch("orchestrator.watchdog.connect", new=fake_connect):
         counters = WatchdogService().run_once()
@@ -99,6 +101,8 @@ def test_watchdog_releases_expired_reservations(_cfg: None) -> None:
         [[]],  # phase 5.1
         [[]],  # phase 5.2
         [[]],  # phase 5.3
+        [[]],  # phase 5.4
+        [[]],  # phase 5.5
     )
     with patch("orchestrator.watchdog.connect", new=fake_connect):
         counters = WatchdogService().run_once()
@@ -123,6 +127,8 @@ def test_watchdog_invalidates_stale_pending_validation(_cfg: None) -> None:
         [[]],  # phase 5.1
         [[]],  # phase 5.2
         [[]],  # phase 5.3
+        [[]],  # phase 5.4
+        [[]],  # phase 5.5
     )
     with patch("orchestrator.watchdog.connect", new=fake_connect):
         counters = WatchdogService().run_once()
@@ -144,6 +150,8 @@ def test_watchdog_clears_expired_delivery_content(_cfg: None) -> None:
         [[]],  # phase 5.1
         [[]],  # phase 5.2
         [[]],  # phase 5.3
+        [[]],  # phase 5.4
+        [[]],  # phase 5.5
     )
     with patch("orchestrator.watchdog.connect", new=fake_connect):
         counters = WatchdogService().run_once()
@@ -157,7 +165,7 @@ def test_watchdog_clears_expired_delivery_content(_cfg: None) -> None:
 def test_watchdog_run_once_no_op_when_clean(_cfg: None) -> None:
     from orchestrator.watchdog import WatchdogService
 
-    fake_connect, _ = _make_phased_connect([[]], [[]], [[]], [[]], [[]], [[]], [[]])
+    fake_connect, _ = _make_phased_connect([[]], [[]], [[]], [[]], [[]], [[]], [[]], [[]], [[]])
     with patch("orchestrator.watchdog.connect", new=fake_connect):
         counters = WatchdogService().run_once()
 
@@ -169,4 +177,154 @@ def test_watchdog_run_once_no_op_when_clean(_cfg: None) -> None:
         "pergb_accounts_expired": 0,
         "pergb_accounts_archived": 0,
         "pergb_samples_pruned": 0,
+        "pergb_block_retries_attempted": 0,
+        "pergb_block_retries_succeeded": 0,
+        "pergb_unblock_retries_attempted": 0,
+        "pergb_unblock_retries_succeeded": 0,
     }
+
+
+# === Wave D safety-net retries ===
+
+
+def _pending_block_row(*, account_id: int, port: int = 32001) -> dict[str, Any]:
+    return {
+        "account_id": account_id,
+        "port": port,
+        "node_url": "http://node-x:8085",
+        "node_api_key": "k1",
+        "node_id": "node-x",
+    }
+
+
+def test_watchdog_retries_pending_blocks_success(_cfg: None) -> None:
+    """Phase 5.4: depleted+!node_blocked → post_disable retried;
+    on success node_blocked flips TRUE."""
+    from orchestrator.watchdog import WatchdogService
+
+    fake_connect, cursors = _make_phased_connect(
+        [[]],  # 1 jobs
+        [[]],  # 2 orders
+        [[]],  # 3 pending validation
+        [[]],  # 4 delivery
+        [[]],  # 5.1 pergb expired
+        [[]],  # 5.2 pergb archived
+        [[]],  # 5.3 samples pruned
+        [[_pending_block_row(account_id=42)]],  # 5.4 one pending block
+        [[]],  # 5.5 unblocks
+    )
+
+    disable_calls: list[tuple[Any, ...]] = []
+
+    def fake_post_disable(url, api_key, port, timeout_sec=10):
+        disable_calls.append((url, api_key, port))
+        return {"action": "killed"}
+
+    with (
+        patch("orchestrator.watchdog.connect", new=fake_connect),
+        patch("orchestrator.watchdog.node_client.post_disable", side_effect=fake_post_disable),
+    ):
+        counters = WatchdogService().run_once()
+
+    assert counters["pergb_block_retries_attempted"] == 1
+    assert counters["pergb_block_retries_succeeded"] == 1
+    assert disable_calls == [("http://node-x:8085", "k1", 32001)]
+
+    # Phase 5.4 cursor saw: 1 SELECT + 1 UPDATE (success branch with node_blocked=true).
+    sql_calls = [c.args[0] for c in cursors[7].execute.call_args_list]
+    assert any("status = 'depleted'" in s and "node_blocked = false" in s for s in sql_calls)
+    assert any("node_blocked = true" in s and "where id = %s" in s for s in sql_calls)
+
+
+def test_watchdog_retries_pending_blocks_failure_keeps_flag_false(_cfg: None) -> None:
+    """Phase 5.4 with post_disable raising: only last_block_attempt_at stamped,
+    node_blocked stays FALSE so a future cycle retries again."""
+    from orchestrator.node_client import NodeAgentError
+    from orchestrator.watchdog import WatchdogService
+
+    fake_connect, cursors = _make_phased_connect(
+        [[]],
+        [[]],
+        [[]],
+        [[]],
+        [[]],
+        [[]],
+        [[]],
+        [[_pending_block_row(account_id=42)]],  # 5.4
+        [[]],  # 5.5
+    )
+
+    def boom(*a, **kw):
+        raise NodeAgentError("disable_failed", status_code=500)
+
+    with (
+        patch("orchestrator.watchdog.connect", new=fake_connect),
+        patch("orchestrator.watchdog.node_client.post_disable", side_effect=boom),
+    ):
+        counters = WatchdogService().run_once()
+
+    assert counters["pergb_block_retries_attempted"] == 1
+    assert counters["pergb_block_retries_succeeded"] == 0
+
+    sql_calls = [c.args[0] for c in cursors[7].execute.call_args_list]
+    # Failure branch: stamp last_block_attempt_at but do NOT set node_blocked.
+    assert any("last_block_attempt_at = now()" in s and "node_blocked" not in s for s in sql_calls)
+
+
+def test_watchdog_retries_pending_unblocks_success(_cfg: None) -> None:
+    """Phase 5.5: active+node_blocked=TRUE → post_enable retried; node_blocked flips FALSE."""
+    from orchestrator.watchdog import WatchdogService
+
+    fake_connect, cursors = _make_phased_connect(
+        [[]],
+        [[]],
+        [[]],
+        [[]],
+        [[]],
+        [[]],
+        [[]],
+        [[]],  # 5.4 nothing
+        [[_pending_block_row(account_id=99, port=32099)]],  # 5.5 one pending unblock
+    )
+
+    enable_calls: list[tuple[Any, ...]] = []
+
+    def fake_post_enable(url, api_key, port, timeout_sec=10):
+        enable_calls.append((url, api_key, port))
+        return {"action": "started"}
+
+    with (
+        patch("orchestrator.watchdog.connect", new=fake_connect),
+        patch("orchestrator.watchdog.node_client.post_enable", side_effect=fake_post_enable),
+    ):
+        counters = WatchdogService().run_once()
+
+    assert counters["pergb_unblock_retries_attempted"] == 1
+    assert counters["pergb_unblock_retries_succeeded"] == 1
+    assert enable_calls == [("http://node-x:8085", "k1", 32099)]
+
+    sql_calls = [c.args[0] for c in cursors[8].execute.call_args_list]
+    assert any("status = 'active'" in s and "node_blocked = true" in s for s in sql_calls)
+    assert any("node_blocked = false" in s and "where id = %s" in s for s in sql_calls)
+
+
+def test_watchdog_retry_select_uses_throttle_and_limit(_cfg: None) -> None:
+    """The retry SELECTs must apply the 5-min throttle and a row LIMIT."""
+    from orchestrator.watchdog import WatchdogService
+
+    fake_connect, cursors = _make_phased_connect([[]], [[]], [[]], [[]], [[]], [[]], [[]], [[]], [[]])
+
+    with patch("orchestrator.watchdog.connect", new=fake_connect):
+        WatchdogService().run_once()
+
+    block_select_sql = cursors[7].execute.call_args_list[0].args[0]
+    assert "status = 'depleted'" in block_select_sql
+    assert "node_blocked = false" in block_select_sql
+    assert "last_block_attempt_at < now() - (%s || ' minutes')::interval" in block_select_sql
+    assert "limit %s" in block_select_sql
+
+    unblock_select_sql = cursors[8].execute.call_args_list[0].args[0]
+    assert "status = 'active'" in unblock_select_sql
+    assert "node_blocked = true" in unblock_select_sql
+    assert "last_unblock_attempt_at < now() - (%s || ' minutes')::interval" in unblock_select_sql
+    assert "limit %s" in unblock_select_sql
