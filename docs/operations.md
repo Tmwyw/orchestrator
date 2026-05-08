@@ -698,3 +698,192 @@ otherwise inflate). Top-SKU list is capped at 5 rows.
 - Real-money smoke against a live billing flow (B-8.4 once nodes return to service).
 - Hard per-port nftables rate-limit cap (Wave D).
 - Cross-SKU top-up (D4.5 rejection — same `sku_id` required).
+
+---
+
+## 13. Production hardening (Wave D)
+
+Three independent operational layers: TLS termination, nightly DB
+backups, and metrics dashboards. None of them affect the application
+code path — they wrap the existing service.
+
+### 13.1 TLS termination via nginx + Let's Encrypt
+
+The orchestrator now has two nginx integrations. Pick one:
+
+- `scripts/install_nginx.sh` (Wave B-7b.5) — HTTP-only, non-default
+  port, fine for single-host or local development.
+- `deploy/scripts/install_nginx_tls.sh` (Wave D) — public TLS on 443,
+  port 80 redirects, /metrics localhost-only. **Pick this for prod.**
+
+Pre-requisites:
+
+1. A domain you control (example: `orch.netrun.live`).
+2. An A-record for that domain pointing at the orchestrator host
+   (e.g. `95.217.98.125`). Verify with `dig +short orch.netrun.live`
+   from a third machine before running the script — certbot's http-01
+   challenge will fail otherwise.
+3. Ports 80 and 443 open on the host firewall.
+4. Orchestrator bound to `127.0.0.1` only — set
+   `ORCHESTRATOR_HOST=127.0.0.1` in `/opt/netrun-orchestrator/.env`
+   and restart `netrun-orchestrator`. The systemd unit reads this via
+   `python -m orchestrator.server`; no unit edit required.
+
+Install:
+
+```bash
+sudo bash deploy/scripts/install_nginx_tls.sh orch.netrun.live ops@netrun.live
+```
+
+The script:
+
+1. `apt-get install -y nginx certbot python3-certbot-nginx` (idempotent).
+2. Renders `deploy/nginx/orchestrator-tls.conf.template` with the
+   domain + `ORCHESTRATOR_PORT` substituted into
+   `/etc/nginx/sites-available/netrun-orchestrator-tls.conf`.
+3. Symlinks into `sites-enabled/`, runs `nginx -t`.
+4. `certbot --nginx -d <domain> --non-interactive --agree-tos -m <email> --redirect`.
+5. `systemctl reload nginx`.
+
+Smoke after install:
+
+```bash
+curl -sI https://orch.netrun.live/health   # 401 (good — auth wall up)
+curl -sI -H "X-NETRUN-API-KEY: $ORCHESTRATOR_API_KEY" \
+  https://orch.netrun.live/health          # 200
+```
+
+Bot-side: change `ORCHESTRATOR_BASE_URL` in the bot's `.env` to
+`https://orch.netrun.live` and restart the bot units.
+
+Renewal: certbot installs its own `certbot.timer` — no extra cron
+needed. Verify with `systemctl list-timers | grep certbot`.
+
+Coexistence: the TLS template uses an explicit `server_name` and
+does NOT set `default_server`. Other vhosts on the same nginx are
+untouched.
+
+### 13.2 Nightly pg_dump backups
+
+Daily snapshot of `netrun_orchestrator`, gzipped, kept for 30 days.
+
+Install:
+
+```bash
+sudo bash deploy/scripts/install_auto_backup.sh
+```
+
+Layout:
+
+| Path | Purpose |
+|------|---------|
+| `/usr/local/bin/netrun-auto-backup.sh` | Executable copy of `auto_backup.sh`. |
+| `/etc/cron.d/netrun-backup` | `0 3 * * * root …` daily run. |
+| `/var/backups/netrun/orchestrator_<DATE>.sql.gz` | Dumps. |
+| `/var/log/netrun-backup.log` | stdout+stderr from cron runs. |
+
+Verify a manual run before walking away:
+
+```bash
+sudo /usr/local/bin/netrun-auto-backup.sh
+ls -lh /var/backups/netrun/
+```
+
+#### Restore from a dump
+
+```bash
+# Pick a backup file:
+ls -lh /var/backups/netrun/
+
+# Stop the orchestrator + workers so no writes race the restore.
+sudo systemctl stop netrun-orchestrator netrun-orchestrator-worker \
+  netrun-orchestrator-refill netrun-orchestrator-traffic-poll \
+  netrun-orchestrator-validation netrun-orchestrator-watchdog
+
+# Drop + recreate (DESTROYS current data — only do this on the
+# machine you intend to restore on, never on a healthy primary).
+sudo -u postgres psql -c "DROP DATABASE netrun_orchestrator;"
+sudo -u postgres psql -c "CREATE DATABASE netrun_orchestrator OWNER netrun_orchestrator;"
+
+# Stream the dump back in.
+gunzip -c /var/backups/netrun/orchestrator_20260508_030000.sql.gz \
+  | sudo -u postgres psql -d netrun_orchestrator
+
+# Start services back up.
+sudo systemctl start netrun-orchestrator netrun-orchestrator-worker \
+  netrun-orchestrator-refill netrun-orchestrator-traffic-poll \
+  netrun-orchestrator-validation netrun-orchestrator-watchdog
+```
+
+Off-site copy (S3 / B2 / rsync) is deferred — for now the dump lives
+only on the orchestrator host. Add an off-site sync step before
+treating this as full DR.
+
+Tunables (override in environment when running the script):
+
+| Variable | Default | Effect |
+|----------|---------|--------|
+| `BACKUP_DIR` | `/var/backups/netrun` | Where dumps land. |
+| `DB_NAME` | `netrun_orchestrator` | Database name passed to `pg_dump`. |
+| `RETENTION_DAYS` | `30` | Dumps older than this are deleted. |
+
+### 13.3 Grafana dashboard
+
+Importable JSON: `deploy/grafana/orchestrator.json`.
+
+Pre-requisite: a Prometheus instance scraping the orchestrator's
+`/metrics` endpoint (the TLS template restricts it to localhost, so
+Prometheus must run on the same host or be allow-listed). Wiring
+Prometheus is outside this repo — a minimal scrape job:
+
+```yaml
+scrape_configs:
+  - job_name: netrun-orchestrator
+    static_configs:
+      - targets: ['127.0.0.1:8090']
+```
+
+Import the dashboard:
+
+1. Grafana → Dashboards → New → Import.
+2. Upload `deploy/grafana/orchestrator.json` (or paste its contents).
+3. Pick the Prometheus datasource when prompted.
+
+Panels (Wave D):
+
+- HTTP rate / 5xx rate / p95 latency, broken down by route template.
+- Reserve / commit / release rate by status.
+- Scheduler runs by (scheduler, status).
+- Watchdog actions per action.
+- Inventory available per SKU.
+- Pergb accounts active vs depleted (stat panel).
+- Traffic poll lag (60s yellow / 180s red).
+- Billed bytes/s by (sku_code, direction).
+
+If you don't have Grafana yet, the simplest path is the official
+package:
+
+```bash
+sudo apt-get install -y apt-transport-https software-properties-common
+sudo wget -qO /etc/apt/keyrings/grafana.gpg https://apt.grafana.com/gpg.key
+echo "deb [signed-by=/etc/apt/keyrings/grafana.gpg] https://apt.grafana.com stable main" \
+  | sudo tee /etc/apt/sources.list.d/grafana.list
+sudo apt-get update && sudo apt-get install -y grafana
+sudo systemctl enable --now grafana-server
+# Then visit http://<host>:3000 — admin/admin, change on first login.
+```
+
+Do not expose `:3000` to the public internet. Tunnel via SSH or put
+it behind nginx auth.
+
+### 13.4 Log paths cheat-sheet (Wave D additions)
+
+| Service | Log |
+|---------|-----|
+| Cron backup | `/var/log/netrun-backup.log` |
+| nginx access | `/var/log/nginx/access.log` |
+| nginx error | `/var/log/nginx/error.log` |
+| certbot | `/var/log/letsencrypt/letsencrypt.log` |
+
+The orchestrator's own units already go to journald — query with
+`journalctl -u netrun-orchestrator -f`.
