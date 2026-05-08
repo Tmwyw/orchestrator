@@ -320,9 +320,13 @@ def test_run_once_depletion_trigger_calls_post_disable(monkeypatch: pytest.Monke
     )
     # Persist cursor must return a row from the depletion UPDATE...RETURNING.
     persist = _make_cursor(fetchone_queue=[{"id": 42}])
+    # Third phase: _record_block_attempt updates node_blocked=TRUE after the
+    # successful post_disable.
+    block_record = _make_cursor()
     fake_connect = _make_phased_connect(
         _make_conn(fetch_cursor),
         _make_conn(persist),
+        _make_conn(block_record),
     )
 
     def fake_get_accounting(url, api_key, ports, timeout_sec=10):
@@ -349,6 +353,10 @@ def test_run_once_depletion_trigger_calls_post_disable(monkeypatch: pytest.Monke
     update_calls = [c.args[0] for c in persist.execute.call_args_list]
     assert any("status = 'depleted'" in s and "depleted_at" in s for s in update_calls)
 
+    # Verify the success path stamps node_blocked=TRUE.
+    record_calls = [c.args[0] for c in block_record.execute.call_args_list]
+    assert any("node_blocked = TRUE" in s and "last_block_attempt_at = now()" in s for s in record_calls)
+
 
 def test_run_once_depletion_disable_failure_is_logged_not_fatal(
     monkeypatch: pytest.MonkeyPatch,
@@ -373,9 +381,13 @@ def test_run_once_depletion_disable_failure_is_logged_not_fatal(
         ],
     )
     persist = _make_cursor(fetchone_queue=[{"id": 42}])
+    # Third phase still runs even on failure — _record_block_attempt stamps
+    # last_block_attempt_at so the watchdog can throttle retries.
+    block_record = _make_cursor()
     fake_connect = _make_phased_connect(
         _make_conn(fetch_cursor),
         _make_conn(persist),
+        _make_conn(block_record),
     )
 
     monkeypatch.setattr(
@@ -395,6 +407,12 @@ def test_run_once_depletion_disable_failure_is_logged_not_fatal(
     # Still flipped to depleted; just not reported as disabled.
     assert counters.accounts_depleted == 1
     assert counters.accounts_disabled == 0
+
+    # Failure path: last_block_attempt_at stamped, but node_blocked NOT touched
+    # (default FALSE — the watchdog will retry).
+    record_calls = [c.args[0] for c in block_record.execute.call_args_list]
+    assert any("last_block_attempt_at = now()" in s for s in record_calls)
+    assert not any("node_blocked = TRUE" in s for s in record_calls)
 
 
 # === top-up reactivation: anchor preserved ===

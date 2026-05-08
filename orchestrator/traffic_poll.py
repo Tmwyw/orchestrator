@@ -324,13 +324,17 @@ class TrafficPollService:
 
     def _fire_disable(self, account: _AccountRow, counters: PollCounters) -> None:
         """Best-effort post_disable on the node-agent. Failure is logged but
-        does not back-out the depletion DB write — next cycle will retry."""
+        does not back-out the depletion DB write — the watchdog retries
+        every 60s using the (last_block_attempt_at, node_blocked) markers
+        we set here regardless of outcome."""
+        succeeded = False
         try:
             node_client.post_disable(
                 account.node_url,
                 account.node_api_key,
                 account.port,
             )
+            succeeded = True
             counters.accounts_disabled += 1
             logger.info(
                 "traffic_account_depleted",
@@ -347,6 +351,32 @@ class TrafficPollService:
                 error=str(exc),
                 status_code=exc.status_code,
             )
+        self._record_block_attempt(account.account_id, succeeded=succeeded)
+
+    def _record_block_attempt(self, account_id: int, *, succeeded: bool) -> None:
+        """Stamp last_block_attempt_at, and on success flip node_blocked=TRUE.
+
+        Failures leave node_blocked alone (default FALSE for new rows; if a
+        prior cycle had already succeeded, post_disable is idempotent so the
+        node stays blocked even if we don't see an ack this cycle)."""
+        with connect() as conn, conn.cursor() as cur:
+            if succeeded:
+                cur.execute(
+                    "update traffic_accounts "
+                    "set node_blocked = TRUE, "
+                    "    last_block_attempt_at = now(), "
+                    "    updated_at = now() "
+                    "where id = %s",
+                    (account_id,),
+                )
+            else:
+                cur.execute(
+                    "update traffic_accounts "
+                    "set last_block_attempt_at = now(), "
+                    "    updated_at = now() "
+                    "where id = %s",
+                    (account_id,),
+                )
 
     # === DB helpers ===
 
