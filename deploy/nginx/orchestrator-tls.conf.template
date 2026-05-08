@@ -1,0 +1,66 @@
+# NETRUN orchestrator nginx reverse proxy — TLS variant (Wave D).
+# Installed via deploy/scripts/install_nginx_tls.sh.
+#
+# Pairs with the orchestrator bound to 127.0.0.1 (set ORCHESTRATOR_HOST=127.0.0.1
+# in /opt/netrun-orchestrator/.env). Use this template only when you control DNS
+# and an A-record for __NGINX_SERVER_NAME__ already points at this host —
+# certbot needs the http-01 challenge to succeed.
+#
+# Coexistence: explicit server_name, no default_server. Touches only the
+# netrun-orchestrator-tls vhost.
+
+upstream orchestrator_backend {
+    server 127.0.0.1:__ORCHESTRATOR_PORT__;
+    keepalive 16;
+}
+
+server {
+    listen 80;
+    listen [::]:80;
+    server_name __NGINX_SERVER_NAME__;
+
+    # certbot --nginx will inject its own http-01 location and a 301 to https.
+    # The empty default below keeps `nginx -t` happy before the first cert.
+    location / {
+        return 301 https://$host$request_uri;
+    }
+}
+
+server {
+    listen 443 ssl http2;
+    listen [::]:443 ssl http2;
+    server_name __NGINX_SERVER_NAME__;
+
+    # Cert paths populated by certbot --nginx (managed by Certbot — DO NOT
+    # hand-edit; re-run certbot if you need to renew or swap domains).
+    ssl_certificate     /etc/letsencrypt/live/__NGINX_SERVER_NAME__/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/__NGINX_SERVER_NAME__/privkey.pem;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_ciphers HIGH:!aNULL:!MD5;
+    ssl_session_cache shared:SSL:10m;
+    ssl_session_timeout 1d;
+
+    client_max_body_size 10M;
+    proxy_read_timeout 1300s;
+    proxy_send_timeout 1300s;
+
+    # /metrics: localhost-only. Prometheus must run on the same host (or
+    # extend allow lines via ACL block) — the FastAPI app intentionally has
+    # no auth on this endpoint.
+    location /metrics {
+        allow 127.0.0.1;
+        allow ::1;
+        deny all;
+        proxy_pass http://orchestrator_backend;
+    }
+
+    location / {
+        proxy_pass http://orchestrator_backend;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header Connection "";
+    }
+}
