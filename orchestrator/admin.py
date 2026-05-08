@@ -22,6 +22,7 @@ from orchestrator.api_schemas import (
     StatsSales,
 )
 from orchestrator.db import fetch_all, fetch_one
+from orchestrator.dns_pool import run_dns_pool_refresh
 from orchestrator.traffic_poll import TrafficPollService
 
 admin_router = APIRouter(prefix="/v1/admin")
@@ -226,3 +227,36 @@ async def force_poll(
         accounts_marked_depleted=counters.accounts_depleted,
     )
     return JSONResponse(content=response.model_dump(mode="json"))
+
+
+# === DNS pool admin (Wave C-DNS) ===
+
+
+@admin_router.post("/dns_pool/refresh")
+async def admin_dns_pool_refresh() -> JSONResponse:
+    """Synchronous trigger for ``run_dns_pool_refresh()``.
+
+    Used during rollout / debugging; under steady state the dns-pool scheduler
+    invokes this every 24h. Long-running (healthchecks N resolvers in
+    parallel) — caller should use an HTTP timeout >= 60s.
+    """
+    counters = await asyncio.to_thread(run_dns_pool_refresh)
+    return JSONResponse(content=counters)
+
+
+@admin_router.get("/dns_pool")
+async def admin_dns_pool_list() -> JSONResponse:
+    """Inspect curated pool — count + healthy count per geo + a sample of IPs."""
+    rows = await asyncio.to_thread(
+        fetch_all,
+        """
+        select geo_code,
+               count(*)::int as total,
+               count(*) filter (where enabled and last_check_ok)::int as healthy,
+               (array_agg(ip order by latency_ms nulls last))[:5] as sample_ips
+        from dns_pool
+        group by geo_code
+        order by geo_code
+        """,
+    )
+    return JSONResponse(content={"items": rows, "count": len(rows)})

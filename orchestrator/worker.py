@@ -126,6 +126,7 @@ def process_simple_job(job: dict[str, Any]) -> None:
             count=int(job["count"]),
             start_port=start_port,
             timeout_sec=get_config().node_request_timeout_sec,
+            geo_code=(node.get("geo") or "").strip() or None,
         )
 
         event_base = {
@@ -240,6 +241,7 @@ def process_refill_job(job: dict[str, Any]) -> None:
             count=count,
             start_port=int(start_port),
             timeout_sec=get_config().node_request_timeout_sec,
+            geo_code=(node.get("geo") or "").strip() or None,
         )
 
         event_base = {

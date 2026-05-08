@@ -2,7 +2,16 @@ from typing import Any, cast
 
 import httpx
 
+from orchestrator.logging_setup import get_logger
 from shared.contracts import PRODUCTION_PROFILE
+
+logger = get_logger("netrun-orchestrator-node-client")
+
+# Below this many healthy resolvers, we skip the --dns-pool flag and let
+# the script's legacy DNS auto-selection run. Two-of-pool plus a couple of
+# tail candidates is the realistic floor for randomization to be meaningful.
+DNS_POOL_MIN_SIZE = 4
+DNS_POOL_LIMIT = 10
 
 
 class NodeAgentError(Exception):
@@ -48,9 +57,42 @@ def generate(
     count: int,
     start_port: int,
     timeout_sec: int,
+    geo_code: str | None = None,
 ) -> dict[str, Any]:
     endpoint = f"{url.rstrip('/')}/generate"
-    payload = {
+    generator_args: list[str] = []
+
+    # ISP-DNS randomization (Wave C-DNS): hand the node script a CSV of
+    # vetted ISP resolvers for its geo. Below the floor we omit the flag so
+    # the script falls back to its existing country/system/global picker.
+    if geo_code:
+        # Local import — orchestrator.dns_pool depends on db; importing it at
+        # module load would couple every node_client consumer to Postgres.
+        from orchestrator.dns_pool import select_pool_for_geo
+
+        try:
+            pool = select_pool_for_geo(geo_code, limit=DNS_POOL_LIMIT)
+        except Exception as exc:
+            logger.warning("dns_pool_lookup_failed", geo_code=geo_code, error=str(exc))
+            pool = []
+        if len(pool) >= DNS_POOL_MIN_SIZE:
+            generator_args.extend(["--dns-pool", ",".join(pool)])
+            logger.info(
+                "dns_pool_attached",
+                job_id=job_id,
+                geo_code=geo_code,
+                pool_size=len(pool),
+            )
+        else:
+            logger.warning(
+                "dns_pool_too_small_falling_back",
+                job_id=job_id,
+                geo_code=geo_code,
+                pool_size=len(pool),
+                min_required=DNS_POOL_MIN_SIZE,
+            )
+
+    payload: dict[str, Any] = {
         "jobId": job_id,
         "proxyCount": count,
         "startPort": start_port,
@@ -66,6 +108,9 @@ def generate(
         "generatorScript": "/opt/netrun/node_runtime/soft/generator/proxyyy_automated.sh",
         "timeoutSec": timeout_sec,
     }
+    if generator_args:
+        payload["generatorArgs"] = generator_args
+
     with httpx.Client(timeout=timeout_sec + 30) as client:
         response = client.post(endpoint, json=payload, headers=_node_headers(api_key))
         response.raise_for_status()
