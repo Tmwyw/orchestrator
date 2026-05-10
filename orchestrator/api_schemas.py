@@ -337,22 +337,55 @@ class ReservePergbRequest(BaseModel):
 
 
 class ReservePergbResponse(BaseModel):
+    """Reserve_pergb response — Wave PERGB-RFCT-A.
+
+    No port credentials any more: reserve_pergb only creates the
+    traffic_account (the GB budget). The bot then calls
+    POST /v1/pergb/{order_ref}/generate_ports to claim N pool ports
+    lazily.
+    """
+
     model_config = _API_MODEL_CONFIG
 
     success: bool = True
     order_ref: str
     expires_at: datetime
-    port: int
-    host: str
-    login: str
-    password: str
     bytes_quota: int
     price_amount: Decimal
+    traffic_account_id: int
 
     @field_validator("price_amount", mode="before")
     @classmethod
     def _parse_decimal(cls, v: Any) -> Any:
         return _coerce_decimal(v)
+
+
+class GeneratePortsRequest(BaseModel):
+    model_config = _API_MODEL_CONFIG
+
+    count: int = Field(ge=1, le=100, description="Ports to allocate from pool")
+    geo_code: str = Field(min_length=2, max_length=10)
+    idempotency_key: str = Field(min_length=8, max_length=128)
+
+
+class GeneratedPort(BaseModel):
+    model_config = _API_MODEL_CONFIG
+
+    port: int
+    host: str
+    login: str
+    password: str
+    geo_code: str
+
+
+class GeneratePortsResponse(BaseModel):
+    model_config = _API_MODEL_CONFIG
+
+    success: bool = True
+    order_ref: str
+    traffic_account_id: int
+    ports: list[GeneratedPort]
+    total_ports_for_client: int
 
 
 class TopupPergbRequest(BaseModel):
@@ -383,6 +416,10 @@ class TopupPergbResponse(BaseModel):
 
 
 class TrafficResponse(BaseModel):
+    """Traffic snapshot. node_id/port are optional after Wave PERGB-RFCT-A
+    — a fresh pergb account has no ports until generate_ports is called.
+    """
+
     model_config = _API_MODEL_CONFIG
 
     order_ref: str
@@ -394,9 +431,10 @@ class TrafficResponse(BaseModel):
     last_polled_at: datetime | None = None
     expires_at: datetime
     depleted_at: datetime | None = None
-    node_id: str
-    port: int
+    node_id: str | None = None
+    port: int | None = None
     over_usage_bytes: int = 0
+    port_count: int = 0
 
 
 class AdminTrafficPollResponse(BaseModel):

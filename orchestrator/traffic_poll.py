@@ -56,11 +56,19 @@ class PollCounters:
 
 
 @dataclass(slots=True)
-class _AccountRow:
+class _PortRow:
+    """One row per linked port (Wave PERGB-RFCT-A: 1 traffic_account → N ports).
+
+    Anchors and the snapshot live on proxy_inventory now so each port has
+    its own counter trajectory (detect resets independently). The
+    account-level bytes_used is recomputed via SUM at the end of each
+    cycle.
+    """
+
     account_id: int
     inventory_id: int
     bytes_quota: int
-    bytes_used: int
+    port_bytes_used_snapshot: int
     last_polled_bytes_in: int | None
     last_polled_bytes_out: int | None
     node_id: str
@@ -118,16 +126,18 @@ class TrafficPollService:
     ) -> PollCounters:
         counters = PollCounters()
         cfg = get_config()
-        rows = self._fetch_active_accounts(
+        rows = self._fetch_active_ports(
             node_id_filter=node_id_filter,
             account_id_filter=account_id_filter,
         )
         if not rows:
             return counters
 
-        by_node: dict[str, list[_AccountRow]] = {}
+        by_node: dict[str, list[_PortRow]] = {}
+        touched_accounts: set[int] = set()
         for row in rows:
             by_node.setdefault(row.node_id, []).append(row)
+            touched_accounts.add(row.account_id)
 
         counters.nodes_polled = len(by_node)
         for node_id, accounts in by_node.items():
@@ -138,13 +148,17 @@ class TrafficPollService:
                 degrade_after=cfg.traffic_poll_degrade_after,
                 request_timeout_sec=cfg.traffic_poll_request_timeout_sec,
             )
+
+        # After per-port snapshots are written, aggregate to traffic_accounts
+        # in one pass per touched account + flip newly-depleted accounts.
+        self._aggregate_and_flip_depleted(touched_accounts, counters)
         return counters
 
     def _poll_one_node(
         self,
         *,
         node_id: str,
-        accounts: list[_AccountRow],
+        accounts: list[_PortRow],
         counters: PollCounters,
         degrade_after: int,
         request_timeout_sec: int,
@@ -201,16 +215,19 @@ class TrafficPollService:
 
     def _process_sample(
         self,
-        account: _AccountRow,
+        account: _PortRow,
         sample: dict[str, int],
         counters: PollCounters,
     ) -> None:
+        """Update one port's snapshot. Account-level depletion + node disable
+        happen in _aggregate_and_flip_depleted after every port for the cycle
+        is processed (so SUM is correct).
+        """
         bytes_in_total = int(sample.get("bytes_in", 0)) + int(sample.get("bytes_in6", 0))
         bytes_out_total = int(sample.get("bytes_out", 0)) + int(sample.get("bytes_out6", 0))
 
         last_in = account.last_polled_bytes_in
         last_out = account.last_polled_bytes_out
-        reset_detected = False
         if last_in is None or last_out is None:
             delta_in = 0
             delta_out = 0
@@ -232,17 +249,13 @@ class TrafficPollService:
                 )
                 delta_in = 0
                 delta_out = 0
-                reset_detected = True
 
-        new_bytes_used = account.bytes_used + delta_in + delta_out
-        flipped_to_depleted = self._persist_sample(
+        new_port_snapshot = account.port_bytes_used_snapshot + delta_in + delta_out
+        self._persist_port_snapshot(
             account=account,
             bytes_in_total=bytes_in_total,
             bytes_out_total=bytes_out_total,
-            delta_in=delta_in,
-            delta_out=delta_out,
-            reset_detected=reset_detected,
-            new_bytes_used=new_bytes_used,
+            new_port_snapshot=new_port_snapshot,
         )
         counters.accounts_polled += 1
         counters.bytes_observed_total += delta_in + delta_out
@@ -253,105 +266,142 @@ class TrafficPollService:
             if delta_out:
                 TRAFFIC_BYTES_TOTAL.labels(sku_code=account.sku_code, direction="out").inc(delta_out)
 
-        if flipped_to_depleted:
-            counters.accounts_depleted += 1
-            if new_bytes_used > account.bytes_quota:
-                TRAFFIC_OVER_USAGE_TOTAL.inc()
-            self._fire_disable(account, counters)
-
-    def _persist_sample(
+    def _persist_port_snapshot(
         self,
         *,
-        account: _AccountRow,
+        account: _PortRow,
         bytes_in_total: int,
         bytes_out_total: int,
-        delta_in: int,
-        delta_out: int,
-        reset_detected: bool,
-        new_bytes_used: int,
-    ) -> bool:
-        """Returns True iff this sample flipped status active → depleted."""
-        flipped = False
+        new_port_snapshot: int,
+    ) -> None:
+        """Write per-port bytes_used_snapshot + anchors. The traffic_samples
+        row remains keyed on account_id (legacy schema); we still emit one
+        per port for full-cycle accounting visibility.
+        """
         with connect() as conn, conn.cursor() as cur:
             cur.execute(
                 """
-                insert into traffic_samples (
-                  account_id, bytes_in, bytes_out,
-                  bytes_in_delta, bytes_out_delta, counter_reset_detected
-                )
-                values (%s, %s, %s, %s, %s, %s)
-                """,
-                (
-                    account.account_id,
-                    bytes_in_total,
-                    bytes_out_total,
-                    delta_in,
-                    delta_out,
-                    reset_detected,
-                ),
-            )
-            cur.execute(
-                """
-                update traffic_accounts
-                set bytes_used = %s,
+                update proxy_inventory
+                set bytes_used_snapshot = %s,
                     last_polled_bytes_in = %s,
                     last_polled_bytes_out = %s,
-                    last_polled_at = now(),
                     updated_at = now()
                 where id = %s
                 """,
                 (
-                    new_bytes_used,
+                    new_port_snapshot,
                     bytes_in_total,
                     bytes_out_total,
-                    account.account_id,
+                    account.inventory_id,
                 ),
             )
-            if new_bytes_used >= account.bytes_quota:
+
+    def _aggregate_and_flip_depleted(
+        self,
+        account_ids: set[int],
+        counters: PollCounters,
+    ) -> None:
+        """For each touched account: recompute bytes_used = SUM(per-port
+        snapshots), flip to depleted if quota crossed, fan out post_disable
+        on all linked ports for newly-depleted accounts.
+        """
+        if not account_ids:
+            return
+        ids_list = list(account_ids)
+        # Single-statement aggregate + flip; capture newly-depleted ids.
+        with connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                update traffic_accounts ta set
+                  bytes_used = coalesce(
+                    (select sum(pi.bytes_used_snapshot) from proxy_inventory pi
+                      where pi.traffic_account_id = ta.id),
+                    0
+                  ),
+                  last_polled_at = now(),
+                  updated_at = now()
+                where ta.id = any(%s)
+                returning ta.id, ta.bytes_used, ta.bytes_quota, ta.status
+                """,
+                (ids_list,),
+            )
+            updated = list(cur.fetchall())
+
+            newly_depleted: list[int] = []
+            for r in updated:
+                if int(r["bytes_used"]) >= int(r["bytes_quota"]) and str(r["status"]) == "active":
+                    newly_depleted.append(int(r["id"]))
+                    if int(r["bytes_used"]) > int(r["bytes_quota"]):
+                        TRAFFIC_OVER_USAGE_TOTAL.inc()
+
+            if newly_depleted:
                 cur.execute(
                     """
                     update traffic_accounts
                     set status = 'depleted',
                         depleted_at = now(),
                         updated_at = now()
-                    where id = %s and status = 'active'
-                    returning id
+                    where id = any(%s) and status = 'active'
                     """,
-                    (account.account_id,),
+                    (newly_depleted,),
                 )
-                flipped = bool(cur.fetchone())
-        return flipped
 
-    def _fire_disable(self, account: _AccountRow, counters: PollCounters) -> None:
-        """Best-effort post_disable on the node-agent. Failure is logged but
-        does not back-out the depletion DB write — the watchdog retries
-        every 60s using the (last_block_attempt_at, node_blocked) markers
-        we set here regardless of outcome."""
-        succeeded = False
-        try:
-            node_client.post_disable(
-                account.node_url,
-                account.node_api_key,
-                account.port,
+        for ta_id in newly_depleted:
+            counters.accounts_depleted += 1
+            self._fire_disable_account(ta_id, counters)
+
+    def _fire_disable_account(self, account_id: int, counters: PollCounters) -> None:
+        """Best-effort post_disable on every port linked to a newly-depleted
+        traffic_account. Mirrors the old _fire_disable but fans out across
+        N ports.
+        """
+        ports = self._fetch_linked_ports(account_id)
+        all_ok = bool(ports)
+        for p in ports:
+            try:
+                node_client.post_disable(p["node_url"], p["node_api_key"], p["port"])
+                counters.accounts_disabled += 1
+                logger.info(
+                    "traffic_account_depleted_port",
+                    account_id=account_id,
+                    node_id=p["node_id"],
+                    port=p["port"],
+                )
+            except NodeAgentError as exc:
+                all_ok = False
+                logger.warning(
+                    "traffic_account_disable_failed",
+                    account_id=account_id,
+                    node_id=p["node_id"],
+                    port=p["port"],
+                    error=str(exc),
+                    status_code=exc.status_code,
+                )
+        self._record_block_attempt(account_id, succeeded=all_ok)
+
+    def _fetch_linked_ports(self, account_id: int) -> list[dict[str, Any]]:
+        rows: list[dict[str, Any]] = []
+        with connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                select i.port, i.node_id,
+                       n.url as node_url, n.api_key as node_api_key
+                  from proxy_inventory i
+                  join nodes n on n.id = i.node_id
+                 where i.traffic_account_id = %s
+                """,
+                (account_id,),
             )
-            succeeded = True
-            counters.accounts_disabled += 1
-            logger.info(
-                "traffic_account_depleted",
-                account_id=account.account_id,
-                node_id=account.node_id,
-                port=account.port,
-            )
-        except NodeAgentError as exc:
-            logger.warning(
-                "traffic_account_disable_failed",
-                account_id=account.account_id,
-                node_id=account.node_id,
-                port=account.port,
-                error=str(exc),
-                status_code=exc.status_code,
-            )
-        self._record_block_attempt(account.account_id, succeeded=succeeded)
+            for r in cur.fetchall():
+                rows.append(
+                    {
+                        "port": int(r["port"]),
+                        "node_id": str(r["node_id"]),
+                        "node_url": str(r["node_url"]),
+                        "node_api_key": (str(r["node_api_key"]) if r.get("node_api_key") else None),
+                    }
+                )
+        return rows
 
     def _record_block_attempt(self, account_id: int, *, succeeded: bool) -> None:
         """Stamp last_block_attempt_at, and on success flip node_blocked=TRUE.
@@ -380,27 +430,33 @@ class TrafficPollService:
 
     # === DB helpers ===
 
-    def _fetch_active_accounts(
+    def _fetch_active_ports(
         self,
         *,
         node_id_filter: str | None = None,
         account_id_filter: int | None = None,
-    ) -> list[_AccountRow]:
-        rows: list[_AccountRow] = []
+    ) -> list[_PortRow]:
+        """One row per linked port (Wave PERGB-RFCT-A).
+
+        We join through the reverse FK proxy_inventory.traffic_account_id
+        so legacy 1:1 clients (backfilled by migration 028) and new N-port
+        clients are picked up uniformly.
+        """
+        rows: list[_PortRow] = []
         sql = """
             select t.id            as account_id,
-                   t.inventory_id  as inventory_id,
+                   i.id            as inventory_id,
                    t.bytes_quota   as bytes_quota,
-                   t.bytes_used    as bytes_used,
-                   t.last_polled_bytes_in,
-                   t.last_polled_bytes_out,
+                   i.bytes_used_snapshot as port_bytes_used_snapshot,
+                   i.last_polled_bytes_in,
+                   i.last_polled_bytes_out,
                    i.node_id       as node_id,
                    i.port          as port,
                    n.url           as node_url,
                    n.api_key       as node_api_key,
                    s.code          as sku_code
             from traffic_accounts t
-            join proxy_inventory i on i.id = t.inventory_id
+            join proxy_inventory i on i.traffic_account_id = t.id
             join nodes n on n.id = i.node_id
             join skus s on s.id = i.sku_id
             where t.status = 'active'
@@ -416,11 +472,11 @@ class TrafficPollService:
             cur.execute(sql, tuple(params))
             for r in cur.fetchall():
                 rows.append(
-                    _AccountRow(
+                    _PortRow(
                         account_id=int(r["account_id"]),
                         inventory_id=int(r["inventory_id"]),
                         bytes_quota=int(r["bytes_quota"]),
-                        bytes_used=int(r["bytes_used"]),
+                        port_bytes_used_snapshot=int(r["port_bytes_used_snapshot"] or 0),
                         last_polled_bytes_in=(
                             int(r["last_polled_bytes_in"]) if r["last_polled_bytes_in"] is not None else None
                         ),

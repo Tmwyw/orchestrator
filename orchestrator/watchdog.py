@@ -13,6 +13,8 @@ last_(un)block_attempt_at >= 5 minutes ago.
 
 from __future__ import annotations
 
+from typing import Any
+
 from orchestrator import node_client
 from orchestrator.config import get_config
 from orchestrator.db import connect
@@ -133,6 +135,8 @@ class WatchdogService:
         # 5.1 Mark active/depleted accounts whose lease has elapsed → 'expired',
         # and cascade proxy_inventory.allocated_pergb → 'expired_grace' so the
         # inventory becomes visible to the existing per-piece grace window.
+        # Wave PERGB-RFCT-A: cascade via the reverse FK
+        # proxy_inventory.traffic_account_id (1 account → N ports).
         with connect() as conn, conn.cursor() as cur:
             cur.execute(
                 """
@@ -140,20 +144,20 @@ class WatchdogService:
                 set status = 'expired', updated_at = now()
                 where status in ('active', 'depleted')
                   and now() >= expires_at
-                returning id, inventory_id
+                returning id
                 """
             )
             expired_rows = list(cur.fetchall())
             counters["pergb_accounts_expired"] = len(expired_rows)
             if expired_rows:
-                inventory_ids = [int(r["inventory_id"]) for r in expired_rows]
+                account_ids = [int(r["id"]) for r in expired_rows]
                 cur.execute(
                     """
                     update proxy_inventory
                     set status = 'expired_grace', updated_at = now()
-                    where id = any(%s) and status = 'allocated_pergb'
+                    where traffic_account_id = any(%s) and status = 'allocated_pergb'
                     """,
-                    (inventory_ids,),
+                    (account_ids,),
                 )
 
         # 5.2 Archive accounts past the 3-day grace; cascade inventory to archived.
@@ -164,21 +168,21 @@ class WatchdogService:
                 set status = 'archived', updated_at = now()
                 where status = 'expired'
                   and expires_at < now() - (%s || ' days')::interval
-                returning id, inventory_id
+                returning id
                 """,
                 (_PERGB_GRACE_DAYS,),
             )
             archived_rows = list(cur.fetchall())
             counters["pergb_accounts_archived"] = len(archived_rows)
             if archived_rows:
-                inventory_ids = [int(r["inventory_id"]) for r in archived_rows]
+                account_ids = [int(r["id"]) for r in archived_rows]
                 cur.execute(
                     """
                     update proxy_inventory
                     set status = 'archived', archived_at = now(), updated_at = now()
-                    where id = any(%s) and status = 'expired_grace'
+                    where traffic_account_id = any(%s) and status = 'expired_grace'
                     """,
-                    (inventory_ids,),
+                    (account_ids,),
                 )
 
         # 5.3 Prune old traffic_samples (retention).
@@ -227,19 +231,18 @@ class WatchdogService:
     # === safety-net retries (Wave D) ===
 
     def _retry_pending_blocks(self, counters: dict[str, int]) -> None:
-        """Find depleted accounts whose post_disable hasn't been acked and retry."""
+        """Find depleted accounts whose post_disable hasn't been acked and retry.
+
+        Wave PERGB-RFCT-A: one account → N ports. We fetch the account list
+        first, then per account fan out post_disable across every linked port.
+        Account is considered "blocked" only when *every* linked port acks.
+        """
         with connect() as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     """
-                    select t.id           as account_id,
-                           i.port         as port,
-                           n.url          as node_url,
-                           n.api_key      as node_api_key,
-                           i.node_id      as node_id
+                    select t.id as account_id
                     from traffic_accounts t
-                    join proxy_inventory i on i.id = t.inventory_id
-                    join nodes n on n.id = i.node_id
                     where t.status = 'depleted'
                       and t.node_blocked = false
                       and (t.last_block_attempt_at is null
@@ -249,19 +252,39 @@ class WatchdogService:
                     """,
                     (_PERGB_BLOCK_RETRY_THROTTLE_MINUTES, _PERGB_BLOCK_RETRY_BATCH_LIMIT),
                 )
-                pending = list(cur.fetchall())
+                pending = [int(r["account_id"]) for r in cur.fetchall()]
 
-            for row in pending:
+            for account_id in pending:
                 counters["pergb_block_retries_attempted"] += 1
-                ok = self._call_disable(
-                    node_url=str(row["node_url"]),
-                    node_api_key=(str(row["node_api_key"]) if row.get("node_api_key") else None),
-                    port=int(row["port"]),
-                    account_id=int(row["account_id"]),
-                    node_id=str(row["node_id"]),
-                )
+                ports = self._fetch_account_ports(conn, account_id)
+                if not ports:
+                    # Account has no linked ports — nothing to disable; mark
+                    # blocked so we stop retrying.
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            """
+                            update traffic_accounts
+                            set node_blocked = true,
+                                last_block_attempt_at = now(),
+                                updated_at = now()
+                            where id = %s
+                            """,
+                            (account_id,),
+                        )
+                    continue
+                all_ok = True
+                for p in ports:
+                    ok = self._call_disable(
+                        node_url=str(p["node_url"]),
+                        node_api_key=(str(p["node_api_key"]) if p.get("node_api_key") else None),
+                        port=int(p["port"]),
+                        account_id=account_id,
+                        node_id=str(p["node_id"]),
+                    )
+                    if not ok:
+                        all_ok = False
                 with conn.cursor() as cur:
-                    if ok:
+                    if all_ok:
                         counters["pergb_block_retries_succeeded"] += 1
                         cur.execute(
                             """
@@ -271,7 +294,7 @@ class WatchdogService:
                                 updated_at = now()
                             where id = %s
                             """,
-                            (int(row["account_id"]),),
+                            (account_id,),
                         )
                     else:
                         cur.execute(
@@ -281,23 +304,21 @@ class WatchdogService:
                                 updated_at = now()
                             where id = %s
                             """,
-                            (int(row["account_id"]),),
+                            (account_id,),
                         )
 
     def _retry_pending_unblocks(self, counters: dict[str, int]) -> None:
-        """Find active accounts still flagged blocked and retry post_enable."""
+        """Find active accounts still flagged blocked and retry post_enable.
+
+        Mirror of _retry_pending_blocks: fan out across N linked ports;
+        clear node_blocked only when every port acks.
+        """
         with connect() as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     """
-                    select t.id           as account_id,
-                           i.port         as port,
-                           n.url          as node_url,
-                           n.api_key      as node_api_key,
-                           i.node_id      as node_id
+                    select t.id as account_id
                     from traffic_accounts t
-                    join proxy_inventory i on i.id = t.inventory_id
-                    join nodes n on n.id = i.node_id
                     where t.status = 'active'
                       and t.node_blocked = true
                       and (t.last_unblock_attempt_at is null
@@ -307,19 +328,37 @@ class WatchdogService:
                     """,
                     (_PERGB_BLOCK_RETRY_THROTTLE_MINUTES, _PERGB_BLOCK_RETRY_BATCH_LIMIT),
                 )
-                pending = list(cur.fetchall())
+                pending = [int(r["account_id"]) for r in cur.fetchall()]
 
-            for row in pending:
+            for account_id in pending:
                 counters["pergb_unblock_retries_attempted"] += 1
-                ok = self._call_enable(
-                    node_url=str(row["node_url"]),
-                    node_api_key=(str(row["node_api_key"]) if row.get("node_api_key") else None),
-                    port=int(row["port"]),
-                    account_id=int(row["account_id"]),
-                    node_id=str(row["node_id"]),
-                )
+                ports = self._fetch_account_ports(conn, account_id)
+                if not ports:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            """
+                            update traffic_accounts
+                            set node_blocked = false,
+                                last_unblock_attempt_at = now(),
+                                updated_at = now()
+                            where id = %s
+                            """,
+                            (account_id,),
+                        )
+                    continue
+                all_ok = True
+                for p in ports:
+                    ok = self._call_enable(
+                        node_url=str(p["node_url"]),
+                        node_api_key=(str(p["node_api_key"]) if p.get("node_api_key") else None),
+                        port=int(p["port"]),
+                        account_id=account_id,
+                        node_id=str(p["node_id"]),
+                    )
+                    if not ok:
+                        all_ok = False
                 with conn.cursor() as cur:
-                    if ok:
+                    if all_ok:
                         counters["pergb_unblock_retries_succeeded"] += 1
                         cur.execute(
                             """
@@ -329,7 +368,7 @@ class WatchdogService:
                                 updated_at = now()
                             where id = %s
                             """,
-                            (int(row["account_id"]),),
+                            (account_id,),
                         )
                     else:
                         cur.execute(
@@ -339,8 +378,31 @@ class WatchdogService:
                                 updated_at = now()
                             where id = %s
                             """,
-                            (int(row["account_id"]),),
+                            (account_id,),
                         )
+
+    @staticmethod
+    def _fetch_account_ports(conn: Any, account_id: int) -> list[dict[str, Any]]:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                select i.port, i.node_id,
+                       n.url as node_url, n.api_key as node_api_key
+                  from proxy_inventory i
+                  join nodes n on n.id = i.node_id
+                 where i.traffic_account_id = %s
+                """,
+                (account_id,),
+            )
+            return [
+                {
+                    "port": int(r["port"]),
+                    "node_id": str(r["node_id"]),
+                    "node_url": str(r["node_url"]),
+                    "node_api_key": (str(r["node_api_key"]) if r.get("node_api_key") else None),
+                }
+                for r in cur.fetchall()
+            ]
 
     def _call_disable(
         self,

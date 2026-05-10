@@ -18,6 +18,9 @@ from fastapi import APIRouter
 from fastapi.responses import JSONResponse
 
 from orchestrator.api_schemas import (
+    GeneratedPort,
+    GeneratePortsRequest,
+    GeneratePortsResponse,
     ReservePergbRequest,
     ReservePergbResponse,
     SkuTierTable,
@@ -51,7 +54,12 @@ _RESERVE_ERROR_STATUS: dict[str, int] = {
     "sku_not_pergb": 400,
     "sku_tiers_invalid": 500,
     "invalid_tier_amount": 400,
-    "insufficient_inventory": 409,
+}
+
+_GENERATE_PORTS_ERROR_STATUS: dict[str, int] = {
+    "order_not_found": 404,
+    "account_not_active": 409,
+    "insufficient_pool": 409,
 }
 
 _TOPUP_ERROR_STATUS: dict[str, int] = {
@@ -98,16 +106,52 @@ async def reserve_pergb(payload: ReservePergbRequest) -> JSONResponse:
 
     assert result.order_ref is not None
     assert result.expires_at is not None
-    assert result.port is not None
+    assert result.traffic_account_id is not None
     response = ReservePergbResponse(
         order_ref=result.order_ref,
         expires_at=result.expires_at,
-        port=result.port,
-        host=result.host or "",
-        login=result.login or "",
-        password=result.password or "",
         bytes_quota=int(result.bytes_quota or 0),
         price_amount=result.price_amount or 0,  # type: ignore[arg-type]
+        traffic_account_id=result.traffic_account_id,
+    )
+    return JSONResponse(content=response.model_dump(mode="json"))
+
+
+@pergb_router.post("/v1/pergb/{order_ref}/generate_ports")
+async def generate_ports(order_ref: str, payload: GeneratePortsRequest) -> JSONResponse:
+    result = await _service.generate_ports(
+        order_ref=order_ref,
+        count=payload.count,
+        geo_code=payload.geo_code,
+        idempotency_key=payload.idempotency_key,
+    )
+    if not result.success:
+        status = _GENERATE_PORTS_ERROR_STATUS.get(result.error or "", 500)
+        extra: dict[str, Any] = {}
+        if result.error == "insufficient_pool":
+            extra["available"] = int(result.available or 0)
+            extra["requested"] = int(result.requested or 0)
+            extra["geo_code"] = result.geo_code or ""
+        if result.error == "account_not_active" and result.current_status:
+            extra["current_status"] = result.current_status
+        return _error_response(status=status, error=result.error or "unknown", **extra)
+
+    assert result.order_ref is not None
+    assert result.traffic_account_id is not None
+    response = GeneratePortsResponse(
+        order_ref=result.order_ref,
+        traffic_account_id=result.traffic_account_id,
+        ports=[
+            GeneratedPort(
+                port=p.port,
+                host=p.host,
+                login=p.login,
+                password=p.password,
+                geo_code=p.geo_code,
+            )
+            for p in (result.ports or [])
+        ],
+        total_ports_for_client=int(result.total_ports_for_client or 0),
     )
     return JSONResponse(content=response.model_dump(mode="json"))
 
@@ -157,8 +201,6 @@ async def get_traffic(order_ref: str) -> JSONResponse:
 
     assert result.order_ref is not None
     assert result.expires_at is not None
-    assert result.node_id is not None
-    assert result.port is not None
     response = TrafficResponse(
         order_ref=result.order_ref,
         status=result.status or "",

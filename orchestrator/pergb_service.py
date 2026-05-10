@@ -42,6 +42,7 @@ _GIB = 1024 * 1024 * 1024
 _IDEM_CACHE_TTL_SEC = 24 * 60 * 60
 _RESERVE_PERGB_IDEM_PREFIX = "idem:reserve_pergb:"
 _TOPUP_PERGB_IDEM_PREFIX = "idem:topup_pergb:"
+_GENERATE_PORTS_IDEM_PREFIX = "idem:generate_ports:"
 
 
 # === Result dataclasses ===
@@ -49,17 +50,41 @@ _TOPUP_PERGB_IDEM_PREFIX = "idem:topup_pergb:"
 
 @dataclass(slots=True)
 class ReservePergbResult:
+    """Wave PERGB-RFCT-A: no port credentials. Bot calls generate_ports
+    after reserve to claim N pool ports lazily.
+    """
+
     success: bool
     order_ref: str | None = None
     expires_at: datetime | None = None
-    port: int | None = None
-    host: str | None = None
-    login: str | None = None
-    password: str | None = None
     bytes_quota: int | None = None
     price_amount: Decimal | None = None
+    traffic_account_id: int | None = None
     error: str | None = None
     available_tiers: list[int] | None = None
+
+
+@dataclass(slots=True)
+class GeneratedPortRow:
+    port: int
+    host: str
+    login: str
+    password: str
+    geo_code: str
+
+
+@dataclass(slots=True)
+class GeneratePortsResult:
+    success: bool
+    order_ref: str | None = None
+    traffic_account_id: int | None = None
+    ports: list[GeneratedPortRow] | None = None
+    total_ports_for_client: int | None = None
+    error: str | None = None
+    requested: int | None = None
+    available: int | None = None
+    geo_code: str | None = None
+    current_status: str | None = None
 
 
 @dataclass(slots=True)
@@ -150,8 +175,8 @@ class PergbService:
         traffic_expires_at = now + timedelta(days=duration_days)
         proxies_expires_at = traffic_expires_at  # mirrors duration column
 
-        claimed = await asyncio.to_thread(
-            self._sync_create_pergb_order,
+        created = await asyncio.to_thread(
+            self._sync_create_pergb_account,
             user_id=user_id,
             sku_id=sku_id,
             gb_amount=gb_amount,
@@ -163,19 +188,14 @@ class PergbService:
             proxies_expires_at=proxies_expires_at,
             idempotency_key=idempotency_key,
         )
-        if claimed is None:
-            return ReservePergbResult(success=False, error="insufficient_inventory")
 
         result = ReservePergbResult(
             success=True,
-            order_ref=claimed["order_ref"],
-            expires_at=claimed["proxies_expires_at"],
-            port=int(claimed["port"]),
-            host=str(claimed["host"]),
-            login=str(claimed["login"]),
-            password=str(claimed["password"]),
+            order_ref=created["order_ref"],
+            expires_at=created["proxies_expires_at"],
             bytes_quota=bytes_quota,
             price_amount=price_amount,
+            traffic_account_id=int(created["traffic_account_id"]),
         )
 
         if idempotency_key:
@@ -188,7 +208,105 @@ class PergbService:
             user_id=user_id,
             gb_amount=gb_amount,
             bytes_quota=bytes_quota,
-            inventory_id=int(claimed["inventory_id"]),
+            traffic_account_id=int(created["traffic_account_id"]),
+        )
+        return result
+
+    # ---------- generate_ports ----------
+
+    async def generate_ports(
+        self,
+        *,
+        order_ref: str,
+        count: int,
+        geo_code: str,
+        idempotency_key: str,
+    ) -> GeneratePortsResult:
+        """Allocate N pool ports for an existing pergb traffic_account.
+
+        Wave PERGB-RFCT-A: replaces the legacy 1:1 port allocation that
+        used to happen inside reserve_pergb. The user buys a GB budget
+        first, then explicitly opts in to "generate proxies" — picking
+        geo + count — and we claim from the shared pool atomically.
+        """
+        cached = await self._idem_get_generate(idempotency_key)
+        if cached is not None:
+            logger.info(
+                "pergb_generate_idempotent_hit",
+                idempotency_key=idempotency_key,
+                order_ref=cached.order_ref,
+            )
+            return cached
+
+        # Fetch & validate the parent account.
+        ta = await asyncio.to_thread(self._sync_get_pergb_parent, order_ref)
+        if ta is None:
+            return GeneratePortsResult(success=False, error="order_not_found")
+        status = str(ta.get("account_status") or "")
+        if status != "active":
+            return GeneratePortsResult(
+                success=False,
+                error="account_not_active",
+                current_status=status or None,
+            )
+
+        traffic_account_id = int(ta["account_id"])
+
+        rows = await asyncio.to_thread(
+            self._sync_atomic_allocate_ports,
+            traffic_account_id=traffic_account_id,
+            order_ref=order_ref,
+            geo_code=geo_code,
+            count=count,
+        )
+        if rows is None:
+            # Probe how many pool ports are available so the bot can show a
+            # useful "X available, Y requested" error.
+            available = await asyncio.to_thread(self._sync_count_available_pool_ports, geo_code=geo_code)
+            return GeneratePortsResult(
+                success=False,
+                error="insufficient_pool",
+                requested=count,
+                available=available,
+                geo_code=geo_code,
+            )
+
+        # Best-effort node-side activation. Failures are logged + watchdog
+        # retries via existing safety-net (Phase 5.5) — we don't roll back.
+        for r in rows:
+            await asyncio.to_thread(
+                self._best_effort_post_enable_one,
+                node_id=str(r["node_id"]),
+                port=int(r["port"]),
+            )
+
+        total = await asyncio.to_thread(self._sync_count_linked_ports, traffic_account_id=traffic_account_id)
+
+        result = GeneratePortsResult(
+            success=True,
+            order_ref=order_ref,
+            traffic_account_id=traffic_account_id,
+            ports=[
+                GeneratedPortRow(
+                    port=int(r["port"]),
+                    host=str(r["host"]),
+                    login=str(r["login"]),
+                    password=str(r["password"]),
+                    geo_code=str(r["geo_code"]),
+                )
+                for r in rows
+            ],
+            total_ports_for_client=total,
+        )
+        await self._idem_set_generate(idempotency_key, result)
+
+        logger.info(
+            "pergb_generate_succeeded",
+            order_ref=order_ref,
+            traffic_account_id=traffic_account_id,
+            count=count,
+            geo_code=geo_code,
+            total_ports_for_client=total,
         )
         return result
 
@@ -268,13 +386,11 @@ class PergbService:
             assert existing is not None
             return self._result_from_existing_topup(existing)
 
-        # Reactivation: if account flipped depleted → active, fire post_enable best-effort.
+        # Reactivation: if account flipped depleted → active, fan out
+        # post_enable across all linked ports (Wave PERGB-RFCT-A: 1 → N).
         if outcome["reactivated"]:
             await asyncio.to_thread(
-                self._best_effort_post_enable,
-                node_url=str(parent["node_url"]),
-                node_api_key=(str(parent["node_api_key"]) if parent.get("node_api_key") else None),
-                port=int(parent["port"]),
+                self._best_effort_post_enable_all,
                 account_id=int(parent["account_id"]),
             )
 
@@ -336,8 +452,8 @@ class PergbService:
             last_polled_at=snapshot.get("last_polled_at"),
             expires_at=snapshot["expires_at"],
             depleted_at=snapshot.get("depleted_at"),
-            node_id=str(snapshot["node_id"]),
-            port=int(snapshot["port"]),
+            node_id=(str(snapshot["node_id"]) if snapshot.get("node_id") else None),
+            port=(int(snapshot["port"]) if snapshot.get("port") is not None else None),
             over_usage_bytes=over_usage,
         )
 
@@ -354,7 +470,7 @@ class PergbService:
             row = cur.fetchone()
         return dict(row) if row else None
 
-    def _sync_create_pergb_order(
+    def _sync_create_pergb_account(
         self,
         *,
         user_id: int,
@@ -367,44 +483,18 @@ class PergbService:
         traffic_expires_at: datetime,
         proxies_expires_at: datetime,
         idempotency_key: str | None,
-    ) -> dict[str, Any] | None:
-        """One transaction: claim inventory, create order, create traffic_account.
+    ) -> dict[str, Any]:
+        """One transaction: insert order + traffic_account (no inventory claim).
 
-        Returns ``None`` if no inventory was available (rolls back nothing —
-        the SELECT-FOR-UPDATE-SKIP-LOCKED claim left no lock).
+        Wave PERGB-RFCT-A: reserve_pergb only creates the GB budget. The user
+        then calls /v1/pergb/{order_ref}/generate_ports to claim N pool ports
+        lazily. traffic_accounts.inventory_id is left NULL — the reverse FK on
+        proxy_inventory.traffic_account_id is the new source of truth for the
+        account ↔ ports relationship.
         """
         order_ref = "ord_" + uuid.uuid4().hex[:12]
-        reservation_key = f"resv_pergb_{uuid.uuid4().hex}"
-
         with connect() as conn, conn.cursor() as cur:
-            # 1. Atomic claim: pick first available row for this SKU (across nodes
-            # — equal-share is approximated by the partial-index ordering; the
-            # refill engine ensures inventory spreads across active bindings).
-            cur.execute(
-                """
-                with selected as (
-                    select id from proxy_inventory
-                    where sku_id = %s and status = 'available'
-                    order by id
-                    for update skip locked
-                    limit 1
-                )
-                update proxy_inventory
-                set status = 'allocated_pergb',
-                    reservation_key = %s,
-                    reserved_at = now(),
-                    updated_at = now()
-                where id in (select id from selected)
-                returning id, node_id, port, host, login, password
-                """,
-                (sku_id, reservation_key),
-            )
-            inv_row = cur.fetchone()
-            if inv_row is None:
-                return None
-            inventory = dict(inv_row)
-
-            # 2. Insert order (auto-committed for pergb — see module doc)
+            # 1. Insert order (auto-committed for pergb — see module doc)
             metadata = {
                 "chosen_tier_gb": gb_amount,
                 "tier_price_per_gb": str(tier_price_per_gb),
@@ -422,7 +512,7 @@ class PergbService:
                 )
                 values (
                   %s, %s, %s, 'committed',
-                  1, 1,
+                  0, 0,
                   %s, now(), %s,
                   now(), %s,
                   %s, %s, %s
@@ -433,7 +523,7 @@ class PergbService:
                     order_ref,
                     user_id,
                     sku_id,
-                    reservation_key,
+                    f"resv_pergb_{uuid.uuid4().hex}",
                     proxies_expires_at,
                     proxies_expires_at,
                     str(price_amount),
@@ -445,42 +535,126 @@ class PergbService:
             assert order_row is not None
             order_id = int(order_row["id"])
 
-            # 3. Bind inventory to order
-            cur.execute(
-                """
-                update proxy_inventory
-                set order_id = %s, sold_at = now(), updated_at = now()
-                where id = %s
-                """,
-                (order_id, int(inventory["id"])),
-            )
-
-            # 4. Insert traffic_account
+            # 2. Insert traffic_account (inventory_id NULL — ports come later)
             cur.execute(
                 """
                 insert into traffic_accounts (
                   order_id, inventory_id, bytes_quota, bytes_used,
                   status, expires_at
                 )
-                values (%s, %s, %s, 0, 'active', %s)
+                values (%s, NULL, %s, 0, 'active', %s)
+                returning id
                 """,
-                (order_id, int(inventory["id"]), bytes_quota, traffic_expires_at),
+                (order_id, bytes_quota, traffic_expires_at),
             )
+            ta_row = cur.fetchone()
+            assert ta_row is not None
+            traffic_account_id = int(ta_row["id"])
 
         return {
             "order_ref": order_ref,
             "order_id": order_id,
-            "inventory_id": int(inventory["id"]),
-            "node_id": str(inventory["node_id"]),
-            "port": int(inventory["port"]),
-            "host": str(inventory["host"]),
-            "login": str(inventory["login"]),
-            "password": str(inventory["password"]),
+            "traffic_account_id": traffic_account_id,
             "proxies_expires_at": proxies_expires_at,
         }
 
+    def _sync_atomic_allocate_ports(
+        self,
+        *,
+        traffic_account_id: int,
+        order_ref: str,
+        geo_code: str,
+        count: int,
+    ) -> list[dict[str, Any]] | None:
+        """Atomically claim N available pool ports of the requested geo and
+        link them to the traffic_account. Returns the allocated rows, or
+        ``None`` if fewer than ``count`` were available.
+
+        Single-statement UPDATE ... WHERE id IN (SELECT ... FOR UPDATE SKIP
+        LOCKED) is race-free across concurrent generate_ports calls.
+        """
+        reservation_key = f"resv_pergb_gen_{uuid.uuid4().hex}"
+        with connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                with selected as (
+                    select id from proxy_inventory
+                    where status = 'available' and geo_code = %s
+                    order by id
+                    for update skip locked
+                    limit %s
+                )
+                update proxy_inventory
+                set status = 'allocated_pergb',
+                    traffic_account_id = %s,
+                    reservation_key = %s,
+                    reserved_at = now(),
+                    sold_at = now(),
+                    updated_at = now()
+                where id in (select id from selected)
+                returning id, node_id, port, host, login, password, geo_code
+                """,
+                (geo_code, count, traffic_account_id, reservation_key),
+            )
+            rows = [dict(r) for r in cur.fetchall()]
+            if len(rows) < count:
+                # Insufficient inventory — roll back the partial allocation.
+                conn.rollback()
+                return None
+        return rows
+
+    def _sync_count_available_pool_ports(self, *, geo_code: str) -> int:
+        with connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                select count(*) as c from proxy_inventory
+                 where status = 'available' and geo_code = %s
+                """,
+                (geo_code,),
+            )
+            row = cur.fetchone() or {"c": 0}
+        return int(row.get("c") or 0)
+
+    def _best_effort_post_enable_one(self, *, node_id: str, port: int) -> None:
+        with connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                "select url, api_key from nodes where id = %s",
+                (node_id,),
+            )
+            row = cur.fetchone()
+        if row is None:
+            logger.warning("pergb_generate_node_lookup_failed", node_id=node_id, port=port)
+            return
+        node_url = str(row["url"])
+        node_api_key = str(row["api_key"]) if row.get("api_key") else None
+        try:
+            node_client.post_enable(node_url, node_api_key, port)
+            logger.info("pergb_generate_port_enabled", node_id=node_id, port=port)
+        except NodeAgentError as exc:
+            logger.warning(
+                "pergb_generate_port_enable_failed",
+                node_id=node_id,
+                port=port,
+                error=str(exc),
+                status_code=exc.status_code,
+            )
+
+    def _sync_count_linked_ports(self, *, traffic_account_id: int) -> int:
+        with connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                "select count(*) as c from proxy_inventory where traffic_account_id = %s",
+                (traffic_account_id,),
+            )
+            row = cur.fetchone() or {"c": 0}
+        return int(row.get("c") or 0)
+
     def _sync_get_pergb_parent(self, parent_order_ref: str) -> dict[str, Any] | None:
-        """Fetch the parent reserve_pergb order + its traffic_account + node info.
+        """Fetch the parent reserve_pergb order + its traffic_account.
+
+        Wave PERGB-RFCT-A: no inventory join — traffic_accounts.inventory_id
+        is NULL for new orders. Linked ports (for topup reactivation) come
+        from a separate _sync_get_linked_ports call so we can fan out across
+        N ports.
 
         Returns None if order_ref doesn't exist or has no traffic_account
         (e.g. it's a top-up's order_ref or a per-piece order).
@@ -497,21 +671,44 @@ class PergbService:
                   t.status        as account_status,
                   t.bytes_quota   as bytes_quota,
                   t.bytes_used    as bytes_used,
-                  t.expires_at    as expires_at,
-                  i.node_id       as node_id,
-                  i.port          as port,
-                  n.url           as node_url,
-                  n.api_key       as node_api_key
+                  t.expires_at    as expires_at
                 from orders o
                 join traffic_accounts t on t.order_id = o.id
-                join proxy_inventory i on i.id = t.inventory_id
-                join nodes n on n.id = i.node_id
                 where o.order_ref = %s
                 """,
                 (parent_order_ref,),
             )
             row = cur.fetchone()
         return dict(row) if row else None
+
+    def _sync_get_linked_ports(self, *, account_id: int) -> list[dict[str, Any]]:
+        """Return all proxy_inventory rows currently linked to the given
+        traffic_account, plus node URL/API key for post_enable/post_disable
+        fan-out. Empty list if no ports allocated yet (initial state).
+        """
+        rows: list[dict[str, Any]] = []
+        with connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                select i.id as inventory_id, i.node_id, i.port,
+                       n.url as node_url, n.api_key as node_api_key
+                  from proxy_inventory i
+                  join nodes n on n.id = i.node_id
+                 where i.traffic_account_id = %s
+                """,
+                (account_id,),
+            )
+            for r in cur.fetchall():
+                rows.append(
+                    {
+                        "inventory_id": int(r["inventory_id"]),
+                        "node_id": str(r["node_id"]),
+                        "port": int(r["port"]),
+                        "node_url": str(r["node_url"]),
+                        "node_api_key": (str(r["node_api_key"]) if r.get("node_api_key") else None),
+                    }
+                )
+        return rows
 
     def _sync_apply_topup(
         self,
@@ -678,16 +875,33 @@ class PergbService:
         )
 
     def _sync_get_traffic_snapshot(self, parent_order_ref: str) -> dict[str, Any] | None:
+        """Snapshot for /v1/orders/{order_ref}/traffic.
+
+        Wave PERGB-RFCT-A: node_id/port no longer come from a single
+        inventory row. We pick a representative linked port via LATERAL
+        (any one is fine for the bot's status display); the account-level
+        bytes_used is still authoritative because traffic_poll aggregates
+        SUM(bytes_used_snapshot) into traffic_accounts.bytes_used per
+        cycle. Returns has_account=True even when no ports are allocated
+        yet — the bot's pergb panel renders the "Generate ports" CTA in
+        that case.
+        """
         with connect() as conn, conn.cursor() as cur:
             cur.execute(
                 """
                 select o.id, o.metadata, t.id as account_id,
                        t.status, t.bytes_quota, t.bytes_used,
                        t.last_polled_at, t.expires_at, t.depleted_at,
-                       i.node_id, i.port
+                       (select i.node_id from proxy_inventory i
+                          where i.traffic_account_id = t.id
+                          order by i.id limit 1) as node_id,
+                       (select i.port from proxy_inventory i
+                          where i.traffic_account_id = t.id
+                          order by i.id limit 1) as port,
+                       (select count(*) from proxy_inventory i
+                          where i.traffic_account_id = t.id) as port_count
                 from orders o
                 left join traffic_accounts t on t.order_id = o.id
-                left join proxy_inventory i on i.id = t.inventory_id
                 where o.order_ref = %s
                 """,
                 (parent_order_ref,),
@@ -709,35 +923,46 @@ class PergbService:
             "last_polled_at": row.get("last_polled_at"),
             "expires_at": row["expires_at"],
             "depleted_at": row.get("depleted_at"),
-            "node_id": str(row["node_id"]),
-            "port": int(row["port"]),
+            "node_id": (str(row["node_id"]) if row.get("node_id") else None),
+            "port": (int(row["port"]) if row.get("port") is not None else None),
+            "port_count": int(row.get("port_count") or 0),
         }
 
-    def _best_effort_post_enable(
-        self,
-        *,
-        node_url: str,
-        node_api_key: str | None,
-        port: int,
-        account_id: int,
-    ) -> None:
-        succeeded = False
-        try:
-            node_client.post_enable(node_url, node_api_key, port)
-            succeeded = True
-            logger.info("pergb_account_reactivated", account_id=account_id, port=port)
-        except NodeAgentError as exc:
-            logger.warning(
-                "pergb_account_reactivate_failed",
-                account_id=account_id,
-                port=port,
-                error=str(exc),
-                status_code=exc.status_code,
-            )
-        # Stamp last_unblock_attempt_at unconditionally so the watchdog can
-        # throttle retries; clear node_blocked only when we got the ack.
+    def _best_effort_post_enable_all(self, *, account_id: int) -> None:
+        """Fan out post_enable across every port linked to this account.
+
+        Reactivation succeeds (in DB terms) iff *all* ports ack — partial
+        failures leave node_blocked=TRUE for watchdog retry, but the
+        traffic_account itself stays active so billing resumes.
+        """
+        ports = self._sync_get_linked_ports(account_id=account_id)
+        if not ports:
+            # No ports yet — first generate_ports call will activate them.
+            return
+        all_ok = True
+        for p in ports:
+            try:
+                node_client.post_enable(p["node_url"], p["node_api_key"], p["port"])
+                logger.info(
+                    "pergb_account_reactivated_port",
+                    account_id=account_id,
+                    node_id=p["node_id"],
+                    port=p["port"],
+                )
+            except NodeAgentError as exc:
+                all_ok = False
+                logger.warning(
+                    "pergb_account_reactivate_failed",
+                    account_id=account_id,
+                    node_id=p["node_id"],
+                    port=p["port"],
+                    error=str(exc),
+                    status_code=exc.status_code,
+                )
+        # Stamp attempt time unconditionally; clear node_blocked only when
+        # every linked port acked.
         with connect() as conn, conn.cursor() as cur:
-            if succeeded:
+            if all_ok:
                 cur.execute(
                     "update traffic_accounts "
                     "set node_blocked = FALSE, "
@@ -773,12 +998,9 @@ class PergbService:
             success=bool(data.get("success", False)),
             order_ref=data.get("order_ref"),
             expires_at=(datetime.fromisoformat(data["expires_at"]) if data.get("expires_at") else None),
-            port=data.get("port"),
-            host=data.get("host"),
-            login=data.get("login"),
-            password=data.get("password"),
             bytes_quota=data.get("bytes_quota"),
             price_amount=Decimal(data["price_amount"]) if data.get("price_amount") else None,
+            traffic_account_id=data.get("traffic_account_id"),
             error=data.get("error"),
             available_tiers=data.get("available_tiers"),
         )
@@ -789,16 +1011,72 @@ class PergbService:
             "success": result.success,
             "order_ref": result.order_ref,
             "expires_at": result.expires_at.isoformat() if result.expires_at else None,
-            "port": result.port,
-            "host": result.host,
-            "login": result.login,
-            "password": result.password,
             "bytes_quota": result.bytes_quota,
             "price_amount": str(result.price_amount) if result.price_amount else None,
+            "traffic_account_id": result.traffic_account_id,
             "error": result.error,
             "available_tiers": result.available_tiers,
         }
         await redis.set(_RESERVE_PERGB_IDEM_PREFIX + key, json.dumps(payload), ex=_IDEM_CACHE_TTL_SEC)
+
+    async def _idem_get_generate(self, key: str) -> GeneratePortsResult | None:
+        redis = await get_redis()
+        cached = await redis.get(_GENERATE_PORTS_IDEM_PREFIX + key)
+        if not cached:
+            return None
+        try:
+            data = json.loads(cached)
+        except json.JSONDecodeError:
+            logger.warning("pergb_generate_idem_corrupt", key=key)
+            return None
+        ports_raw = data.get("ports") or []
+        ports = [
+            GeneratedPortRow(
+                port=int(p["port"]),
+                host=str(p["host"]),
+                login=str(p["login"]),
+                password=str(p["password"]),
+                geo_code=str(p["geo_code"]),
+            )
+            for p in ports_raw
+        ]
+        return GeneratePortsResult(
+            success=bool(data.get("success", False)),
+            order_ref=data.get("order_ref"),
+            traffic_account_id=data.get("traffic_account_id"),
+            ports=ports if ports else None,
+            total_ports_for_client=data.get("total_ports_for_client"),
+            error=data.get("error"),
+            requested=data.get("requested"),
+            available=data.get("available"),
+            geo_code=data.get("geo_code"),
+            current_status=data.get("current_status"),
+        )
+
+    async def _idem_set_generate(self, key: str, result: GeneratePortsResult) -> None:
+        redis = await get_redis()
+        payload = {
+            "success": result.success,
+            "order_ref": result.order_ref,
+            "traffic_account_id": result.traffic_account_id,
+            "ports": [
+                {
+                    "port": p.port,
+                    "host": p.host,
+                    "login": p.login,
+                    "password": p.password,
+                    "geo_code": p.geo_code,
+                }
+                for p in (result.ports or [])
+            ],
+            "total_ports_for_client": result.total_ports_for_client,
+            "error": result.error,
+            "requested": result.requested,
+            "available": result.available,
+            "geo_code": result.geo_code,
+            "current_status": result.current_status,
+        }
+        await redis.set(_GENERATE_PORTS_IDEM_PREFIX + key, json.dumps(payload), ex=_IDEM_CACHE_TTL_SEC)
 
     async def _idem_get_topup(self, key: str) -> TopupPergbResult | None:
         redis = await get_redis()
