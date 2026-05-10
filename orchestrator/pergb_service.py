@@ -576,12 +576,17 @@ class PergbService:
         LOCKED) is race-free across concurrent generate_ports calls.
         """
         reservation_key = f"resv_pergb_gen_{uuid.uuid4().hex}"
+        # NOTE: proxy_inventory's country column is named ``geo_country`` per
+        # the canonical schema (see allocator + delivery + admin). The
+        # ``geo_code`` shape used everywhere else in the API (skus.geo_code,
+        # nodes.geo, etc.) is *the same value* — we alias it on the SELECT
+        # so callers/tests keep their existing ``row["geo_code"]`` reads.
         with connect() as conn, conn.cursor() as cur:
             cur.execute(
                 """
                 with selected as (
                     select id from proxy_inventory
-                    where status = 'available' and geo_code = %s
+                    where status = 'available' and geo_country = %s
                     order by id
                     for update skip locked
                     limit %s
@@ -594,7 +599,8 @@ class PergbService:
                     sold_at = now(),
                     updated_at = now()
                 where id in (select id from selected)
-                returning id, node_id, port, host, login, password, geo_code
+                returning id, node_id, port, host, login, password,
+                          geo_country as geo_code
                 """,
                 (geo_code, count, traffic_account_id, reservation_key),
             )
@@ -610,7 +616,7 @@ class PergbService:
             cur.execute(
                 """
                 select count(*) as c from proxy_inventory
-                 where status = 'available' and geo_code = %s
+                 where status = 'available' and geo_country = %s
                 """,
                 (geo_code,),
             )
