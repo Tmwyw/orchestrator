@@ -1,4 +1,11 @@
-"""Unit tests for TrafficPollService (Wave B-8.2 design § 4)."""
+"""Unit tests for TrafficPollService (Wave B-8.2 design § 4).
+
+Wave PERGB-RFCT-A: 1 traffic_account → N ports. Each port gets its own
+``bytes_used_snapshot`` + ``last_polled_bytes_in/out`` anchor on
+``proxy_inventory``. The poller writes per-port snapshots first, then
+aggregates SUM into ``traffic_accounts.bytes_used`` and flips newly
+depleted accounts in a single follow-up pass.
+"""
 
 from __future__ import annotations
 
@@ -46,12 +53,12 @@ def _make_phased_connect(*phases: MagicMock):
     return fake_connect
 
 
-def _account_row(
+def _port_row(
     *,
     account_id: int,
     inventory_id: int,
     bytes_quota: int,
-    bytes_used: int,
+    port_bytes_used_snapshot: int,
     last_in: int | None,
     last_out: int | None,
     node_id: str = "node-x",
@@ -60,11 +67,12 @@ def _account_row(
     port: int = 32001,
     sku_code: str = "sku_pergb_us",
 ) -> dict[str, Any]:
+    """Wave PERGB-RFCT-A: row from the per-port join in _fetch_active_ports."""
     return {
         "account_id": account_id,
         "inventory_id": inventory_id,
         "bytes_quota": bytes_quota,
-        "bytes_used": bytes_used,
+        "port_bytes_used_snapshot": port_bytes_used_snapshot,
         "last_polled_bytes_in": last_in,
         "last_polled_bytes_out": last_out,
         "node_id": node_id,
@@ -75,31 +83,39 @@ def _account_row(
     }
 
 
+def _aggregate_returning(
+    *,
+    rows: list[dict[str, Any]],
+) -> MagicMock:
+    """Cursor for _aggregate_and_flip_depleted's UPDATE ... RETURNING."""
+    return _make_cursor(fetchall_queue=[rows])
+
+
 # === happy path ===
 
 
 def test_run_once_happy_path_two_accounts_one_node(monkeypatch: pytest.MonkeyPatch) -> None:
-    """2 accounts on 1 node, both poll OK, deltas computed."""
+    """2 accounts on 1 node, both poll OK, deltas computed, no depletion."""
     from orchestrator import traffic_poll
     from orchestrator.traffic_poll import TrafficPollService
 
     fetch_cursor = _make_cursor(
         fetchall_queue=[
             [
-                _account_row(
+                _port_row(
                     account_id=1,
                     inventory_id=10,
                     bytes_quota=1_000_000_000,
-                    bytes_used=100,
+                    port_bytes_used_snapshot=100,
                     last_in=50,
                     last_out=50,
                     port=32001,
                 ),
-                _account_row(
+                _port_row(
                     account_id=2,
                     inventory_id=11,
                     bytes_quota=1_000_000_000,
-                    bytes_used=0,
+                    port_bytes_used_snapshot=0,
                     last_in=None,
                     last_out=None,
                     port=32002,
@@ -109,10 +125,17 @@ def test_run_once_happy_path_two_accounts_one_node(monkeypatch: pytest.MonkeyPat
     )
     persist1 = _make_cursor()
     persist2 = _make_cursor()
+    aggregate = _aggregate_returning(
+        rows=[
+            {"id": 1, "bytes_used": 400, "bytes_quota": 1_000_000_000, "status": "active"},
+            {"id": 2, "bytes_used": 100, "bytes_quota": 1_000_000_000, "status": "active"},
+        ]
+    )
     fake_connect = _make_phased_connect(
         _make_conn(fetch_cursor),
         _make_conn(persist1),
         _make_conn(persist2),
+        _make_conn(aggregate),
     )
 
     def fake_get_accounting(url, api_key, ports, timeout_sec=10):
@@ -139,10 +162,12 @@ def test_run_once_happy_path_two_accounts_one_node(monkeypatch: pytest.MonkeyPat
     assert counters.counter_resets_detected == 0
     assert counters.skipped_overlap is False
 
-    # First account: delta computed (200-50)+(200-50) = 300; sample inserted + bytes_used updated.
+    # Per-port persist writes proxy_inventory, not traffic_samples.
     sql_calls = [c.args[0] for c in persist1.execute.call_args_list]
-    assert any("insert into traffic_samples" in s for s in sql_calls)
-    assert any("update traffic_accounts" in s for s in sql_calls)
+    assert any("update proxy_inventory" in s for s in sql_calls)
+    # Aggregate phase issues the SUM-into-traffic_accounts UPDATE.
+    agg_sql = [c.args[0] for c in aggregate.execute.call_args_list]
+    assert any("update traffic_accounts" in s and "sum(pi.bytes_used_snapshot)" in s for s in agg_sql)
 
 
 # === partial response from node ===
@@ -156,20 +181,20 @@ def test_run_once_partial_node_response(monkeypatch: pytest.MonkeyPatch) -> None
     fetch_cursor = _make_cursor(
         fetchall_queue=[
             [
-                _account_row(
+                _port_row(
                     account_id=1,
                     inventory_id=10,
                     bytes_quota=1_000_000_000,
-                    bytes_used=0,
+                    port_bytes_used_snapshot=0,
                     last_in=0,
                     last_out=0,
                     port=32001,
                 ),
-                _account_row(
+                _port_row(
                     account_id=2,
                     inventory_id=11,
                     bytes_quota=1_000_000_000,
-                    bytes_used=0,
+                    port_bytes_used_snapshot=0,
                     last_in=0,
                     last_out=0,
                     port=32002,
@@ -178,10 +203,16 @@ def test_run_once_partial_node_response(monkeypatch: pytest.MonkeyPatch) -> None
         ],
     )
     persist1 = _make_cursor()
+    aggregate = _aggregate_returning(
+        rows=[
+            {"id": 1, "bytes_used": 200, "bytes_quota": 1_000_000_000, "status": "active"},
+            {"id": 2, "bytes_used": 0, "bytes_quota": 1_000_000_000, "status": "active"},
+        ]
+    )
     fake_connect = _make_phased_connect(
         _make_conn(fetch_cursor),
-        _make_conn(persist1),
-        _make_conn(_make_cursor()),
+        _make_conn(persist1),  # only one port had a sample to persist
+        _make_conn(aggregate),
     )
 
     def fake_get_accounting(url, api_key, ports, timeout_sec=10):
@@ -209,11 +240,11 @@ def test_run_once_full_node_failure(monkeypatch: pytest.MonkeyPatch) -> None:
     fetch_cursor = _make_cursor(
         fetchall_queue=[
             [
-                _account_row(
+                _port_row(
                     account_id=1,
                     inventory_id=10,
                     bytes_quota=1_000_000_000,
-                    bytes_used=0,
+                    port_bytes_used_snapshot=0,
                     last_in=0,
                     last_out=0,
                     port=32001,
@@ -221,7 +252,10 @@ def test_run_once_full_node_failure(monkeypatch: pytest.MonkeyPatch) -> None:
             ]
         ],
     )
-    fake_connect = _make_phased_connect(_make_conn(fetch_cursor))
+    # Aggregate still runs even on full-failure cycle (no-op for untouched
+    # accounts since touched_accounts derives from rows we *did* poll).
+    aggregate = _aggregate_returning(rows=[])
+    fake_connect = _make_phased_connect(_make_conn(fetch_cursor), _make_conn(aggregate))
 
     def boom(*a, **kw):
         raise NodeAgentError("nft_failed", status_code=503)
@@ -246,11 +280,11 @@ def test_run_once_counter_reset_detected(monkeypatch: pytest.MonkeyPatch) -> Non
     fetch_cursor = _make_cursor(
         fetchall_queue=[
             [
-                _account_row(
+                _port_row(
                     account_id=7,
                     inventory_id=10,
                     bytes_quota=1_000_000_000,
-                    bytes_used=500,
+                    port_bytes_used_snapshot=500,
                     last_in=1000,
                     last_out=2000,
                     port=32001,
@@ -259,9 +293,13 @@ def test_run_once_counter_reset_detected(monkeypatch: pytest.MonkeyPatch) -> Non
         ],
     )
     persist = _make_cursor()
+    aggregate = _aggregate_returning(
+        rows=[{"id": 7, "bytes_used": 500, "bytes_quota": 1_000_000_000, "status": "active"}]
+    )
     fake_connect = _make_phased_connect(
         _make_conn(fetch_cursor),
         _make_conn(persist),
+        _make_conn(aggregate),
     )
 
     # New reading is LOWER than the anchor → counter reset
@@ -276,21 +314,16 @@ def test_run_once_counter_reset_detected(monkeypatch: pytest.MonkeyPatch) -> Non
     assert counters.counter_resets_detected == 1
     assert counters.accounts_polled == 1
 
-    # The traffic_samples row should have counter_reset_detected=True and zero deltas.
-    insert_call = persist.execute.call_args_list[0]
-    insert_params = insert_call.args[1]
-    # Params order: (account_id, bytes_in_total, bytes_out_total, delta_in, delta_out, reset)
-    assert insert_params[3] == 0  # delta_in clamped
-    assert insert_params[4] == 0  # delta_out clamped
-    assert insert_params[5] is True
-
-    # bytes_used must NOT have grown — anchor moved to new (lower) reading instead.
-    update_call = persist.execute.call_args_list[1]
+    # The proxy_inventory UPDATE writes:
+    #   bytes_used_snapshot, last_polled_bytes_in, last_polled_bytes_out, inventory_id
+    # On counter reset, snapshot is unchanged (delta clamped to 0) and the
+    # anchor moves to the new (lower) reading.
+    update_call = persist.execute.call_args_list[0]
     update_params = update_call.args[1]
-    # Params: (new_bytes_used, bytes_in_total, bytes_out_total, account_id)
-    assert update_params[0] == 500  # unchanged
-    assert update_params[1] == 10
-    assert update_params[2] == 20
+    assert update_params[0] == 500  # snapshot unchanged
+    assert update_params[1] == 10  # new anchor in
+    assert update_params[2] == 20  # new anchor out
+    assert update_params[3] == 10  # inventory_id
 
 
 # === depletion-trigger ===
@@ -304,11 +337,11 @@ def test_run_once_depletion_trigger_calls_post_disable(monkeypatch: pytest.Monke
     fetch_cursor = _make_cursor(
         fetchall_queue=[
             [
-                _account_row(
+                _port_row(
                     account_id=42,
                     inventory_id=10,
                     bytes_quota=1000,
-                    bytes_used=900,
+                    port_bytes_used_snapshot=900,
                     last_in=0,
                     last_out=0,
                     port=32001,
@@ -318,24 +351,41 @@ def test_run_once_depletion_trigger_calls_post_disable(monkeypatch: pytest.Monke
             ]
         ],
     )
-    # Persist cursor must return a row from the depletion UPDATE...RETURNING.
-    persist = _make_cursor(fetchone_queue=[{"id": 42}])
-    # Third phase: _record_block_attempt updates node_blocked=TRUE after the
-    # successful post_disable.
+    persist = _make_cursor()
+    # Aggregate: one row returned, marked as crossing quota → depletion path.
+    aggregate = _aggregate_returning(
+        rows=[{"id": 42, "bytes_used": 1100, "bytes_quota": 1000, "status": "active"}]
+    )
+    # _fetch_linked_ports for the depleted account.
+    linked_ports = _make_cursor(
+        fetchall_queue=[
+            [
+                {
+                    "port": 32001,
+                    "node_id": "node-x",
+                    "node_url": "http://node-x:8085",
+                    "node_api_key": "k1",
+                }
+            ]
+        ]
+    )
     block_record = _make_cursor()
     fake_connect = _make_phased_connect(
         _make_conn(fetch_cursor),
         _make_conn(persist),
+        _make_conn(aggregate),
+        _make_conn(linked_ports),
         _make_conn(block_record),
     )
 
     def fake_get_accounting(url, api_key, ports, timeout_sec=10):
-        # Adding 100 + 100 puts bytes_used at 1100, > quota of 1000.
+        # +200 over the snapshot will be aggregated, but for this test the
+        # aggregate cursor returns the post-aggregate state directly.
         return {"32001": {"bytes_in": 100, "bytes_out": 100, "bytes_in6": 0, "bytes_out6": 0}}
 
     disable_calls: list[tuple[Any, ...]] = []
 
-    def fake_post_disable(url, api_key, port, timeout_sec=10):
+    def fake_post_disable(url, api_key, port):
         disable_calls.append((url, api_key, port))
         return {"action": "killed"}
 
@@ -349,11 +399,11 @@ def test_run_once_depletion_trigger_calls_post_disable(monkeypatch: pytest.Monke
     assert counters.accounts_disabled == 1
     assert disable_calls == [("http://node-x:8085", "k1", 32001)]
 
-    # Verify the depletion UPDATE was issued.
-    update_calls = [c.args[0] for c in persist.execute.call_args_list]
-    assert any("status = 'depleted'" in s and "depleted_at" in s for s in update_calls)
+    # Verify the depletion UPDATE was issued by aggregate.
+    agg_calls = [c.args[0] for c in aggregate.execute.call_args_list]
+    assert any("status = 'depleted'" in s and "depleted_at" in s for s in agg_calls)
 
-    # Verify the success path stamps node_blocked=TRUE.
+    # Success path stamps node_blocked=TRUE on the account.
     record_calls = [c.args[0] for c in block_record.execute.call_args_list]
     assert any("node_blocked = TRUE" in s and "last_block_attempt_at = now()" in s for s in record_calls)
 
@@ -368,11 +418,11 @@ def test_run_once_depletion_disable_failure_is_logged_not_fatal(
     fetch_cursor = _make_cursor(
         fetchall_queue=[
             [
-                _account_row(
+                _port_row(
                     account_id=42,
                     inventory_id=10,
                     bytes_quota=1000,
-                    bytes_used=900,
+                    port_bytes_used_snapshot=900,
                     last_in=0,
                     last_out=0,
                     port=32001,
@@ -380,13 +430,28 @@ def test_run_once_depletion_disable_failure_is_logged_not_fatal(
             ]
         ],
     )
-    persist = _make_cursor(fetchone_queue=[{"id": 42}])
-    # Third phase still runs even on failure — _record_block_attempt stamps
-    # last_block_attempt_at so the watchdog can throttle retries.
+    persist = _make_cursor()
+    aggregate = _aggregate_returning(
+        rows=[{"id": 42, "bytes_used": 1100, "bytes_quota": 1000, "status": "active"}]
+    )
+    linked_ports = _make_cursor(
+        fetchall_queue=[
+            [
+                {
+                    "port": 32001,
+                    "node_id": "node-x",
+                    "node_url": "http://node-x:8085",
+                    "node_api_key": "k1",
+                }
+            ]
+        ]
+    )
     block_record = _make_cursor()
     fake_connect = _make_phased_connect(
         _make_conn(fetch_cursor),
         _make_conn(persist),
+        _make_conn(aggregate),
+        _make_conn(linked_ports),
         _make_conn(block_record),
     )
 
@@ -408,8 +473,7 @@ def test_run_once_depletion_disable_failure_is_logged_not_fatal(
     assert counters.accounts_depleted == 1
     assert counters.accounts_disabled == 0
 
-    # Failure path: last_block_attempt_at stamped, but node_blocked NOT touched
-    # (default FALSE — the watchdog will retry).
+    # Failure path: last_block_attempt_at stamped, but node_blocked NOT touched.
     record_calls = [c.args[0] for c in block_record.execute.call_args_list]
     assert any("last_block_attempt_at = now()" in s for s in record_calls)
     assert not any("node_blocked = TRUE" in s for s in record_calls)
@@ -421,30 +485,35 @@ def test_run_once_depletion_disable_failure_is_logged_not_fatal(
 def test_run_once_polls_reactivated_account_with_preserved_anchor(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """After a top-up, account.status is 'active' again with the anchor still in
-    place. Polling must compute delta vs the pre-topup anchor as usual."""
+    """After a top-up, account.status is 'active' again with the per-port
+    anchor still in place. Polling must compute delta vs the pre-topup anchor
+    as usual."""
     from orchestrator import traffic_poll
     from orchestrator.traffic_poll import TrafficPollService
 
     fetch_cursor = _make_cursor(
         fetchall_queue=[
             [
-                _account_row(
+                _port_row(
                     account_id=99,
                     inventory_id=10,
                     bytes_quota=10_000,  # post-topup quota
-                    bytes_used=900,  # carried over
+                    port_bytes_used_snapshot=900,  # carried over from pre-topup
                     last_in=400,
-                    last_out=500,  # anchor preserved across reactivation
+                    last_out=500,  # anchor preserved
                     port=32001,
                 ),
             ]
         ],
     )
     persist = _make_cursor()
+    aggregate = _aggregate_returning(
+        rows=[{"id": 99, "bytes_used": 1300, "bytes_quota": 10_000, "status": "active"}]
+    )
     fake_connect = _make_phased_connect(
         _make_conn(fetch_cursor),
         _make_conn(persist),
+        _make_conn(aggregate),
     )
 
     monkeypatch.setattr(
@@ -458,8 +527,8 @@ def test_run_once_polls_reactivated_account_with_preserved_anchor(
 
     assert counters.accounts_polled == 1
     assert counters.counter_resets_detected == 0
-    # delta_in=200 (600-400), delta_out=200 (700-500) → new bytes_used=1300
-    update_params = persist.execute.call_args_list[1].args[1]
+    # delta_in=200 (600-400), delta_out=200 (700-500) → new snapshot = 1300
+    update_params = persist.execute.call_args_list[0].args[1]
     assert update_params[0] == 1300
 
 
@@ -499,17 +568,15 @@ def test_run_once_marks_node_degraded_after_threshold(
 
     service = TrafficPollService()
 
-    # Each cycle: one fetch_active_accounts conn (returns the same single account)
-    # and on the 3rd cycle one extra conn for _mark_node_degraded.
     def make_fetch_cursor():
         return _make_cursor(
             fetchall_queue=[
                 [
-                    _account_row(
+                    _port_row(
                         account_id=1,
                         inventory_id=10,
                         bytes_quota=1_000_000_000,
-                        bytes_used=0,
+                        port_bytes_used_snapshot=0,
                         last_in=0,
                         last_out=0,
                         port=32001,
@@ -519,23 +586,24 @@ def test_run_once_marks_node_degraded_after_threshold(
             ],
         )
 
-    # Cycle 1
-    fc1 = _make_phased_connect(_make_conn(make_fetch_cursor()))
+    # Cycle 1: fetch + aggregate (no per-port persist since node failed)
+    fc1 = _make_phased_connect(_make_conn(make_fetch_cursor()), _make_conn(_aggregate_returning(rows=[])))
     with patch("orchestrator.traffic_poll.connect", new=fc1):
         c1 = service.run_once()
     assert c1.node_failures == 1
 
     # Cycle 2
-    fc2 = _make_phased_connect(_make_conn(make_fetch_cursor()))
+    fc2 = _make_phased_connect(_make_conn(make_fetch_cursor()), _make_conn(_aggregate_returning(rows=[])))
     with patch("orchestrator.traffic_poll.connect", new=fc2):
         c2 = service.run_once()
     assert c2.node_failures == 1
 
-    # Cycle 3 — must trigger degrade (UPDATE nodes RETURNING id) — fetchone returns the row
+    # Cycle 3 — must trigger degrade (UPDATE nodes RETURNING id)
     degrade_cursor = _make_cursor(fetchone_queue=[{"id": "node-degrade-test"}])
     fc3 = _make_phased_connect(
         _make_conn(make_fetch_cursor()),
         _make_conn(degrade_cursor),
+        _make_conn(_aggregate_returning(rows=[])),
     )
     with patch("orchestrator.traffic_poll.connect", new=fc3):
         c3 = service.run_once()
@@ -561,11 +629,11 @@ def test_consecutive_failures_reset_on_success(monkeypatch: pytest.MonkeyPatch) 
         return _make_cursor(
             fetchall_queue=[
                 [
-                    _account_row(
+                    _port_row(
                         account_id=1,
                         inventory_id=10,
                         bytes_quota=1_000_000_000,
-                        bytes_used=0,
+                        port_bytes_used_snapshot=0,
                         last_in=0,
                         last_out=0,
                         port=32001,
@@ -584,7 +652,10 @@ def test_consecutive_failures_reset_on_success(monkeypatch: pytest.MonkeyPatch) 
     for _ in range(2):
         with patch(
             "orchestrator.traffic_poll.connect",
-            new=_make_phased_connect(_make_conn(make_fetch_cursor())),
+            new=_make_phased_connect(
+                _make_conn(make_fetch_cursor()),
+                _make_conn(_aggregate_returning(rows=[])),
+            ),
         ):
             service.run_once()
 
@@ -598,7 +669,12 @@ def test_consecutive_failures_reset_on_success(monkeypatch: pytest.MonkeyPatch) 
         "orchestrator.traffic_poll.connect",
         new=_make_phased_connect(
             _make_conn(make_fetch_cursor()),
-            _make_conn(_make_cursor()),  # persist
+            _make_conn(_make_cursor()),  # per-port persist
+            _make_conn(
+                _aggregate_returning(
+                    rows=[{"id": 1, "bytes_used": 0, "bytes_quota": 1_000_000_000, "status": "active"}]
+                )
+            ),
         ),
     ):
         service.run_once()
@@ -612,7 +688,10 @@ def test_consecutive_failures_reset_on_success(monkeypatch: pytest.MonkeyPatch) 
     for _ in range(2):
         with patch(
             "orchestrator.traffic_poll.connect",
-            new=_make_phased_connect(_make_conn(make_fetch_cursor())),
+            new=_make_phased_connect(
+                _make_conn(make_fetch_cursor()),
+                _make_conn(_aggregate_returning(rows=[])),
+            ),
         ):
             service.run_once()
 
@@ -623,7 +702,7 @@ def test_consecutive_failures_reset_on_success(monkeypatch: pytest.MonkeyPatch) 
 def test_run_once_no_active_accounts_returns_zero_counters(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Empty traffic_accounts table → fast no-op."""
+    """Empty traffic_accounts table → fast no-op (no aggregate phase needed)."""
     from orchestrator.traffic_poll import TrafficPollService
 
     fetch_cursor = _make_cursor(fetchall_queue=[[]])

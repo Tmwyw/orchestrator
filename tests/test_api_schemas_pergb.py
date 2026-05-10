@@ -149,16 +149,14 @@ def test_reserve_pergb_response_parses_decimal_string() -> None:
         {
             "order_ref": "ord_aaa",
             "expires_at": "2026-06-01T00:00:00Z",
-            "port": 32001,
-            "host": "1.2.3.4",
-            "login": "u",
-            "password": "p",
             "bytes_quota": 5_000_000_000,
             "price_amount": "49.95",
+            "traffic_account_id": 42,
         }
     )
     assert resp.success is True
     assert resp.price_amount == Decimal("49.95")
+    assert resp.traffic_account_id == 42
 
 
 def test_topup_pergb_response_parses_both_decimals() -> None:

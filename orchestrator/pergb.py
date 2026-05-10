@@ -214,6 +214,7 @@ async def get_traffic(order_ref: str) -> JSONResponse:
         node_id=result.node_id,
         port=result.port,
         over_usage_bytes=int(result.over_usage_bytes or 0),
+        port_count=int(result.port_count or 0),
     )
     return JSONResponse(content=response.model_dump(mode="json"))
 

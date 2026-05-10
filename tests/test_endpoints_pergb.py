@@ -16,6 +16,8 @@ import pytest
 from fastapi.testclient import TestClient
 
 from orchestrator.pergb_service import (
+    GeneratedPortRow,
+    GeneratePortsResult,
     ReservePergbResult,
     TopupPergbResult,
     TrafficResult,
@@ -48,6 +50,7 @@ def _mock_service(monkeypatch: pytest.MonkeyPatch):
             "reserve_pergb": AsyncMock(),
             "topup_pergb": AsyncMock(),
             "get_traffic": AsyncMock(),
+            "generate_ports": AsyncMock(),
         },
     )()
     monkeypatch.setattr(pergb, "_service", mock)
@@ -65,12 +68,9 @@ def test_reserve_pergb_happy_path(_no_auth: None, _mock_service) -> None:
         success=True,
         order_ref="ord_abc",
         expires_at=expires,
-        port=32001,
-        host="2001:db8::1",
-        login="u",
-        password="p",
         bytes_quota=10 * 1024 * 1024 * 1024,
         price_amount=Decimal("9.50"),
+        traffic_account_id=42,
     )
 
     client = TestClient(app)
@@ -82,9 +82,12 @@ def test_reserve_pergb_happy_path(_no_auth: None, _mock_service) -> None:
     assert r.status_code == 200
     body = r.json()
     assert body["order_ref"] == "ord_abc"
-    assert body["port"] == 32001
+    assert body["traffic_account_id"] == 42
     assert body["bytes_quota"] == 10 * 1024 * 1024 * 1024
     assert body["price_amount"] == "9.50"  # Decimal serialized as string per § 6.10
+    # Wave PERGB-RFCT-A: reserve no longer returns port credentials.
+    assert "port" not in body
+    assert "host" not in body
 
 
 def test_reserve_pergb_invalid_tier(_no_auth: None, _mock_service) -> None:
@@ -132,19 +135,10 @@ def test_reserve_pergb_sku_not_found(_no_auth: None, _mock_service) -> None:
     assert r.json()["error"] == "sku_not_found"
 
 
-def test_reserve_pergb_insufficient_inventory(_no_auth: None, _mock_service) -> None:
-    from orchestrator.main import app
-
-    _mock_service.reserve_pergb.return_value = ReservePergbResult(
-        success=False, error="insufficient_inventory"
-    )
-    client = TestClient(app)
-    r = client.post(
-        "/v1/orders/reserve_pergb",
-        json={"user_id": 1, "sku_id": 5, "gb_amount": 10},
-    )
-    assert r.status_code == 409
-    assert r.json()["error"] == "insufficient_inventory"
+# Wave PERGB-RFCT-A: reserve_pergb no longer touches the inventory pool — port
+# allocation moved to /v1/pergb/{ref}/generate_ports. The "insufficient_inventory"
+# error path was removed at the source; pool exhaustion now surfaces as
+# "insufficient_pool" on generate_ports (covered below).
 
 
 def test_reserve_pergb_passes_idempotency_key_through(_no_auth: None, _mock_service) -> None:
@@ -155,12 +149,9 @@ def test_reserve_pergb_passes_idempotency_key_through(_no_auth: None, _mock_serv
         success=True,
         order_ref="ord_xxx",
         expires_at=expires,
-        port=32001,
-        host="h",
-        login="u",
-        password="p",
         bytes_quota=1024,
         price_amount=Decimal("1.00"),
+        traffic_account_id=7,
     )
     client = TestClient(app)
     client.post(
@@ -169,6 +160,112 @@ def test_reserve_pergb_passes_idempotency_key_through(_no_auth: None, _mock_serv
     )
     _mock_service.reserve_pergb.assert_awaited_once_with(
         user_id=1, sku_id=5, gb_amount=1, idempotency_key="K1"
+    )
+
+
+# ===== generate_ports =====
+
+
+def test_generate_ports_happy_path(_no_auth: None, _mock_service) -> None:
+    from orchestrator.main import app
+
+    _mock_service.generate_ports.return_value = GeneratePortsResult(
+        success=True,
+        order_ref="ord_abc",
+        traffic_account_id=42,
+        ports=[
+            GeneratedPortRow(port=32001, host="2001:db8::1", login="u1", password="p1", geo_code="us"),
+            GeneratedPortRow(port=32002, host="2001:db8::1", login="u2", password="p2", geo_code="us"),
+        ],
+        total_ports_for_client=2,
+    )
+
+    client = TestClient(app)
+    r = client.post(
+        "/v1/pergb/ord_abc/generate_ports",
+        json={"count": 2, "geo_code": "us", "idempotency_key": "k-generate-1"},
+    )
+
+    assert r.status_code == 200
+    body = r.json()
+    assert body["order_ref"] == "ord_abc"
+    assert body["traffic_account_id"] == 42
+    assert body["total_ports_for_client"] == 2
+    assert len(body["ports"]) == 2
+    assert body["ports"][0]["port"] == 32001
+    assert body["ports"][0]["login"] == "u1"
+
+
+def test_generate_ports_order_not_found(_no_auth: None, _mock_service) -> None:
+    from orchestrator.main import app
+
+    _mock_service.generate_ports.return_value = GeneratePortsResult(success=False, error="order_not_found")
+    client = TestClient(app)
+    r = client.post(
+        "/v1/pergb/ord_missing/generate_ports",
+        json={"count": 1, "geo_code": "us", "idempotency_key": "k-generate-2"},
+    )
+    assert r.status_code == 404
+    assert r.json()["error"] == "order_not_found"
+
+
+def test_generate_ports_account_not_active(_no_auth: None, _mock_service) -> None:
+    from orchestrator.main import app
+
+    _mock_service.generate_ports.return_value = GeneratePortsResult(
+        success=False, error="account_not_active", current_status="depleted"
+    )
+    client = TestClient(app)
+    r = client.post(
+        "/v1/pergb/ord_abc/generate_ports",
+        json={"count": 1, "geo_code": "us", "idempotency_key": "k-generate-3"},
+    )
+    assert r.status_code == 409
+    body = r.json()
+    assert body["error"] == "account_not_active"
+    assert body["current_status"] == "depleted"
+
+
+def test_generate_ports_insufficient_pool(_no_auth: None, _mock_service) -> None:
+    from orchestrator.main import app
+
+    _mock_service.generate_ports.return_value = GeneratePortsResult(
+        success=False,
+        error="insufficient_pool",
+        requested=10,
+        available=3,
+        geo_code="us",
+    )
+    client = TestClient(app)
+    r = client.post(
+        "/v1/pergb/ord_abc/generate_ports",
+        json={"count": 10, "geo_code": "us", "idempotency_key": "k-generate-4"},
+    )
+    assert r.status_code == 409
+    body = r.json()
+    assert body["error"] == "insufficient_pool"
+    assert body["available"] == 3
+    assert body["requested"] == 10
+    assert body["geo_code"] == "us"
+
+
+def test_generate_ports_passes_idempotency_key_through(_no_auth: None, _mock_service) -> None:
+    from orchestrator.main import app
+
+    _mock_service.generate_ports.return_value = GeneratePortsResult(
+        success=True,
+        order_ref="ord_abc",
+        traffic_account_id=42,
+        ports=[],
+        total_ports_for_client=0,
+    )
+    client = TestClient(app)
+    client.post(
+        "/v1/pergb/ord_abc/generate_ports",
+        json={"count": 1, "geo_code": "us", "idempotency_key": "k-pass-through"},
+    )
+    _mock_service.generate_ports.assert_awaited_once_with(
+        order_ref="ord_abc", count=1, geo_code="us", idempotency_key="k-pass-through"
     )
 
 

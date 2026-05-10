@@ -187,19 +187,30 @@ def test_watchdog_run_once_no_op_when_clean(_cfg: None) -> None:
 # === Wave D safety-net retries ===
 
 
-def _pending_block_row(*, account_id: int, port: int = 32001) -> dict[str, Any]:
+def _account_id_row(*, account_id: int) -> dict[str, Any]:
+    """Wave PERGB-RFCT-A: phase 5.4/5.5 SELECT only returns account_id;
+    the per-port join happens in _fetch_account_ports."""
+    return {"account_id": account_id}
+
+
+def _linked_port_row(
+    *,
+    port: int = 32001,
+    node_id: str = "node-x",
+    node_url: str = "http://node-x:8085",
+    api_key: str | None = "k1",
+) -> dict[str, Any]:
     return {
-        "account_id": account_id,
         "port": port,
-        "node_url": "http://node-x:8085",
-        "node_api_key": "k1",
-        "node_id": "node-x",
+        "node_id": node_id,
+        "node_url": node_url,
+        "node_api_key": api_key,
     }
 
 
 def test_watchdog_retries_pending_blocks_success(_cfg: None) -> None:
-    """Phase 5.4: depleted+!node_blocked → post_disable retried;
-    on success node_blocked flips TRUE."""
+    """Phase 5.4: depleted+!node_blocked → post_disable retried across every
+    linked port; on full success node_blocked flips TRUE."""
     from orchestrator.watchdog import WatchdogService
 
     fake_connect, cursors = _make_phased_connect(
@@ -210,13 +221,14 @@ def test_watchdog_retries_pending_blocks_success(_cfg: None) -> None:
         [[]],  # 5.1 pergb expired
         [[]],  # 5.2 pergb archived
         [[]],  # 5.3 samples pruned
-        [[_pending_block_row(account_id=42)]],  # 5.4 one pending block
+        # 5.4: 1st fetchall = account ids; 2nd fetchall = linked ports for that account.
+        [[_account_id_row(account_id=42)], [_linked_port_row(port=32001)]],
         [[]],  # 5.5 unblocks
     )
 
     disable_calls: list[tuple[Any, ...]] = []
 
-    def fake_post_disable(url, api_key, port, timeout_sec=10):
+    def fake_post_disable(url, api_key, port):
         disable_calls.append((url, api_key, port))
         return {"action": "killed"}
 
@@ -230,9 +242,11 @@ def test_watchdog_retries_pending_blocks_success(_cfg: None) -> None:
     assert counters["pergb_block_retries_succeeded"] == 1
     assert disable_calls == [("http://node-x:8085", "k1", 32001)]
 
-    # Phase 5.4 cursor saw: 1 SELECT + 1 UPDATE (success branch with node_blocked=true).
+    # Phase 5.4 cursor saw: account-ids SELECT + linked-ports SELECT + UPDATE
+    # (success branch with node_blocked=true).
     sql_calls = [c.args[0] for c in cursors[7].execute.call_args_list]
     assert any("status = 'depleted'" in s and "node_blocked = false" in s for s in sql_calls)
+    assert any("from proxy_inventory" in s and "traffic_account_id = %s" in s for s in sql_calls)
     assert any("node_blocked = true" in s and "where id = %s" in s for s in sql_calls)
 
 
@@ -250,7 +264,8 @@ def test_watchdog_retries_pending_blocks_failure_keeps_flag_false(_cfg: None) ->
         [[]],
         [[]],
         [[]],
-        [[_pending_block_row(account_id=42)]],  # 5.4
+        # 5.4: account ids + linked ports
+        [[_account_id_row(account_id=42)], [_linked_port_row(port=32001)]],
         [[]],  # 5.5
     )
 
@@ -284,12 +299,13 @@ def test_watchdog_retries_pending_unblocks_success(_cfg: None) -> None:
         [[]],
         [[]],
         [[]],  # 5.4 nothing
-        [[_pending_block_row(account_id=99, port=32099)]],  # 5.5 one pending unblock
+        # 5.5: account ids + linked ports
+        [[_account_id_row(account_id=99)], [_linked_port_row(port=32099)]],
     )
 
     enable_calls: list[tuple[Any, ...]] = []
 
-    def fake_post_enable(url, api_key, port, timeout_sec=10):
+    def fake_post_enable(url, api_key, port):
         enable_calls.append((url, api_key, port))
         return {"action": "started"}
 
@@ -305,6 +321,7 @@ def test_watchdog_retries_pending_unblocks_success(_cfg: None) -> None:
 
     sql_calls = [c.args[0] for c in cursors[8].execute.call_args_list]
     assert any("status = 'active'" in s and "node_blocked = true" in s for s in sql_calls)
+    assert any("from proxy_inventory" in s and "traffic_account_id = %s" in s for s in sql_calls)
     assert any("node_blocked = false" in s and "where id = %s" in s for s in sql_calls)
 
 

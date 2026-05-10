@@ -82,6 +82,9 @@ _PERGB_SKU_METADATA = {
 
 
 def test_reserve_pergb_happy_path() -> None:
+    """Wave PERGB-RFCT-A: reserve_pergb no longer claims inventory. The
+    create-account transaction inserts the order then the traffic_account
+    (with inventory_id NULL). Ports come later via generate_ports."""
     sku_cursor = _make_cursor(
         fetchone_queue=[
             {
@@ -96,17 +99,10 @@ def test_reserve_pergb_happy_path() -> None:
     )
     create_cursor = _make_cursor(
         fetchone_queue=[
-            # 1. Inventory claim returning row
-            {
-                "id": 100,
-                "node_id": "node-x",
-                "port": 32001,
-                "host": "2001:db8::1",
-                "login": "u",
-                "password": "p",
-            },
-            # 2. Order INSERT RETURNING id
+            # 1. Order INSERT RETURNING id
             {"id": 999},
+            # 2. traffic_accounts INSERT RETURNING id
+            {"id": 42},
         ],
     )
     fake_connect = _make_phased_connect(_make_conn(sku_cursor), _make_conn(create_cursor))
@@ -126,7 +122,7 @@ def test_reserve_pergb_happy_path() -> None:
         )
 
     assert result.success is True
-    assert result.port == 32001
+    assert result.traffic_account_id == 42
     assert result.bytes_quota == 10 * 1024 * 1024 * 1024
     assert result.price_amount == Decimal("9.50000000")
     # Idempotency cache write
@@ -138,8 +134,8 @@ def test_reserve_pergb_idem_cache_hit_skips_db() -> None:
     cached_payload = (
         '{"success": true, "order_ref": "ord_cached", '
         '"expires_at": "2026-06-01T00:00:00+00:00", '
-        '"port": 32001, "host": "h", "login": "u", "password": "p", '
-        '"bytes_quota": 1024, "price_amount": "1.00"}'
+        '"bytes_quota": 1024, "price_amount": "1.00", '
+        '"traffic_account_id": 7}'
     )
     redis = _make_redis_mock(cached=cached_payload)
     connect_calls: list[str] = []
@@ -229,28 +225,62 @@ def test_reserve_pergb_invalid_tier_returns_available_list() -> None:
     assert result.available_tiers == [1, 5, 10]
 
 
-def test_reserve_pergb_insufficient_inventory_returns_error() -> None:
-    sku_cursor = _make_cursor(
+# Wave PERGB-RFCT-A: insufficient_inventory error path was dropped from
+# reserve_pergb (it no longer touches the pool). Pool exhaustion now surfaces
+# as ``insufficient_pool`` from generate_ports — covered in test_generate_ports
+# (endpoint level) and exercised in PergbService through
+# _sync_count_available_pool_ports.
+
+
+def test_generate_ports_insufficient_pool_returns_available_count() -> None:
+    """Pool starves below requested count → rolls back, probes available, returns
+    insufficient_pool with available + requested + geo_code populated."""
+    parent_cursor = _make_cursor(
         fetchone_queue=[
             {
-                "id": 5,
-                "product_kind": "datacenter_pergb",
-                "metadata": _PERGB_SKU_METADATA,
-                "duration_days": 30,
-                "is_active": True,
+                "account_id": 7,
+                "account_status": "active",
             }
         ]
     )
-    create_cursor = _make_cursor(fetchone_queue=[None])  # inventory claim returns no row
-    fake_connect = _make_phased_connect(_make_conn(sku_cursor), _make_conn(create_cursor))
-
+    # Atomic alloc: cur.fetchall returns fewer rows than requested → rollback,
+    # then None is returned.
+    alloc_cursor = _make_cursor(
+        fetchall_queue=[
+            [
+                {
+                    "id": 100,
+                    "node_id": "node-x",
+                    "port": 32001,
+                    "host": "h",
+                    "login": "u",
+                    "password": "p",
+                    "geo_code": "us",
+                },
+            ]
+        ],
+    )
+    count_cursor = _make_cursor(fetchone_queue=[{"c": 1}])
+    fake_connect = _make_phased_connect(
+        _make_conn(parent_cursor),
+        _make_conn(alloc_cursor),
+        _make_conn(count_cursor),
+    )
     with (
         patch("orchestrator.pergb_service.connect", new=fake_connect),
         patch("orchestrator.pergb_service.get_redis", new=AsyncMock(return_value=_make_redis_mock())),
     ):
-        result = _run(PergbService().reserve_pergb(user_id=1, sku_id=5, gb_amount=10))
+        result = _run(
+            PergbService().generate_ports(
+                order_ref="ord_abc", count=3, geo_code="us", idempotency_key="k-pool-1"
+            )
+        )
 
-    assert result.error == "insufficient_inventory"
+    assert result.success is False
+    assert result.error == "insufficient_pool"
+    assert result.requested == 3
+    assert result.available == 1
+    assert result.geo_code == "us"
 
 
 # ===== topup_pergb =====
@@ -445,19 +475,35 @@ def test_topup_pergb_reactivation_calls_post_enable() -> None:
             },
         ]
     )
-    # Fourth phase: _best_effort_post_enable now records the unblock attempt
-    # (node_blocked=FALSE on success, last_unblock_attempt_at always stamped).
+    # Wave PERGB-RFCT-A: reactivation now fan-outs across every port linked to
+    # the account. _best_effort_post_enable_all does:
+    #   1) _sync_get_linked_ports (fetchall returns one row per port)
+    #   2) records the unblock attempt (FALSE on full ack, no clear on partial)
+    linked_ports_cursor = _make_cursor(
+        fetchall_queue=[
+            [
+                {
+                    "inventory_id": 100,
+                    "node_id": "node-x",
+                    "port": 32001,
+                    "node_url": "http://node-x:8085",
+                    "node_api_key": "k1",
+                }
+            ]
+        ]
+    )
     unblock_record = _make_cursor()
     fake_connect = _make_phased_connect(
         _make_conn(parent_cursor),
         _make_conn(sku_cursor),
         _make_conn(apply_cursor),
+        _make_conn(linked_ports_cursor),
         _make_conn(unblock_record),
     )
 
     enable_calls: list[tuple[Any, ...]] = []
 
-    def fake_post_enable(url, api_key, port, timeout_sec=10):
+    def fake_post_enable(url, api_key, port):
         enable_calls.append((url, api_key, port))
         return {"action": "started"}
 
@@ -526,15 +572,29 @@ def test_topup_pergb_reactivation_post_enable_failure_keeps_node_blocked() -> No
             },
         ]
     )
+    linked_ports_cursor = _make_cursor(
+        fetchall_queue=[
+            [
+                {
+                    "inventory_id": 100,
+                    "node_id": "node-x",
+                    "port": 32001,
+                    "node_url": "http://node-x:8085",
+                    "node_api_key": "k1",
+                }
+            ]
+        ]
+    )
     unblock_record = _make_cursor()
     fake_connect = _make_phased_connect(
         _make_conn(parent_cursor),
         _make_conn(sku_cursor),
         _make_conn(apply_cursor),
+        _make_conn(linked_ports_cursor),
         _make_conn(unblock_record),
     )
 
-    def boom_post_enable(url, api_key, port, timeout_sec=10):
+    def boom_post_enable(url, api_key, port):
         raise NodeAgentError("enable_failed", status_code=502)
 
     with (

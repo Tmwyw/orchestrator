@@ -119,6 +119,7 @@ class TrafficResult:
     node_id: str | None = None
     port: int | None = None
     over_usage_bytes: int = 0
+    port_count: int = 0
     error: str | None = None
     detail: str | None = None
 
@@ -455,6 +456,7 @@ class PergbService:
             node_id=(str(snapshot["node_id"]) if snapshot.get("node_id") else None),
             port=(int(snapshot["port"]) if snapshot.get("port") is not None else None),
             over_usage_bytes=over_usage,
+            port_count=int(snapshot.get("port_count") or 0),
         )
 
     # ===========================================================
