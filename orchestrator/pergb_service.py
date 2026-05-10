@@ -576,31 +576,41 @@ class PergbService:
         LOCKED) is race-free across concurrent generate_ports calls.
         """
         reservation_key = f"resv_pergb_gen_{uuid.uuid4().hex}"
-        # NOTE: proxy_inventory's country column is named ``geo_country`` per
-        # the canonical schema (see allocator + delivery + admin). The
-        # ``geo_code`` shape used everywhere else in the API (skus.geo_code,
-        # nodes.geo, etc.) is *the same value* — we alias it on the SELECT
-        # so callers/tests keep their existing ``row["geo_code"]`` reads.
+        # NOTE: ``proxy_inventory.geo_country`` is nullable + stores full
+        # country names ('Japan', 'India'), not the ISO codes the API/bot
+        # use. The canonical link is via ``proxy_inventory.sku_id`` →
+        # ``skus.geo_code`` (same path ``list_active_skus`` takes). We
+        # filter through that JOIN so the pergb pool view matches the
+        # IPv6 catalog the user sees.
         with connect() as conn, conn.cursor() as cur:
             cur.execute(
                 """
                 with selected as (
-                    select id from proxy_inventory
-                    where status = 'available' and geo_country = %s
-                    order by id
+                    select pi.id
+                    from proxy_inventory pi
+                    join skus s on s.id = pi.sku_id
+                    where pi.status = 'available'
+                      and s.is_active = true
+                      and s.product_kind = 'ipv6'
+                      and s.geo_code = %s
+                    order by pi.id
                     for update skip locked
                     limit %s
+                ), updated as (
+                    update proxy_inventory
+                    set status = 'allocated_pergb',
+                        traffic_account_id = %s,
+                        reservation_key = %s,
+                        reserved_at = now(),
+                        sold_at = now(),
+                        updated_at = now()
+                    where id in (select id from selected)
+                    returning id, node_id, port, host, login, password, sku_id
                 )
-                update proxy_inventory
-                set status = 'allocated_pergb',
-                    traffic_account_id = %s,
-                    reservation_key = %s,
-                    reserved_at = now(),
-                    sold_at = now(),
-                    updated_at = now()
-                where id in (select id from selected)
-                returning id, node_id, port, host, login, password,
-                          geo_country as geo_code
+                select u.id, u.node_id, u.port, u.host, u.login, u.password,
+                       s.geo_code
+                from updated u
+                join skus s on s.id = u.sku_id
                 """,
                 (geo_code, count, traffic_account_id, reservation_key),
             )
@@ -615,8 +625,13 @@ class PergbService:
         with connect() as conn, conn.cursor() as cur:
             cur.execute(
                 """
-                select count(*) as c from proxy_inventory
-                 where status = 'available' and geo_country = %s
+                select count(*) as c
+                from proxy_inventory pi
+                join skus s on s.id = pi.sku_id
+                where pi.status = 'available'
+                  and s.is_active = true
+                  and s.product_kind = 'ipv6'
+                  and s.geo_code = %s
                 """,
                 (geo_code,),
             )
