@@ -31,6 +31,24 @@ logger = get_logger("netrun-orchestrator-allocator")
 _IDEM_CACHE_TTL_SEC = 24 * 60 * 60
 
 
+def _sync_next_order_ref() -> str:
+    """Pull the next value from `order_ref_seq` and format as `order_<N>`.
+
+    Sequence is created by migration 029. Pre-INSERT generation: each call
+    consumes one sequence value, so failed reservations create gaps — fine
+    for a user-facing display id.
+    """
+    with connect() as conn, conn.cursor() as cur:
+        cur.execute("SELECT nextval('order_ref_seq')")
+        row = cur.fetchone()
+        assert row is not None
+        # psycopg can return dict-rows (RealDictRow) or tuple-rows depending
+        # on configured row_factory. Cover both shapes — `nextval` is the
+        # single column either way.
+        value = row[0] if not isinstance(row, dict) else next(iter(row.values()))
+        return f"order_{int(value)}"
+
+
 @dataclass(slots=True)
 class ReserveResult:
     success: bool
@@ -151,7 +169,6 @@ class AllocatorService:
         n = len(bindings)
         quotas = equal_share(quantity, [10**9] * n)
         reservation_key = f"resv_{uuid.uuid4().hex}"
-        order_ref = "ord_" + uuid.uuid4().hex[:12]
         ttl = max(
             cfg.reservation_min_ttl_sec,
             min(reservation_ttl_sec, cfg.reservation_max_ttl_sec),
@@ -178,6 +195,9 @@ class AllocatorService:
                 available_now=available_now,
             )
 
+        # Pull the human-friendly `order_<N>` AFTER the stock check so failed
+        # reservations don't burn sequence values for nothing.
+        order_ref = await asyncio.to_thread(_sync_next_order_ref)
         expires_at = datetime.now(timezone.utc) + timedelta(seconds=ttl)
         await asyncio.to_thread(
             self._sync_insert_order,

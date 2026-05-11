@@ -99,6 +99,8 @@ def test_reserve_pergb_happy_path() -> None:
     )
     create_cursor = _make_cursor(
         fetchone_queue=[
+            # 0. SELECT nextval('order_ref_seq') — yields order_ref `order_<N>`
+            {"nextval": 7},
             # 1. Order INSERT RETURNING id
             {"id": 999},
             # 2. traffic_accounts INSERT RETURNING id
@@ -122,6 +124,8 @@ def test_reserve_pergb_happy_path() -> None:
         )
 
     assert result.success is True
+    # Wave PERGB-INFINITE: sequential `order_<N>` shape (migration 029).
+    assert result.order_ref == "order_7"
     assert result.traffic_account_id == 42
     assert result.bytes_quota == 10 * 1024 * 1024 * 1024
     assert result.price_amount == Decimal("9.50000000")
@@ -319,6 +323,9 @@ def test_topup_pergb_happy_path() -> None:
     )
     apply_cursor = _make_cursor(
         fetchone_queue=[
+            # Wave PERGB-INFINITE: SELECT nextval('order_ref_seq') for new
+            # top-up order_ref → `order_<N>`.
+            {"nextval": 21},
             {"c": 0},  # topup count
             {"id": 1234},  # new order INSERT RETURNING id
             {
@@ -464,6 +471,8 @@ def test_topup_pergb_reactivation_calls_post_enable() -> None:
     )
     apply_cursor = _make_cursor(
         fetchone_queue=[
+            # Wave PERGB-INFINITE: SELECT nextval('order_ref_seq').
+            {"nextval": 22},
             {"c": 0},
             {"id": 1234},
             {
@@ -561,6 +570,8 @@ def test_topup_pergb_reactivation_post_enable_failure_keeps_node_blocked() -> No
     )
     apply_cursor = _make_cursor(
         fetchone_queue=[
+            # Wave PERGB-INFINITE: SELECT nextval('order_ref_seq').
+            {"nextval": 23},
             {"c": 0},
             {"id": 1234},
             {
@@ -649,18 +660,20 @@ def test_topup_pergb_idempotency_unique_violation_path_b() -> None:
         ]
     )
 
-    # Simulate UniqueViolation on the orders INSERT (the 2nd execute call —
-    # 1st is the topup count SELECT). Build an execute side-effect:
+    # Wave PERGB-INFINITE: 1st execute is now SELECT nextval('order_ref_seq'),
+    # 2nd is the topup-count SELECT, 3rd is the orders INSERT (the one that
+    # raises UniqueViolation here).
     execute_calls = {"n": 0}
 
     def execute_side_effect(*args, **kwargs):
         execute_calls["n"] += 1
-        if execute_calls["n"] == 2:
+        if execute_calls["n"] == 3:
             raise psycopg.errors.UniqueViolation("dup")
         return
 
     apply_cursor = _make_cursor(
         fetchone_queue=[
+            {"nextval": 24},  # SELECT nextval('order_ref_seq')
             {"c": 0},  # topup count SELECT
         ],
         execute_side_effect=execute_side_effect,

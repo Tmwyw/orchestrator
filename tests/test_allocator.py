@@ -132,15 +132,18 @@ async def test_reserve_success_writes_redis() -> None:
     with (
         patch("orchestrator.allocator.get_config", return_value=_make_config()),
         patch("orchestrator.allocator.get_redis", new=AsyncMock(return_value=fake_redis)),
+        patch("orchestrator.allocator._sync_next_order_ref", return_value="order_42"),
     ):
         result = await service.reserve(user_id=42, sku_id=1, quantity=1000, reservation_ttl_sec=300)
 
     assert result.success is True
-    assert result.order_ref is not None and result.order_ref.startswith("ord_")
+    # Wave PERGB-INFINITE: new sequential `order_<N>` shape (migration 029)
+    # replaces the legacy `ord_<hex>` prefix.
+    assert result.order_ref == "order_42"
     assert result.proxies_count == 1000
     fake_redis.set.assert_called_once()
     set_args, set_kwargs = fake_redis.set.call_args
-    assert set_args[0].startswith("reservation:ord_")
+    assert set_args[0] == "reservation:order_42"
     assert set_kwargs.get("ex") == 300
 
 

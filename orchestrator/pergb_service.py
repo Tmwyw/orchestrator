@@ -494,8 +494,16 @@ class PergbService:
         proxy_inventory.traffic_account_id is the new source of truth for the
         account ↔ ports relationship.
         """
-        order_ref = "ord_" + uuid.uuid4().hex[:12]
         with connect() as conn, conn.cursor() as cur:
+            # Wave PERGB-INFINITE: pull a clean sequential id from
+            # `order_ref_seq` (migration 029) instead of the legacy
+            # `ord_<hex>` shape. Generation lives inside the same TX so
+            # the sequence value commits atomically with the order row.
+            cur.execute("SELECT nextval('order_ref_seq')")
+            _seq_row = cur.fetchone()
+            assert _seq_row is not None
+            _seq_value = _seq_row[0] if not isinstance(_seq_row, dict) else next(iter(_seq_row.values()))
+            order_ref = f"order_{int(_seq_value)}"
             # 1. Insert order (auto-committed for pergb — see module doc)
             metadata = {
                 "chosen_tier_gb": gb_amount,
@@ -753,9 +761,15 @@ class PergbService:
         Handles UNIQUE-violation on idempotency_key per design § 6.3 D6.4
         Path B (return existing).
         """
-        new_order_ref = "ord_topup_" + uuid.uuid4().hex[:10]
-        # Compute next topup_sequence by counting existing top-ups for the parent.
+        # Wave PERGB-INFINITE: top-up orders share the same `order_<N>`
+        # sequence as fresh reservations (migration 029). The `topup_sequence`
+        # in metadata still tracks per-parent ordering for billing audits.
         with connect() as conn, conn.cursor() as cur:
+            cur.execute("SELECT nextval('order_ref_seq')")
+            _seq_row = cur.fetchone()
+            assert _seq_row is not None
+            _seq_value = _seq_row[0] if not isinstance(_seq_row, dict) else next(iter(_seq_row.values()))
+            new_order_ref = f"order_{int(_seq_value)}"
             cur.execute(
                 """
                 select count(*) as c
