@@ -7,6 +7,7 @@ import contextlib
 import ipaddress
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
@@ -16,6 +17,51 @@ from orchestrator.config import get_config
 from orchestrator.logging_setup import get_logger
 
 logger = get_logger("netrun-orchestrator-validation")
+
+# === MaxMind GeoLite2 offline reader ===
+# Replaces ipapi.co which kept hitting HTTP 429 (rate limit) on the free tier
+# at ~1000 IPv6 lookups/day — causing ~50% of generated proxies to be marked
+# `invalid` by validator even though they were healthy. GeoLite2-Country.mmdb
+# is a ~10 MB offline lookup table refreshed weekly by `scripts/setup_geoip.sh`
+# (MaxMind requires a free license key, see ops doc).
+#
+# Reader is created lazily on first use + cached in module state. geoip2's
+# Reader is sync (microsecond lookups), so we wrap it in asyncio.to_thread
+# to avoid blocking the event loop on the (rare) page-fault path.
+_GEOIP_READER: Any = None  # type: ignore[var-annotated] — geoip2.database.Reader|None
+
+
+def _get_geoip_reader() -> Any:
+    """Open the MMDB file once and cache. Returns None if geoip2 not installed
+    or mmdb path missing — caller falls back to httpx lookup (legacy path)."""
+    global _GEOIP_READER
+    if _GEOIP_READER is not None:
+        return _GEOIP_READER
+
+    cfg = get_config()
+    db_path = getattr(cfg, "geolite2_db_path", "")
+    if not db_path:
+        return None
+    path = Path(db_path)
+    if not path.is_file():
+        logger.warning("geolite2_db_missing", path=str(path))
+        return None
+
+    try:
+        import geoip2.database  # type: ignore[import-untyped]
+    except ImportError:
+        logger.warning("geoip2_not_installed", hint="pip install 'geoip2>=4.8'")
+        return None
+
+    try:
+        reader = geoip2.database.Reader(str(path))
+    except Exception as exc:
+        logger.warning("geolite2_open_failed", path=str(path), error=str(exc))
+        return None
+
+    _GEOIP_READER = reader
+    logger.info("geolite2_reader_ready", path=str(path))
+    return reader
 
 
 @dataclass(slots=True)
@@ -223,6 +269,29 @@ class ProxyValidationService:
                     await writer.wait_closed()
 
     async def _lookup_geo(self, ip_value: str) -> tuple[str | None, str | None]:
+        """Look up geo via MaxMind GeoLite2 offline DB (no rate-limit, ~1µs/query).
+        Falls back to ipapi.co only if mmdb unavailable AND legacy fallback enabled
+        — but the fallback runs into 429 quickly, so it's mostly a safety net.
+
+        Returns ISO 2-letter country code (e.g. 'DE', 'US') as the country
+        field, NOT the long name — orchestrator + bot logic compares against
+        SKU.geo_code which is ISO-2.
+        """
+        reader = _get_geoip_reader()
+        if reader is not None:
+            try:
+                # geoip2.Reader is sync; offload to thread (microsecond lookup
+                # but page-fault on cold DB can take 10s of ms).
+                response = await asyncio.to_thread(reader.country, ip_value)
+                country = (response.country.iso_code or "").strip().upper() or None
+                # GeoLite2-Country has no city — return None for city.
+                return country, None
+            except Exception as exc:
+                # AddressNotFoundError / ValueError on bogus IPs — return None
+                logger.debug("geolite2_lookup_failed", ip=ip_value, error=str(exc))
+                return None, None
+
+        # Legacy fallback (only if mmdb absent / geoip2 not installed)
         timeout = httpx.Timeout(self.geo_lookup_timeout_sec)
         try:
             async with httpx.AsyncClient(timeout=timeout) as client:
@@ -232,7 +301,7 @@ class ProxyValidationService:
                 data = response.json()
                 if not isinstance(data, dict):
                     return None, None
-                country = str(data.get("country_name") or data.get("country") or "").strip() or None
+                country = str(data.get("country") or "").strip().upper() or None
                 city = str(data.get("city") or "").strip() or None
                 return country, city
         except Exception:
