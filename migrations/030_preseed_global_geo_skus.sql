@@ -20,6 +20,7 @@ INSERT INTO skus (
     code,
     product_kind,
     geo_code,
+    protocol,
     duration_days,
     price_per_piece,
     target_stock,
@@ -27,34 +28,34 @@ INSERT INTO skus (
     is_active
 ) VALUES
     -- North America
-    ('ipv6_us', 'ipv6', 'US', 30, 0.14, 4000, 500, TRUE),
-    ('ipv6_ca', 'ipv6', 'CA', 30, 0.14, 4000, 500, TRUE),
-    ('ipv6_mx', 'ipv6', 'MX', 30, 0.14, 4000, 500, TRUE),
+    ('ipv6_us', 'ipv6', 'US', 'socks5', 30, 0.14, 4000, 500, TRUE),
+    ('ipv6_ca', 'ipv6', 'CA', 'socks5', 30, 0.14, 4000, 500, TRUE),
+    ('ipv6_mx', 'ipv6', 'MX', 'socks5', 30, 0.14, 4000, 500, TRUE),
     -- Europe
-    ('ipv6_nl', 'ipv6', 'NL', 30, 0.14, 4000, 500, TRUE),
-    ('ipv6_pl', 'ipv6', 'PL', 30, 0.14, 4000, 500, TRUE),
-    ('ipv6_de', 'ipv6', 'DE', 30, 0.14, 4000, 500, TRUE),
-    ('ipv6_fr', 'ipv6', 'FR', 30, 0.14, 4000, 500, TRUE),
-    ('ipv6_gb', 'ipv6', 'GB', 30, 0.14, 4000, 500, TRUE),
-    ('ipv6_es', 'ipv6', 'ES', 30, 0.14, 4000, 500, TRUE),
-    ('ipv6_it', 'ipv6', 'IT', 30, 0.14, 4000, 500, TRUE),
-    ('ipv6_se', 'ipv6', 'SE', 30, 0.14, 4000, 500, TRUE),
-    ('ipv6_ro', 'ipv6', 'RO', 30, 0.14, 4000, 500, TRUE),
+    ('ipv6_nl', 'ipv6', 'NL', 'socks5', 30, 0.14, 4000, 500, TRUE),
+    ('ipv6_pl', 'ipv6', 'PL', 'socks5', 30, 0.14, 4000, 500, TRUE),
+    ('ipv6_de', 'ipv6', 'DE', 'socks5', 30, 0.14, 4000, 500, TRUE),
+    ('ipv6_fr', 'ipv6', 'FR', 'socks5', 30, 0.14, 4000, 500, TRUE),
+    ('ipv6_gb', 'ipv6', 'GB', 'socks5', 30, 0.14, 4000, 500, TRUE),
+    ('ipv6_es', 'ipv6', 'ES', 'socks5', 30, 0.14, 4000, 500, TRUE),
+    ('ipv6_it', 'ipv6', 'IT', 'socks5', 30, 0.14, 4000, 500, TRUE),
+    ('ipv6_se', 'ipv6', 'SE', 'socks5', 30, 0.14, 4000, 500, TRUE),
+    ('ipv6_ro', 'ipv6', 'RO', 'socks5', 30, 0.14, 4000, 500, TRUE),
     -- Asia
-    ('ipv6_jp', 'ipv6', 'JP', 30, 0.14, 4000, 500, TRUE),
-    ('ipv6_in', 'ipv6', 'IN', 30, 0.14, 4000, 500, TRUE),
-    ('ipv6_sg', 'ipv6', 'SG', 30, 0.14, 4000, 500, TRUE),
-    ('ipv6_kr', 'ipv6', 'KR', 30, 0.14, 4000, 500, TRUE),
-    ('ipv6_il', 'ipv6', 'IL', 30, 0.14, 4000, 500, TRUE),
-    ('ipv6_ae', 'ipv6', 'AE', 30, 0.14, 4000, 500, TRUE),
-    ('ipv6_id', 'ipv6', 'ID', 30, 0.14, 4000, 500, TRUE),
+    ('ipv6_jp', 'ipv6', 'JP', 'socks5', 30, 0.14, 4000, 500, TRUE),
+    ('ipv6_in', 'ipv6', 'IN', 'socks5', 30, 0.14, 4000, 500, TRUE),
+    ('ipv6_sg', 'ipv6', 'SG', 'socks5', 30, 0.14, 4000, 500, TRUE),
+    ('ipv6_kr', 'ipv6', 'KR', 'socks5', 30, 0.14, 4000, 500, TRUE),
+    ('ipv6_il', 'ipv6', 'IL', 'socks5', 30, 0.14, 4000, 500, TRUE),
+    ('ipv6_ae', 'ipv6', 'AE', 'socks5', 30, 0.14, 4000, 500, TRUE),
+    ('ipv6_id', 'ipv6', 'ID', 'socks5', 30, 0.14, 4000, 500, TRUE),
     -- Oceania
-    ('ipv6_au', 'ipv6', 'AU', 30, 0.14, 4000, 500, TRUE),
+    ('ipv6_au', 'ipv6', 'AU', 'socks5', 30, 0.14, 4000, 500, TRUE),
     -- South America
-    ('ipv6_br', 'ipv6', 'BR', 30, 0.14, 4000, 500, TRUE),
-    ('ipv6_cl', 'ipv6', 'CL', 30, 0.14, 4000, 500, TRUE),
+    ('ipv6_br', 'ipv6', 'BR', 'socks5', 30, 0.14, 4000, 500, TRUE),
+    ('ipv6_cl', 'ipv6', 'CL', 'socks5', 30, 0.14, 4000, 500, TRUE),
     -- Africa
-    ('ipv6_za', 'ipv6', 'ZA', 30, 0.14, 4000, 500, TRUE)
+    ('ipv6_za', 'ipv6', 'ZA', 'socks5', 30, 0.14, 4000, 500, TRUE)
 ON CONFLICT (code) DO NOTHING;
 
 -- Sanity readout — count active SKUs by region group after seed.
