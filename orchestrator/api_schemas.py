@@ -363,7 +363,11 @@ class ReservePergbResponse(BaseModel):
 class GeneratePortsRequest(BaseModel):
     model_config = _API_MODEL_CONFIG
 
-    count: int = Field(ge=1, le=100, description="Ports to allocate from pool")
+    # Bot's pergb_panel._GENERATE_MAX_COUNT = 500. Server-side cap must match
+    # or 422 rejects every batch > old limit. With parallelize sem=20 (inside
+    # pergb_service.generate_ports) + 300s bot HTTP timeout in place, 500
+    # ports complete in 30-50s comfortably.
+    count: int = Field(ge=1, le=500, description="Ports to allocate from pool")
     geo_code: str = Field(min_length=2, max_length=10)
     idempotency_key: str = Field(min_length=8, max_length=128)
 
