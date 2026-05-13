@@ -274,12 +274,23 @@ class PergbService:
 
         # Best-effort node-side activation. Failures are logged + watchdog
         # retries via existing safety-net (Phase 5.5) — we don't roll back.
-        for r in rows:
-            await asyncio.to_thread(
-                self._best_effort_post_enable_one,
-                node_id=str(r["node_id"]),
-                port=int(r["port"]),
-            )
+        #
+        # PERGB-PERF: parallelize per-port enable calls. Each /accounts/{port}/
+        # enable round-trip takes ~1-2 sec; with 500 ports sequentially that's
+        # 8-15 min — bot HTTP timeout (60 sec) trips long before. asyncio.gather
+        # with a 20-concurrent semaphore drains 500 ports in ~30-50 sec while
+        # not overwhelming the node-agent's serial 3proxy reload path.
+        _enable_sem = asyncio.Semaphore(20)
+
+        async def _enable_with_limit(node_id: str, port: int) -> None:
+            async with _enable_sem:
+                await asyncio.to_thread(
+                    self._best_effort_post_enable_one,
+                    node_id=node_id,
+                    port=port,
+                )
+
+        await asyncio.gather(*[_enable_with_limit(str(r["node_id"]), int(r["port"])) for r in rows])
 
         total = await asyncio.to_thread(self._sync_count_linked_ports, traffic_account_id=traffic_account_id)
 
