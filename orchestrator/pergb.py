@@ -188,6 +188,37 @@ async def topup_pergb(order_ref: str, payload: TopupPergbRequest) -> JSONRespons
     return JSONResponse(content=response.model_dump(mode="json"))
 
 
+@pergb_router.get("/v1/pergb/{order_ref}/current_ports")
+async def list_current_ports(order_ref: str) -> JSONResponse:
+    """All currently-claimed ports under a pergb order's traffic_account.
+
+    Returns the list every time the user opens «Скачать все мои прокси»
+    in the bot's pergb panel — lets them re-download the full .txt file
+    of every generation batch they've made on this order.
+
+    Response shape: { order_ref, ports: [{port, host, login, password,
+    geo_code}, ...] }. Returns 404 if order_ref is unknown / not pergb."""
+    ports = await _service.list_active_ports(order_ref=order_ref)
+    if ports is None:
+        return _error_response(status=404, error="order_not_found")
+    return JSONResponse(
+        content={
+            "order_ref": order_ref,
+            "ports": [
+                {
+                    "port": p.port,
+                    "host": p.host,
+                    "login": p.login,
+                    "password": p.password,
+                    "geo_code": p.geo_code,
+                }
+                for p in ports
+            ],
+            "total": len(ports),
+        }
+    )
+
+
 @pergb_router.get("/v1/orders/{order_ref}/traffic")
 async def get_traffic(order_ref: str) -> JSONResponse:
     result = await _service.get_traffic(parent_order_ref=order_ref)

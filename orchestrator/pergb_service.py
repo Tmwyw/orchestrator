@@ -679,6 +679,59 @@ class PergbService:
             row = cur.fetchone() or {"c": 0}
         return int(row.get("c") or 0)
 
+    # ---------- list_active_ports (re-download support) ----------
+
+    async def list_active_ports(self, *, order_ref: str) -> list[GeneratedPortRow] | None:
+        """Return ALL ports currently claimed under a pergb order's
+        traffic_account. Used by the bot's «Скачать все мои прокси»
+        button so the user can re-fetch the .txt of every generation
+        batch they've ever made on this order.
+
+        Returns None if the order_ref doesn't exist / isn't pergb /
+        has no traffic_account. Empty list if the account exists but
+        no ports have been generated yet.
+        """
+        parent = await asyncio.to_thread(self._sync_get_pergb_parent, order_ref)
+        if parent is None:
+            return None
+        traffic_account_id = int(parent["account_id"])
+
+        rows = await asyncio.to_thread(
+            self._sync_list_pergb_account_ports,
+            traffic_account_id=traffic_account_id,
+        )
+        return [
+            GeneratedPortRow(
+                port=int(r["port"]),
+                host=str(r["host"]),
+                login=str(r["login"]),
+                password=str(r["password"]),
+                geo_code=str(r["geo_code"] or ""),
+            )
+            for r in rows
+        ]
+
+    def _sync_list_pergb_account_ports(self, *, traffic_account_id: int) -> list[dict[str, Any]]:
+        """All currently-claimed proxy_inventory rows under this pergb
+        account, with host/login/password + geo for .txt rendering.
+
+        Only returns rows in 'allocated_pergb' status — excludes ports
+        that were released/expired. Sorted by port for stable output."""
+        with connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                select pi.port, pi.host, pi.login, pi.password,
+                       s.geo_code
+                from proxy_inventory pi
+                join skus s on s.id = pi.sku_id
+                where pi.traffic_account_id = %s
+                  and pi.status = 'allocated_pergb'
+                order by pi.port
+                """,
+                (traffic_account_id,),
+            )
+            return [dict(r) for r in cur.fetchall()]
+
     def _sync_get_pergb_parent(self, parent_order_ref: str) -> dict[str, Any] | None:
         """Fetch the parent reserve_pergb order + its traffic_account.
 
