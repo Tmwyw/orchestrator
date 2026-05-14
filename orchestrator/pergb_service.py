@@ -74,6 +74,21 @@ class GeneratedPortRow:
 
 
 @dataclass(slots=True)
+class PergbBatchSummary:
+    """One generation batch — created by a single `generate_ports` call.
+
+    Ports of one batch share the same `proxy_inventory.reservation_key`
+    (`resv_pergb_gen_<hex32>`); we expose only the hex32 suffix as
+    `batch_id` so it fits inside Telegram callback_data.
+    """
+
+    batch_id: str
+    geo_code: str
+    count: int
+    created_at: datetime
+
+
+@dataclass(slots=True)
 class GeneratePortsResult:
     success: bool
     order_ref: str | None = None
@@ -742,6 +757,118 @@ class PergbService:
                 (traffic_account_id,),
             )
             return [dict(r) for r in cur.fetchall()]
+
+    # ---------- list_batches (per-generation re-download) -------
+
+    async def list_batches(self, *, order_ref: str) -> list[PergbBatchSummary] | None:
+        """Group currently-claimed ports by generation batch.
+
+        Each ``generate_ports`` call stamps its rows with a unique
+        ``proxy_inventory.reservation_key`` = ``resv_pergb_gen_<hex32>``
+        and a shared ``sold_at`` timestamp — we group by that key to
+        surface one row per batch in the bot's «Ваши прокси» menu.
+
+        Returns ``None`` if the order isn't a pergb order; empty list if
+        the user has not generated any ports yet.
+        """
+        parent = await asyncio.to_thread(self._sync_get_pergb_parent, order_ref)
+        if parent is None:
+            return None
+        traffic_account_id = int(parent["account_id"])
+
+        rows = await asyncio.to_thread(
+            self._sync_list_pergb_batches,
+            traffic_account_id=traffic_account_id,
+        )
+        return [
+            PergbBatchSummary(
+                batch_id=str(r["batch_id"]),
+                geo_code=str(r["geo_code"] or ""),
+                count=int(r["count"]),
+                created_at=r["created_at"],
+            )
+            for r in rows
+        ]
+
+    async def list_batch_ports(self, *, order_ref: str, batch_id: str) -> list[GeneratedPortRow] | None:
+        """All ports of a single generation batch (by ``batch_id`` =
+        suffix of ``reservation_key`` after the ``resv_pergb_gen_``
+        prefix). Returns ``None`` if the order isn't pergb or the batch
+        doesn't belong to this order's traffic_account.
+        """
+        parent = await asyncio.to_thread(self._sync_get_pergb_parent, order_ref)
+        if parent is None:
+            return None
+        traffic_account_id = int(parent["account_id"])
+
+        rows = await asyncio.to_thread(
+            self._sync_list_pergb_batch_ports,
+            traffic_account_id=traffic_account_id,
+            batch_id=batch_id,
+        )
+        if rows is None:
+            return None
+        return [
+            GeneratedPortRow(
+                port=int(r["port"]),
+                host=str(r["host"]),
+                login=str(r["login"]),
+                password=str(r["password"]),
+                geo_code=str(r["geo_code"] or ""),
+            )
+            for r in rows
+        ]
+
+    def _sync_list_pergb_batches(self, *, traffic_account_id: int) -> list[dict[str, Any]]:
+        """One row per distinct ``reservation_key`` for this account.
+
+        We expose only the hex32 suffix (`batch_id`) — the
+        ``resv_pergb_gen_`` prefix is implementation-internal. Sorted
+        oldest-first so the UI lists batches chronologically.
+        """
+        with connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                select substring(pi.reservation_key from 'resv_pergb_gen_(.*)') as batch_id,
+                       max(s.geo_code)              as geo_code,
+                       count(*)                     as count,
+                       min(pi.sold_at)              as created_at
+                from proxy_inventory pi
+                join skus s on s.id = pi.sku_id
+                where pi.traffic_account_id = %s
+                  and pi.status = 'allocated_pergb'
+                  and pi.reservation_key like 'resv_pergb_gen_%%'
+                group by substring(pi.reservation_key from 'resv_pergb_gen_(.*)')
+                order by min(pi.sold_at) asc
+                """,
+                (traffic_account_id,),
+            )
+            return [dict(r) for r in cur.fetchall()]
+
+    def _sync_list_pergb_batch_ports(
+        self, *, traffic_account_id: int, batch_id: str
+    ) -> list[dict[str, Any]] | None:
+        """All ports of one batch (reservation_key = `resv_pergb_gen_<batch_id>`).
+
+        Returns ``None`` if no rows match — handler converts that to 404.
+        """
+        full_key = f"resv_pergb_gen_{batch_id}"
+        with connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                select pi.port, pi.host, pi.login, pi.password,
+                       s.geo_code
+                from proxy_inventory pi
+                join skus s on s.id = pi.sku_id
+                where pi.traffic_account_id = %s
+                  and pi.reservation_key = %s
+                  and pi.status = 'allocated_pergb'
+                order by pi.port
+                """,
+                (traffic_account_id, full_key),
+            )
+            rows = [dict(r) for r in cur.fetchall()]
+        return rows or None
 
     def _sync_get_pergb_parent(self, parent_order_ref: str) -> dict[str, Any] | None:
         """Fetch the parent reserve_pergb order + its traffic_account.

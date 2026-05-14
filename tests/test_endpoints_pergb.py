@@ -18,6 +18,7 @@ from fastapi.testclient import TestClient
 from orchestrator.pergb_service import (
     GeneratedPortRow,
     GeneratePortsResult,
+    PergbBatchSummary,
     ReservePergbResult,
     TopupPergbResult,
     TrafficResult,
@@ -51,6 +52,8 @@ def _mock_service(monkeypatch: pytest.MonkeyPatch):
             "topup_pergb": AsyncMock(),
             "get_traffic": AsyncMock(),
             "generate_ports": AsyncMock(),
+            "list_batches": AsyncMock(),
+            "list_batch_ports": AsyncMock(),
         },
     )()
     monkeypatch.setattr(pergb, "_service", mock)
@@ -449,3 +452,92 @@ def test_traffic_over_usage_serializes(_no_auth: None, _mock_service) -> None:
     assert body["usage_pct"] == 1.0
     assert body["over_usage_bytes"] == 100
     assert body["bytes_remaining"] == 0
+
+
+# ===== list_batches / list_batch_ports (per-generation re-download) =====
+
+
+def test_list_batches_happy_path(_no_auth: None, _mock_service) -> None:
+    from orchestrator.main import app
+
+    ts1 = datetime(2026, 5, 14, 12, 0, tzinfo=timezone.utc)
+    ts2 = datetime(2026, 5, 14, 13, 0, tzinfo=timezone.utc)
+    _mock_service.list_batches.return_value = [
+        PergbBatchSummary(batch_id="abc123", geo_code="us", count=5, created_at=ts1),
+        PergbBatchSummary(batch_id="def456", geo_code="de", count=3, created_at=ts2),
+    ]
+    client = TestClient(app)
+    r = client.get("/v1/pergb/ord_abc/batches")
+
+    assert r.status_code == 200
+    body = r.json()
+    assert body["order_ref"] == "ord_abc"
+    assert body["total"] == 2
+    assert body["batches"][0] == {
+        "batch_id": "abc123",
+        "geo_code": "us",
+        "count": 5,
+        "created_at": ts1.isoformat(),
+    }
+    assert body["batches"][1]["batch_id"] == "def456"
+    _mock_service.list_batches.assert_awaited_once_with(order_ref="ord_abc")
+
+
+def test_list_batches_empty(_no_auth: None, _mock_service) -> None:
+    from orchestrator.main import app
+
+    _mock_service.list_batches.return_value = []
+    client = TestClient(app)
+    r = client.get("/v1/pergb/ord_abc/batches")
+
+    assert r.status_code == 200
+    body = r.json()
+    assert body["batches"] == []
+    assert body["total"] == 0
+
+
+def test_list_batches_order_not_found(_no_auth: None, _mock_service) -> None:
+    from orchestrator.main import app
+
+    _mock_service.list_batches.return_value = None
+    client = TestClient(app)
+    r = client.get("/v1/pergb/ord_missing/batches")
+
+    assert r.status_code == 404
+    assert r.json()["error"] == "order_not_found"
+
+
+def test_list_batch_ports_happy_path(_no_auth: None, _mock_service) -> None:
+    from orchestrator.main import app
+
+    _mock_service.list_batch_ports.return_value = [
+        GeneratedPortRow(port=32001, host="2001:db8::1", login="u1", password="p1", geo_code="us"),
+        GeneratedPortRow(port=32002, host="2001:db8::1", login="u2", password="p2", geo_code="us"),
+    ]
+    client = TestClient(app)
+    r = client.get("/v1/pergb/ord_abc/batches/abc123/ports")
+
+    assert r.status_code == 200
+    body = r.json()
+    assert body["order_ref"] == "ord_abc"
+    assert body["batch_id"] == "abc123"
+    assert body["total"] == 2
+    assert body["ports"][0] == {
+        "port": 32001,
+        "host": "2001:db8::1",
+        "login": "u1",
+        "password": "p1",
+        "geo_code": "us",
+    }
+    _mock_service.list_batch_ports.assert_awaited_once_with(order_ref="ord_abc", batch_id="abc123")
+
+
+def test_list_batch_ports_not_found(_no_auth: None, _mock_service) -> None:
+    from orchestrator.main import app
+
+    _mock_service.list_batch_ports.return_value = None
+    client = TestClient(app)
+    r = client.get("/v1/pergb/ord_abc/batches/missing/ports")
+
+    assert r.status_code == 404
+    assert r.json()["error"] == "batch_not_found"

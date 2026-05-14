@@ -820,3 +820,120 @@ def test_get_traffic_over_usage_caps_pct_at_one() -> None:
     assert result.usage_pct == 1.0
     assert result.over_usage_bytes == 100
     assert result.bytes_remaining == 0
+
+
+# ===== list_batches / list_batch_ports =====
+
+
+def test_list_batches_groups_by_reservation_key() -> None:
+    """Happy path: 2 batches, each surfaced once with count/geo/created_at
+    from the SQL grouping. We mock the cursor result directly — the
+    GROUP BY logic itself runs in PG, so the unit test asserts that the
+    service correctly maps rows into PergbBatchSummary."""
+    ts1 = datetime(2026, 5, 14, 12, 0, tzinfo=timezone.utc)
+    ts2 = datetime(2026, 5, 14, 13, 0, tzinfo=timezone.utc)
+    parent_cursor = _make_cursor(fetchone_queue=[{"account_id": 7, "account_status": "active"}])
+    batches_cursor = _make_cursor(
+        fetchall_queue=[
+            [
+                {"batch_id": "abc123", "geo_code": "us", "count": 5, "created_at": ts1},
+                {"batch_id": "def456", "geo_code": "de", "count": 3, "created_at": ts2},
+            ]
+        ]
+    )
+    fake_connect = _make_phased_connect(
+        _make_conn(parent_cursor),
+        _make_conn(batches_cursor),
+    )
+    with patch("orchestrator.pergb_service.connect", new=fake_connect):
+        result = _run(PergbService().list_batches(order_ref="ord_abc"))
+
+    assert result is not None
+    assert len(result) == 2
+    assert result[0].batch_id == "abc123"
+    assert result[0].geo_code == "us"
+    assert result[0].count == 5
+    assert result[0].created_at == ts1
+    assert result[1].batch_id == "def456"
+
+
+def test_list_batches_returns_none_for_non_pergb_order() -> None:
+    parent_cursor = _make_cursor(fetchone_queue=[None])
+    fake_connect = _make_phased_connect(_make_conn(parent_cursor))
+    with patch("orchestrator.pergb_service.connect", new=fake_connect):
+        result = _run(PergbService().list_batches(order_ref="ord_missing"))
+
+    assert result is None
+
+
+def test_list_batches_empty_when_no_generations_yet() -> None:
+    parent_cursor = _make_cursor(fetchone_queue=[{"account_id": 7, "account_status": "active"}])
+    batches_cursor = _make_cursor(fetchall_queue=[[]])
+    fake_connect = _make_phased_connect(
+        _make_conn(parent_cursor),
+        _make_conn(batches_cursor),
+    )
+    with patch("orchestrator.pergb_service.connect", new=fake_connect):
+        result = _run(PergbService().list_batches(order_ref="ord_abc"))
+
+    assert result == []
+
+
+def test_list_batch_ports_happy_path() -> None:
+    parent_cursor = _make_cursor(fetchone_queue=[{"account_id": 7, "account_status": "active"}])
+    ports_cursor = _make_cursor(
+        fetchall_queue=[
+            [
+                {
+                    "port": 32001,
+                    "host": "2001:db8::1",
+                    "login": "u1",
+                    "password": "p1",
+                    "geo_code": "us",
+                },
+                {
+                    "port": 32002,
+                    "host": "2001:db8::1",
+                    "login": "u2",
+                    "password": "p2",
+                    "geo_code": "us",
+                },
+            ]
+        ]
+    )
+    fake_connect = _make_phased_connect(
+        _make_conn(parent_cursor),
+        _make_conn(ports_cursor),
+    )
+    with patch("orchestrator.pergb_service.connect", new=fake_connect):
+        result = _run(PergbService().list_batch_ports(order_ref="ord_abc", batch_id="abc123"))
+
+    assert result is not None
+    assert len(result) == 2
+    assert result[0].port == 32001
+    assert result[0].login == "u1"
+    assert result[1].port == 32002
+
+
+def test_list_batch_ports_returns_none_for_unknown_order() -> None:
+    parent_cursor = _make_cursor(fetchone_queue=[None])
+    fake_connect = _make_phased_connect(_make_conn(parent_cursor))
+    with patch("orchestrator.pergb_service.connect", new=fake_connect):
+        result = _run(PergbService().list_batch_ports(order_ref="ord_missing", batch_id="abc"))
+
+    assert result is None
+
+
+def test_list_batch_ports_returns_none_for_unknown_batch() -> None:
+    """Account exists but batch_id has no rows under it → service returns
+    None so the endpoint can map to 404 batch_not_found."""
+    parent_cursor = _make_cursor(fetchone_queue=[{"account_id": 7, "account_status": "active"}])
+    ports_cursor = _make_cursor(fetchall_queue=[[]])
+    fake_connect = _make_phased_connect(
+        _make_conn(parent_cursor),
+        _make_conn(ports_cursor),
+    )
+    with patch("orchestrator.pergb_service.connect", new=fake_connect):
+        result = _run(PergbService().list_batch_ports(order_ref="ord_abc", batch_id="nope"))
+
+    assert result is None

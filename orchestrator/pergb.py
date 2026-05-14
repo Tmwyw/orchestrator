@@ -219,6 +219,65 @@ async def list_current_ports(order_ref: str) -> JSONResponse:
     )
 
 
+@pergb_router.get("/v1/pergb/{order_ref}/batches")
+async def list_batches(order_ref: str) -> JSONResponse:
+    """One entry per generation batch on this pergb order.
+
+    Used by the bot's «Ваши прокси» submenu — each row corresponds to
+    a single ``generate_ports`` call (geo + count + timestamp). The
+    follow-up download click hits ``/batches/{batch_id}/ports``.
+
+    Response: ``{ order_ref, batches: [{batch_id, geo_code, count,
+    created_at}, ...], total }``. 404 when order_ref is unknown / not
+    pergb."""
+    batches = await _service.list_batches(order_ref=order_ref)
+    if batches is None:
+        return _error_response(status=404, error="order_not_found")
+    return JSONResponse(
+        content={
+            "order_ref": order_ref,
+            "batches": [
+                {
+                    "batch_id": b.batch_id,
+                    "geo_code": b.geo_code,
+                    "count": b.count,
+                    "created_at": b.created_at.isoformat(),
+                }
+                for b in batches
+            ],
+            "total": len(batches),
+        }
+    )
+
+
+@pergb_router.get("/v1/pergb/{order_ref}/batches/{batch_id}/ports")
+async def list_batch_ports(order_ref: str, batch_id: str) -> JSONResponse:
+    """All ports of a single generation batch — returned in the same
+    shape as ``/current_ports`` so the bot can reuse its .txt rendering
+    code.  404 when order_ref is unknown / not pergb, or when batch_id
+    has no ports under this order's traffic_account."""
+    ports = await _service.list_batch_ports(order_ref=order_ref, batch_id=batch_id)
+    if ports is None:
+        return _error_response(status=404, error="batch_not_found")
+    return JSONResponse(
+        content={
+            "order_ref": order_ref,
+            "batch_id": batch_id,
+            "ports": [
+                {
+                    "port": p.port,
+                    "host": p.host,
+                    "login": p.login,
+                    "password": p.password,
+                    "geo_code": p.geo_code,
+                }
+                for p in ports
+            ],
+            "total": len(ports),
+        }
+    )
+
+
 @pergb_router.get("/v1/orders/{order_ref}/traffic")
 async def get_traffic(order_ref: str) -> JSONResponse:
     result = await _service.get_traffic(parent_order_ref=order_ref)
