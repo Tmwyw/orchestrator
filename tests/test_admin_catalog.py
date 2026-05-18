@@ -531,3 +531,177 @@ def test_jsonify_diff_coerces_decimals_to_strings() -> None:
     assert result["price_per_piece"] == {"old": "2.50", "new": "3.00"}
     assert result["target_stock"] == {"old": 5000, "new": 8000}
     assert result["is_active"] == {"old": True, "new": False}
+
+
+# === GET /v1/admin/skus/{id}/bindings ===
+
+
+def _stub_binding(node_id: str = "node-us-1", geo: str = "US") -> dict[str, Any]:
+    return {
+        "node_id": node_id,
+        "node_name": node_id,
+        "node_geo": geo,
+        "weight": 100,
+        "max_batch_size": 1500,
+        "is_active": True,
+        "created_at": datetime(2026, 5, 1, tzinfo=timezone.utc),
+        "updated_at": datetime(2026, 5, 1, tzinfo=timezone.utc),
+    }
+
+
+def test_list_bindings_happy(
+    monkeypatch: pytest.MonkeyPatch, _no_auth: None
+) -> None:
+    rows = [_stub_binding("node-us-1"), _stub_binding("node-us-2")]
+    monkeypatch.setattr(
+        "orchestrator.admin_catalog._list_bindings_sync", lambda _id: rows
+    )
+    from orchestrator.main import app
+
+    client = TestClient(app)
+    r = client.get("/v1/admin/skus/1/bindings")
+    assert r.status_code == 200
+    body = r.json()
+    assert len(body["items"]) == 2
+    assert body["items"][0]["node_id"] == "node-us-1"
+
+
+def test_list_bindings_404_sku_missing(
+    monkeypatch: pytest.MonkeyPatch, _no_auth: None
+) -> None:
+    monkeypatch.setattr(
+        "orchestrator.admin_catalog._list_bindings_sync", lambda _id: "sku_not_found"
+    )
+    from orchestrator.main import app
+
+    client = TestClient(app)
+    r = client.get("/v1/admin/skus/9999/bindings")
+    assert r.status_code == 404
+
+
+# === POST /v1/admin/skus/{id}/bindings ===
+
+
+def test_add_binding_happy(monkeypatch: pytest.MonkeyPatch, _no_auth: None) -> None:
+    monkeypatch.setattr(
+        "orchestrator.admin_catalog._add_binding_sync",
+        lambda _sku, _p: _stub_binding("node-us-3"),
+    )
+    from orchestrator.main import app
+
+    client = TestClient(app)
+    r = client.post(
+        "/v1/admin/skus/1/bindings",
+        json={"node_id": "node-us-3", "weight": 100, "max_batch_size": 1500},
+    )
+    assert r.status_code == 201
+    assert r.json()["node_id"] == "node-us-3"
+
+
+@pytest.mark.parametrize(
+    "code,status",
+    [
+        ("sku_not_found", 404),
+        ("node_not_found", 404),
+        ("geo_mismatch", 409),
+        ("binding_exists", 409),
+    ],
+)
+def test_add_binding_error_codes(
+    monkeypatch: pytest.MonkeyPatch, _no_auth: None, code: str, status: int
+) -> None:
+    monkeypatch.setattr(
+        "orchestrator.admin_catalog._add_binding_sync", lambda _sku, _p: code
+    )
+    from orchestrator.main import app
+
+    client = TestClient(app)
+    r = client.post(
+        "/v1/admin/skus/1/bindings",
+        json={"node_id": "node-us-3"},
+    )
+    assert r.status_code == status
+    assert r.json()["error"] == code
+
+
+# === PATCH /v1/admin/skus/{id}/bindings/{node_id} ===
+
+
+def test_patch_binding_happy(
+    monkeypatch: pytest.MonkeyPatch, _no_auth: None
+) -> None:
+    updated = _stub_binding()
+    updated["weight"] = 200
+    monkeypatch.setattr(
+        "orchestrator.admin_catalog._update_binding_sync",
+        lambda _sku, _node, _p: updated,
+    )
+    from orchestrator.main import app
+
+    client = TestClient(app)
+    r = client.patch(
+        "/v1/admin/skus/1/bindings/node-us-1", json={"weight": 200}
+    )
+    assert r.status_code == 200
+    assert r.json()["weight"] == 200
+
+
+def test_patch_binding_400_no_fields(
+    monkeypatch: pytest.MonkeyPatch, _no_auth: None
+) -> None:
+    monkeypatch.setattr(
+        "orchestrator.admin_catalog._update_binding_sync",
+        lambda _sku, _node, _p: "no_fields_to_update",
+    )
+    from orchestrator.main import app
+
+    client = TestClient(app)
+    r = client.patch("/v1/admin/skus/1/bindings/node-us-1", json={})
+    assert r.status_code == 400
+
+
+def test_patch_binding_404(monkeypatch: pytest.MonkeyPatch, _no_auth: None) -> None:
+    monkeypatch.setattr(
+        "orchestrator.admin_catalog._update_binding_sync",
+        lambda _sku, _node, _p: "binding_not_found",
+    )
+    from orchestrator.main import app
+
+    client = TestClient(app)
+    r = client.patch(
+        "/v1/admin/skus/1/bindings/node-missing", json={"weight": 50}
+    )
+    assert r.status_code == 404
+
+
+# === DELETE /v1/admin/skus/{id}/bindings/{node_id} ===
+
+
+def test_delete_binding_happy(
+    monkeypatch: pytest.MonkeyPatch, _no_auth: None
+) -> None:
+    monkeypatch.setattr(
+        "orchestrator.admin_catalog._delete_binding_sync",
+        lambda _sku, _node: {"sku_id": 1, "node_id": "node-us-1"},
+    )
+    from orchestrator.main import app
+
+    client = TestClient(app)
+    r = client.delete("/v1/admin/skus/1/bindings/node-us-1")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["success"] is True
+    assert body["sku_id"] == 1
+    assert body["node_id"] == "node-us-1"
+
+
+def test_delete_binding_404(monkeypatch: pytest.MonkeyPatch, _no_auth: None) -> None:
+    monkeypatch.setattr(
+        "orchestrator.admin_catalog._delete_binding_sync",
+        lambda _sku, _node: "binding_not_found",
+    )
+    from orchestrator.main import app
+
+    client = TestClient(app)
+    r = client.delete("/v1/admin/skus/1/bindings/node-missing")
+    assert r.status_code == 404

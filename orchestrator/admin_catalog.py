@@ -20,6 +20,10 @@ from fastapi.responses import JSONResponse
 from psycopg.types.json import Jsonb
 
 from orchestrator.api_schemas import (
+    BindingCreateRequest,
+    BindingItem,
+    BindingListResponse,
+    BindingUpdateRequest,
     ProblemResponse,
     SkuAdminDetail,
     SkuAdminItem,
@@ -526,3 +530,219 @@ async def create_sku(payload: SkuCreateRequest) -> JSONResponse:
         stock_breakdown=[],
     )
     return JSONResponse(status_code=201, content=detail.model_dump(mode="json"))
+
+
+# === /v1/admin/skus/{sku_id}/bindings — CATALOG-1 Phase A.4 ===
+
+
+def _list_bindings_sync(sku_id: int) -> list[dict[str, Any]] | str:
+    sku = fetch_one("SELECT 1 FROM skus WHERE id = %s", (sku_id,))
+    if not sku:
+        return "sku_not_found"
+    rows = fetch_all(
+        """
+        SELECT b.node_id, n.name AS node_name, n.geo AS node_geo,
+               b.weight, b.max_batch_size, b.is_active,
+               b.created_at, b.updated_at
+          FROM sku_node_bindings b
+          JOIN nodes n ON n.id = b.node_id
+         WHERE b.sku_id = %s
+         ORDER BY n.name
+        """,
+        (sku_id,),
+    )
+    return rows
+
+
+def _add_binding_sync(
+    sku_id: int, payload: BindingCreateRequest
+) -> dict[str, Any] | str:
+    """Bind a node to an SKU with geo validation.
+
+    Geo rule: ``node.geo`` must equal ``sku.geo_code``, OR ``sku.geo_code``
+    must be empty (datacenter_pergb / global SKUs). This mirrors the
+    auto-bind path in ``/v1/nodes/enroll`` and prevents accidental cross-
+    geo allocations that would surprise the buyer.
+    """
+    with connect() as conn, conn.cursor() as cur:
+        cur.execute("SELECT id, geo_code FROM skus WHERE id = %s", (sku_id,))
+        sku = cur.fetchone()
+        if not sku:
+            return "sku_not_found"
+        cur.execute(
+            "SELECT id, name, geo FROM nodes WHERE id = %s", (payload.node_id,)
+        )
+        node = cur.fetchone()
+        if not node:
+            return "node_not_found"
+
+        sku_geo = (sku["geo_code"] or "").strip()
+        node_geo = (node["geo"] or "").strip()
+        if sku_geo and node_geo != sku_geo:
+            return "geo_mismatch"
+
+        try:
+            cur.execute(
+                """
+                INSERT INTO sku_node_bindings
+                    (sku_id, node_id, weight, max_batch_size, is_active)
+                VALUES (%s, %s, %s, %s, true)
+                RETURNING node_id, weight, max_batch_size, is_active,
+                          created_at, updated_at
+                """,
+                (sku_id, payload.node_id, payload.weight, payload.max_batch_size),
+            )
+        except psycopg.errors.UniqueViolation:
+            return "binding_exists"
+        row = cur.fetchone()
+        assert row is not None
+        result = {
+            **dict(row),
+            "node_name": node["name"],
+            "node_geo": node["geo"] or "",
+        }
+        _audit(
+            cur,
+            action="binding_added",
+            target_type="binding",
+            target_id=f"{sku_id}:{payload.node_id}",
+            details={
+                "sku_id": sku_id,
+                "node_id": payload.node_id,
+                "weight": payload.weight,
+                "max_batch_size": payload.max_batch_size,
+            },
+        )
+        return result
+
+
+def _update_binding_sync(
+    sku_id: int, node_id: str, payload: BindingUpdateRequest
+) -> dict[str, Any] | str:
+    update_fields = payload.model_dump(exclude_none=True)
+    if not update_fields:
+        return "no_fields_to_update"
+    with connect() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT b.node_id, n.name AS node_name, n.geo AS node_geo,
+                   b.weight, b.max_batch_size, b.is_active
+              FROM sku_node_bindings b
+              JOIN nodes n ON n.id = b.node_id
+             WHERE b.sku_id = %s AND b.node_id = %s
+             FOR UPDATE
+            """,
+            (sku_id, node_id),
+        )
+        old = cur.fetchone()
+        if not old:
+            return "binding_not_found"
+
+        set_clauses = [f"{col} = %s" for col in update_fields]
+        set_clauses.append("updated_at = now()")
+        params = list(update_fields.values()) + [sku_id, node_id]
+        cur.execute(
+            f"""
+            UPDATE sku_node_bindings
+               SET {", ".join(set_clauses)}
+             WHERE sku_id = %s AND node_id = %s
+            RETURNING node_id, weight, max_batch_size, is_active,
+                      created_at, updated_at
+            """,
+            tuple(params),
+        )
+        new_row = cur.fetchone()
+        assert new_row is not None
+        diff = {
+            col: {"old": old[col], "new": new_row[col]}
+            for col in update_fields
+            if old[col] != new_row[col]
+        }
+        _audit(
+            cur,
+            action="binding_updated",
+            target_type="binding",
+            target_id=f"{sku_id}:{node_id}",
+            details={"diff": _jsonify_diff(diff)},
+        )
+        return {
+            **dict(new_row),
+            "node_name": old["node_name"],
+            "node_geo": old["node_geo"] or "",
+        }
+
+
+def _delete_binding_sync(sku_id: int, node_id: str) -> dict[str, Any] | str:
+    with connect() as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT 1 FROM sku_node_bindings WHERE sku_id = %s AND node_id = %s",
+            (sku_id, node_id),
+        )
+        if not cur.fetchone():
+            return "binding_not_found"
+        cur.execute(
+            "DELETE FROM sku_node_bindings WHERE sku_id = %s AND node_id = %s",
+            (sku_id, node_id),
+        )
+        _audit(
+            cur,
+            action="binding_removed",
+            target_type="binding",
+            target_id=f"{sku_id}:{node_id}",
+            details={"sku_id": sku_id, "node_id": node_id},
+        )
+        return {"sku_id": sku_id, "node_id": node_id}
+
+
+@admin_catalog_router.get("/skus/{sku_id}/bindings")
+async def list_bindings(sku_id: int) -> JSONResponse:
+    """List all node bindings for an SKU."""
+    result = await asyncio.to_thread(_list_bindings_sync, sku_id)
+    if result == "sku_not_found":
+        return _problem(404, "sku_not_found")
+    assert isinstance(result, list)
+    items = [BindingItem(**r) for r in result]
+    return JSONResponse(
+        content=BindingListResponse(items=items).model_dump(mode="json")
+    )
+
+
+@admin_catalog_router.post("/skus/{sku_id}/bindings", status_code=201)
+async def add_binding(sku_id: int, payload: BindingCreateRequest) -> JSONResponse:
+    """Add a node binding for an SKU with geo validation."""
+    result = await asyncio.to_thread(_add_binding_sync, sku_id, payload)
+    error_status: dict[str, int] = {
+        "sku_not_found": 404,
+        "node_not_found": 404,
+        "geo_mismatch": 409,
+        "binding_exists": 409,
+    }
+    if isinstance(result, str):
+        return _problem(error_status[result], result)
+    return JSONResponse(status_code=201, content=BindingItem(**result).model_dump(mode="json"))
+
+
+@admin_catalog_router.patch("/skus/{sku_id}/bindings/{node_id}")
+async def patch_binding(
+    sku_id: int, node_id: str, payload: BindingUpdateRequest
+) -> JSONResponse:
+    """Update weight, max_batch_size, or is_active for a binding."""
+    result = await asyncio.to_thread(_update_binding_sync, sku_id, node_id, payload)
+    if result == "no_fields_to_update":
+        return _problem(400, "no_fields_to_update")
+    if result == "binding_not_found":
+        return _problem(404, "binding_not_found")
+    assert isinstance(result, dict)
+    return JSONResponse(content=BindingItem(**result).model_dump(mode="json"))
+
+
+@admin_catalog_router.delete("/skus/{sku_id}/bindings/{node_id}")
+async def delete_binding(sku_id: int, node_id: str) -> JSONResponse:
+    """Remove a node binding (hard delete — no inventory cascade)."""
+    result = await asyncio.to_thread(_delete_binding_sync, sku_id, node_id)
+    if result == "binding_not_found":
+        return _problem(404, "binding_not_found")
+    assert isinstance(result, dict)
+    return JSONResponse(
+        content={"success": True, "sku_id": result["sku_id"], "node_id": result["node_id"]}
+    )
