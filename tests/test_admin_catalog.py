@@ -463,13 +463,20 @@ def test_delete_sku_happy(monkeypatch: pytest.MonkeyPatch, _no_auth: None) -> No
 
 
 def test_delete_sku_blocked_by_pending_orders(monkeypatch: pytest.MonkeyPatch, _no_auth: None) -> None:
-    monkeypatch.setattr("orchestrator.admin_catalog._delete_sku_sync", lambda _id: "pending_orders")
+    monkeypatch.setattr(
+        "orchestrator.admin_catalog._delete_sku_sync",
+        lambda _id: ("pending_orders", {"pending_count": 5}),
+    )
     from orchestrator.main import app
 
     client = TestClient(app)
     r = client.delete("/v1/admin/skus/1")
     assert r.status_code == 409
-    assert r.json()["error"] == "pending_orders"
+    body = r.json()
+    assert body["error"] == "pending_orders"
+    # D-Polishing-A.2: pending_count surfaces in extra so the bot can
+    # render "❌ N активных заказов" without a probe round-trip.
+    assert body["extra"]["pending_count"] == 5
 
 
 def test_delete_sku_404_when_missing(monkeypatch: pytest.MonkeyPatch, _no_auth: None) -> None:

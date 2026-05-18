@@ -454,14 +454,16 @@ def _jsonify_scalar(v: Any) -> Any:
     return str(v)
 
 
-def _delete_sku_sync(sku_id: int) -> dict[str, Any] | str:
+def _delete_sku_sync(sku_id: int) -> dict[str, Any] | str | tuple[str, dict[str, Any]]:
     """Soft-delete SKU. Blocks if any non-terminal orders exist.
 
     Returns:
       - dict with deleted row on success
       - ``"sku_not_found"`` if id unknown
-      - ``"pending_orders"`` if any order with status in
-        (``reserved``, ``committed``) still has an active expiry
+      - ``("pending_orders", {"pending_count": N})`` if any order with
+        status in (``reserved``, ``committed``) still has an active
+        expiry — the count travels back so the route can render the
+        number in the 409 response (D-Polishing-A.2 enrichment)
 
     Idempotent: re-deleting an already-inactive SKU returns the row but
     still audits the event (so an operator-initiated re-delete is
@@ -494,7 +496,7 @@ def _delete_sku_sync(sku_id: int) -> dict[str, Any] | str:
         pending_row = cur.fetchone()
         pending = int(pending_row["n"]) if pending_row else 0
         if pending > 0:
-            return "pending_orders"
+            return ("pending_orders", {"pending_count": pending})
 
         cur.execute(
             """
@@ -546,8 +548,8 @@ async def delete_sku(sku_id: int) -> JSONResponse:
     result = await asyncio.to_thread(_delete_sku_sync, sku_id)
     if result == "sku_not_found":
         return _problem(404, "sku_not_found")
-    if result == "pending_orders":
-        return _problem(409, "pending_orders")
+    if isinstance(result, tuple) and result[0] == "pending_orders":
+        return _problem(409, "pending_orders", **result[1])
     assert isinstance(result, dict)
     return JSONResponse(content={"success": True, "deleted_id": result["id"]})
 
