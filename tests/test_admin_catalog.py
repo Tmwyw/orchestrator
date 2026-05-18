@@ -208,3 +208,178 @@ def test_get_sku_returns_404_when_missing(
     body = r.json()
     assert body["error"] == "sku_not_found"
     assert body["success"] is False
+
+
+# === POST /v1/admin/skus ===
+
+
+def test_create_sku_happy_path(monkeypatch: pytest.MonkeyPatch, _no_auth: None) -> None:
+    inserted_row = {
+        "id": 42,
+        "code": "ipv6_de_socks5",
+        "product_kind": "ipv6",
+        "geo_code": "DE",
+        "protocol": "socks5",
+        "duration_days": 30,
+        "price_per_piece": Decimal("2.40"),
+        "price_per_gb": None,
+        "target_stock": 5000,
+        "refill_batch_size": 500,
+        "validation_require_ipv6": True,
+        "is_active": True,
+        "metadata": {},
+        "created_at": datetime(2026, 5, 18, tzinfo=timezone.utc),
+        "updated_at": datetime(2026, 5, 18, tzinfo=timezone.utc),
+    }
+
+    def fake_create_sku_sync(payload: Any) -> dict[str, Any]:
+        assert payload.code == "ipv6_de_socks5"
+        assert payload.price_per_piece == Decimal("2.40")
+        return inserted_row
+
+    monkeypatch.setattr(
+        "orchestrator.admin_catalog._create_sku_sync", fake_create_sku_sync
+    )
+
+    from orchestrator.main import app
+
+    client = TestClient(app)
+    r = client.post(
+        "/v1/admin/skus",
+        json={
+            "code": "ipv6_de_socks5",
+            "product_kind": "ipv6",
+            "geo_code": "DE",
+            "protocol": "socks5",
+            "duration_days": 30,
+            "price_per_piece": "2.40",
+            "target_stock": 5000,
+        },
+    )
+    assert r.status_code == 201
+    body = r.json()
+    assert body["id"] == 42
+    assert body["code"] == "ipv6_de_socks5"
+    assert body["stock_total"]["available"] == 0
+    assert body["stock_breakdown"] == []
+
+
+def test_create_sku_409_on_duplicate_code(
+    monkeypatch: pytest.MonkeyPatch, _no_auth: None
+) -> None:
+    monkeypatch.setattr(
+        "orchestrator.admin_catalog._create_sku_sync", lambda _p: "duplicate_code"
+    )
+    from orchestrator.main import app
+
+    client = TestClient(app)
+    r = client.post(
+        "/v1/admin/skus",
+        json={
+            "code": "ipv6_de_socks5",
+            "product_kind": "ipv6",
+            "geo_code": "DE",
+            "protocol": "socks5",
+            "price_per_piece": "2.40",
+            "target_stock": 5000,
+        },
+    )
+    assert r.status_code == 409
+    assert r.json()["error"] == "duplicate_code"
+
+
+def test_create_sku_409_on_duplicate_kind_geo_protocol(
+    monkeypatch: pytest.MonkeyPatch, _no_auth: None
+) -> None:
+    monkeypatch.setattr(
+        "orchestrator.admin_catalog._create_sku_sync",
+        lambda _p: "duplicate_kind_geo_protocol",
+    )
+    from orchestrator.main import app
+
+    client = TestClient(app)
+    r = client.post(
+        "/v1/admin/skus",
+        json={
+            "code": "ipv6_de_socks5_v2",
+            "product_kind": "ipv6",
+            "geo_code": "DE",
+            "protocol": "socks5",
+            "price_per_piece": "2.40",
+            "target_stock": 5000,
+        },
+    )
+    assert r.status_code == 409
+    assert r.json()["error"] == "duplicate_kind_geo_protocol"
+
+
+def test_create_sku_400_on_invalid_price_too_high(
+    monkeypatch: pytest.MonkeyPatch, _no_auth: None
+) -> None:
+    # Should not even reach the service — Pydantic rejects price > 10000.
+    monkeypatch.setattr(
+        "orchestrator.admin_catalog._create_sku_sync",
+        lambda _p: (_ for _ in ()).throw(AssertionError("service must not be called")),
+    )
+    from orchestrator.main import app
+
+    client = TestClient(app)
+    r = client.post(
+        "/v1/admin/skus",
+        json={
+            "code": "ipv6_xx_socks5",
+            "product_kind": "ipv6",
+            "geo_code": "XX",
+            "protocol": "socks5",
+            "price_per_piece": "99999.99",
+            "target_stock": 100,
+        },
+    )
+    assert r.status_code == 422  # FastAPI validation error
+
+
+def test_create_sku_400_on_invalid_target_stock_zero(
+    monkeypatch: pytest.MonkeyPatch, _no_auth: None
+) -> None:
+    monkeypatch.setattr(
+        "orchestrator.admin_catalog._create_sku_sync",
+        lambda _p: (_ for _ in ()).throw(AssertionError("service must not be called")),
+    )
+    from orchestrator.main import app
+
+    client = TestClient(app)
+    r = client.post(
+        "/v1/admin/skus",
+        json={
+            "code": "ipv6_xx_socks5",
+            "product_kind": "ipv6",
+            "geo_code": "XX",
+            "protocol": "socks5",
+            "price_per_piece": "2.50",
+            "target_stock": 0,
+        },
+    )
+    assert r.status_code == 422
+
+
+def test_create_sku_400_when_pergb_missing_price_per_gb(
+    monkeypatch: pytest.MonkeyPatch, _no_auth: None
+) -> None:
+    monkeypatch.setattr(
+        "orchestrator.admin_catalog._create_sku_sync",
+        lambda _p: (_ for _ in ()).throw(AssertionError("service must not be called")),
+    )
+    from orchestrator.main import app
+
+    client = TestClient(app)
+    r = client.post(
+        "/v1/admin/skus",
+        json={
+            "code": "pergb_global",
+            "product_kind": "datacenter_pergb",
+            "geo_code": "",
+            "protocol": "socks5",
+            "target_stock": 1000,
+        },
+    )
+    assert r.status_code == 422

@@ -14,17 +14,20 @@ from __future__ import annotations
 import asyncio
 from typing import Any
 
+import psycopg
 from fastapi import APIRouter
 from fastapi.responses import JSONResponse
+from psycopg.types.json import Jsonb
 
 from orchestrator.api_schemas import (
     ProblemResponse,
     SkuAdminDetail,
     SkuAdminItem,
+    SkuCreateRequest,
     SkuListResponse,
     SkuStockBreakdownItem,
 )
-from orchestrator.db import fetch_all, fetch_one
+from orchestrator.db import connect, fetch_all, fetch_one
 
 admin_catalog_router = APIRouter(prefix="/v1/admin")
 
@@ -34,6 +37,35 @@ def _problem(status_code: int, error: str, **extra: Any) -> JSONResponse:
         exclude_none=True, mode="json"
     )
     return JSONResponse(status_code=status_code, content=payload)
+
+
+def _audit(
+    cur: psycopg.Cursor,
+    action: str,
+    target_type: str,
+    target_id: str | int | None,
+    details: dict[str, Any] | None = None,
+    actor: str = "admin",
+) -> None:
+    """Append one row to ``admin_audit_log`` inside the caller's txn.
+
+    Pass the caller's cursor so the audit write is atomic with the
+    mutating SQL — a rollback of the parent statement also rolls back
+    the audit row.
+    """
+    cur.execute(
+        """
+        INSERT INTO admin_audit_log (actor, action, target_type, target_id, details)
+        VALUES (%s, %s, %s, %s, %s)
+        """,
+        (
+            actor,
+            action,
+            target_type,
+            str(target_id) if target_id is not None else None,
+            Jsonb(details or {}),
+        ),
+    )
 
 
 # === GET /v1/admin/skus ===
@@ -154,3 +186,106 @@ async def get_sku(sku_id: int) -> JSONResponse:
         stock_breakdown=[SkuStockBreakdownItem(**r) for r in breakdown_rows],
     )
     return JSONResponse(content=detail.model_dump(mode="json"))
+
+
+# === POST /v1/admin/skus ===
+
+
+def _create_sku_sync(payload: SkuCreateRequest) -> dict[str, Any] | str:
+    """Insert SKU + audit row inside one transaction.
+
+    Returns the inserted row on success, or a string error code:
+      - ``"duplicate_code"`` if ``code`` UNIQUE constraint trips
+      - ``"duplicate_kind_geo_protocol"`` if (kind, geo, protocol) already exists
+
+    The (kind, geo, protocol) uniqueness is enforced in application code
+    (no DB constraint yet) — we SELECT-check inside the same txn before
+    INSERT. Race window is acceptable: a concurrent POST will succeed in
+    one branch and the other gets the ``UNIQUE(code)`` violation since
+    callers normally derive ``code`` from those three fields anyway.
+    """
+    with connect() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT 1 FROM skus
+            WHERE product_kind = %s AND geo_code = %s AND protocol = %s
+            LIMIT 1
+            """,
+            (payload.product_kind, payload.geo_code, payload.protocol),
+        )
+        if cur.fetchone():
+            return "duplicate_kind_geo_protocol"
+
+        try:
+            cur.execute(
+                """
+                INSERT INTO skus (
+                    code, product_kind, geo_code, protocol, duration_days,
+                    price_per_piece, price_per_gb, target_stock,
+                    refill_batch_size, validation_require_ipv6, is_active
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                RETURNING id, code, product_kind, geo_code, protocol,
+                          duration_days, price_per_piece, price_per_gb,
+                          target_stock, refill_batch_size,
+                          validation_require_ipv6, is_active, metadata,
+                          created_at, updated_at
+                """,
+                (
+                    payload.code,
+                    payload.product_kind,
+                    payload.geo_code,
+                    payload.protocol,
+                    payload.duration_days,
+                    payload.price_per_piece,
+                    payload.price_per_gb,
+                    payload.target_stock,
+                    payload.refill_batch_size,
+                    payload.validation_require_ipv6,
+                    payload.is_active,
+                ),
+            )
+        except psycopg.errors.UniqueViolation:
+            return "duplicate_code"
+
+        row = cur.fetchone()
+        assert row is not None
+        _audit(
+            cur,
+            action="sku_created",
+            target_type="sku",
+            target_id=row["id"],
+            details=payload.model_dump(mode="json"),
+        )
+        return dict(row)
+
+
+@admin_catalog_router.post("/skus", status_code=201)
+async def create_sku(payload: SkuCreateRequest) -> JSONResponse:
+    """Create a new SKU.
+
+    Validations:
+      - ``code`` regex ``^[a-z0-9_]+$``, 3-64 chars (in Pydantic model)
+      - ``price_per_piece`` / ``price_per_gb`` > 0 and ≤ 10000
+      - ``target_stock`` 1..1_000_000
+      - UNIQUE (``kind``, ``geo_code``, ``protocol``) — checked in txn
+      - UNIQUE ``code`` — enforced by DB index
+
+    On success, audits ``sku_created`` with the full request body in
+    ``details``.
+    """
+    result = await asyncio.to_thread(_create_sku_sync, payload)
+    if isinstance(result, str):
+        return _problem(409, result)
+    detail = SkuAdminDetail(
+        **result,
+        stock_total={
+            "available": 0,
+            "reserved": 0,
+            "sold": 0,
+            "expired_grace": 0,
+            "pending_validation": 0,
+        },
+        stock_breakdown=[],
+    )
+    return JSONResponse(status_code=201, content=detail.model_dump(mode="json"))
