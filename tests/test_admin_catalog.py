@@ -27,9 +27,7 @@ def _no_auth():
 # === GET /v1/admin/skus ===
 
 
-def test_list_skus_returns_items_and_total(
-    monkeypatch: pytest.MonkeyPatch, _no_auth: None
-) -> None:
+def test_list_skus_returns_items_and_total(monkeypatch: pytest.MonkeyPatch, _no_auth: None) -> None:
     fake_rows = [
         {
             "id": 1,
@@ -85,9 +83,7 @@ def test_list_skus_returns_items_and_total(
     assert body["items"][1]["is_active"] is False
 
 
-def test_list_skus_applies_filters(
-    monkeypatch: pytest.MonkeyPatch, _no_auth: None
-) -> None:
+def test_list_skus_applies_filters(monkeypatch: pytest.MonkeyPatch, _no_auth: None) -> None:
     captured: dict[str, Any] = {}
 
     def fake_fetch_all(query: str, params: Any = None) -> list[dict[str, Any]]:
@@ -122,9 +118,7 @@ def test_list_skus_requires_api_key(monkeypatch: pytest.MonkeyPatch) -> None:
 # === GET /v1/admin/skus/{id} ===
 
 
-def test_get_sku_returns_detail_with_breakdown(
-    monkeypatch: pytest.MonkeyPatch, _no_auth: None
-) -> None:
+def test_get_sku_returns_detail_with_breakdown(monkeypatch: pytest.MonkeyPatch, _no_auth: None) -> None:
     sku_row = {
         "id": 1,
         "code": "ipv6_us_socks5",
@@ -192,9 +186,7 @@ def test_get_sku_returns_detail_with_breakdown(
     assert body["stock_breakdown"][0]["available"] == 2340
 
 
-def test_get_sku_returns_404_when_missing(
-    monkeypatch: pytest.MonkeyPatch, _no_auth: None
-) -> None:
+def test_get_sku_returns_404_when_missing(monkeypatch: pytest.MonkeyPatch, _no_auth: None) -> None:
     def fake_fetch_one(query: str, params: Any = None) -> dict[str, Any] | None:
         return None
 
@@ -237,9 +229,7 @@ def test_create_sku_happy_path(monkeypatch: pytest.MonkeyPatch, _no_auth: None) 
         assert payload.price_per_piece == Decimal("2.40")
         return inserted_row
 
-    monkeypatch.setattr(
-        "orchestrator.admin_catalog._create_sku_sync", fake_create_sku_sync
-    )
+    monkeypatch.setattr("orchestrator.admin_catalog._create_sku_sync", fake_create_sku_sync)
 
     from orchestrator.main import app
 
@@ -264,12 +254,8 @@ def test_create_sku_happy_path(monkeypatch: pytest.MonkeyPatch, _no_auth: None) 
     assert body["stock_breakdown"] == []
 
 
-def test_create_sku_409_on_duplicate_code(
-    monkeypatch: pytest.MonkeyPatch, _no_auth: None
-) -> None:
-    monkeypatch.setattr(
-        "orchestrator.admin_catalog._create_sku_sync", lambda _p: "duplicate_code"
-    )
+def test_create_sku_409_on_duplicate_code(monkeypatch: pytest.MonkeyPatch, _no_auth: None) -> None:
+    monkeypatch.setattr("orchestrator.admin_catalog._create_sku_sync", lambda _p: "duplicate_code")
     from orchestrator.main import app
 
     client = TestClient(app)
@@ -313,9 +299,7 @@ def test_create_sku_409_on_duplicate_kind_geo_protocol(
     assert r.json()["error"] == "duplicate_kind_geo_protocol"
 
 
-def test_create_sku_400_on_invalid_price_too_high(
-    monkeypatch: pytest.MonkeyPatch, _no_auth: None
-) -> None:
+def test_create_sku_400_on_invalid_price_too_high(monkeypatch: pytest.MonkeyPatch, _no_auth: None) -> None:
     # Should not even reach the service — Pydantic rejects price > 10000.
     monkeypatch.setattr(
         "orchestrator.admin_catalog._create_sku_sync",
@@ -338,9 +322,7 @@ def test_create_sku_400_on_invalid_price_too_high(
     assert r.status_code == 422  # FastAPI validation error
 
 
-def test_create_sku_400_on_invalid_target_stock_zero(
-    monkeypatch: pytest.MonkeyPatch, _no_auth: None
-) -> None:
+def test_create_sku_400_on_invalid_target_stock_zero(monkeypatch: pytest.MonkeyPatch, _no_auth: None) -> None:
     monkeypatch.setattr(
         "orchestrator.admin_catalog._create_sku_sync",
         lambda _p: (_ for _ in ()).throw(AssertionError("service must not be called")),
@@ -408,9 +390,7 @@ def _stub_updated_row(price: str = "2.80", target_stock: int = 6000) -> dict[str
     }
 
 
-def test_patch_sku_happy_path(
-    monkeypatch: pytest.MonkeyPatch, _no_auth: None
-) -> None:
+def test_patch_sku_happy_path(monkeypatch: pytest.MonkeyPatch, _no_auth: None) -> None:
     new_row = _stub_updated_row(price="3.00", target_stock=8000)
     captured: dict[str, Any] = {}
 
@@ -420,9 +400,7 @@ def test_patch_sku_happy_path(
         return new_row
 
     monkeypatch.setattr("orchestrator.admin_catalog._update_sku_sync", fake_update)
-    monkeypatch.setattr(
-        "orchestrator.admin_catalog.fetch_all", lambda *_a, **_kw: []
-    )
+    monkeypatch.setattr("orchestrator.admin_catalog.fetch_all", lambda *_a, **_kw: [])
 
     from orchestrator.main import app
 
@@ -440,9 +418,7 @@ def test_patch_sku_happy_path(
     assert captured["fields"]["target_stock"] == 8000
 
 
-def test_patch_sku_404_when_missing(
-    monkeypatch: pytest.MonkeyPatch, _no_auth: None
-) -> None:
+def test_patch_sku_404_when_missing(monkeypatch: pytest.MonkeyPatch, _no_auth: None) -> None:
     monkeypatch.setattr(
         "orchestrator.admin_catalog._update_sku_sync",
         lambda _id, _p: "sku_not_found",
@@ -455,9 +431,7 @@ def test_patch_sku_404_when_missing(
     assert r.json()["error"] == "sku_not_found"
 
 
-def test_patch_sku_400_when_no_fields(
-    monkeypatch: pytest.MonkeyPatch, _no_auth: None
-) -> None:
+def test_patch_sku_400_when_no_fields(monkeypatch: pytest.MonkeyPatch, _no_auth: None) -> None:
     monkeypatch.setattr(
         "orchestrator.admin_catalog._update_sku_sync",
         lambda _id, _p: "no_fields_to_update",
@@ -488,12 +462,8 @@ def test_delete_sku_happy(monkeypatch: pytest.MonkeyPatch, _no_auth: None) -> No
     assert body["deleted_id"] == 1
 
 
-def test_delete_sku_blocked_by_pending_orders(
-    monkeypatch: pytest.MonkeyPatch, _no_auth: None
-) -> None:
-    monkeypatch.setattr(
-        "orchestrator.admin_catalog._delete_sku_sync", lambda _id: "pending_orders"
-    )
+def test_delete_sku_blocked_by_pending_orders(monkeypatch: pytest.MonkeyPatch, _no_auth: None) -> None:
+    monkeypatch.setattr("orchestrator.admin_catalog._delete_sku_sync", lambda _id: "pending_orders")
     from orchestrator.main import app
 
     client = TestClient(app)
@@ -502,12 +472,8 @@ def test_delete_sku_blocked_by_pending_orders(
     assert r.json()["error"] == "pending_orders"
 
 
-def test_delete_sku_404_when_missing(
-    monkeypatch: pytest.MonkeyPatch, _no_auth: None
-) -> None:
-    monkeypatch.setattr(
-        "orchestrator.admin_catalog._delete_sku_sync", lambda _id: "sku_not_found"
-    )
+def test_delete_sku_404_when_missing(monkeypatch: pytest.MonkeyPatch, _no_auth: None) -> None:
+    monkeypatch.setattr("orchestrator.admin_catalog._delete_sku_sync", lambda _id: "sku_not_found")
     from orchestrator.main import app
 
     client = TestClient(app)
@@ -522,7 +488,7 @@ def test_delete_sku_404_when_missing(
 def test_jsonify_diff_coerces_decimals_to_strings() -> None:
     from orchestrator.admin_catalog import _jsonify_diff
 
-    diff = {
+    diff: dict[str, dict[str, Any]] = {
         "price_per_piece": {"old": Decimal("2.50"), "new": Decimal("3.00")},
         "target_stock": {"old": 5000, "new": 8000},
         "is_active": {"old": True, "new": False},
@@ -549,13 +515,9 @@ def _stub_binding(node_id: str = "node-us-1", geo: str = "US") -> dict[str, Any]
     }
 
 
-def test_list_bindings_happy(
-    monkeypatch: pytest.MonkeyPatch, _no_auth: None
-) -> None:
+def test_list_bindings_happy(monkeypatch: pytest.MonkeyPatch, _no_auth: None) -> None:
     rows = [_stub_binding("node-us-1"), _stub_binding("node-us-2")]
-    monkeypatch.setattr(
-        "orchestrator.admin_catalog._list_bindings_sync", lambda _id: rows
-    )
+    monkeypatch.setattr("orchestrator.admin_catalog._list_bindings_sync", lambda _id: rows)
     from orchestrator.main import app
 
     client = TestClient(app)
@@ -566,12 +528,8 @@ def test_list_bindings_happy(
     assert body["items"][0]["node_id"] == "node-us-1"
 
 
-def test_list_bindings_404_sku_missing(
-    monkeypatch: pytest.MonkeyPatch, _no_auth: None
-) -> None:
-    monkeypatch.setattr(
-        "orchestrator.admin_catalog._list_bindings_sync", lambda _id: "sku_not_found"
-    )
+def test_list_bindings_404_sku_missing(monkeypatch: pytest.MonkeyPatch, _no_auth: None) -> None:
+    monkeypatch.setattr("orchestrator.admin_catalog._list_bindings_sync", lambda _id: "sku_not_found")
     from orchestrator.main import app
 
     client = TestClient(app)
@@ -610,9 +568,7 @@ def test_add_binding_happy(monkeypatch: pytest.MonkeyPatch, _no_auth: None) -> N
 def test_add_binding_error_codes(
     monkeypatch: pytest.MonkeyPatch, _no_auth: None, code: str, status: int
 ) -> None:
-    monkeypatch.setattr(
-        "orchestrator.admin_catalog._add_binding_sync", lambda _sku, _p: code
-    )
+    monkeypatch.setattr("orchestrator.admin_catalog._add_binding_sync", lambda _sku, _p: code)
     from orchestrator.main import app
 
     client = TestClient(app)
@@ -627,9 +583,7 @@ def test_add_binding_error_codes(
 # === PATCH /v1/admin/skus/{id}/bindings/{node_id} ===
 
 
-def test_patch_binding_happy(
-    monkeypatch: pytest.MonkeyPatch, _no_auth: None
-) -> None:
+def test_patch_binding_happy(monkeypatch: pytest.MonkeyPatch, _no_auth: None) -> None:
     updated = _stub_binding()
     updated["weight"] = 200
     monkeypatch.setattr(
@@ -639,16 +593,12 @@ def test_patch_binding_happy(
     from orchestrator.main import app
 
     client = TestClient(app)
-    r = client.patch(
-        "/v1/admin/skus/1/bindings/node-us-1", json={"weight": 200}
-    )
+    r = client.patch("/v1/admin/skus/1/bindings/node-us-1", json={"weight": 200})
     assert r.status_code == 200
     assert r.json()["weight"] == 200
 
 
-def test_patch_binding_400_no_fields(
-    monkeypatch: pytest.MonkeyPatch, _no_auth: None
-) -> None:
+def test_patch_binding_400_no_fields(monkeypatch: pytest.MonkeyPatch, _no_auth: None) -> None:
     monkeypatch.setattr(
         "orchestrator.admin_catalog._update_binding_sync",
         lambda _sku, _node, _p: "no_fields_to_update",
@@ -668,18 +618,14 @@ def test_patch_binding_404(monkeypatch: pytest.MonkeyPatch, _no_auth: None) -> N
     from orchestrator.main import app
 
     client = TestClient(app)
-    r = client.patch(
-        "/v1/admin/skus/1/bindings/node-missing", json={"weight": 50}
-    )
+    r = client.patch("/v1/admin/skus/1/bindings/node-missing", json={"weight": 50})
     assert r.status_code == 404
 
 
 # === DELETE /v1/admin/skus/{id}/bindings/{node_id} ===
 
 
-def test_delete_binding_happy(
-    monkeypatch: pytest.MonkeyPatch, _no_auth: None
-) -> None:
+def test_delete_binding_happy(monkeypatch: pytest.MonkeyPatch, _no_auth: None) -> None:
     monkeypatch.setattr(
         "orchestrator.admin_catalog._delete_binding_sync",
         lambda _sku, _node: {"sku_id": 1, "node_id": "node-us-1"},
@@ -716,9 +662,7 @@ def test_list_tiers_happy(monkeypatch: pytest.MonkeyPatch, _no_auth: None) -> No
         {"gb": 50, "price_per_gb": Decimal("0.80")},
         {"gb": 200, "price_per_gb": Decimal("0.50")},
     ]
-    monkeypatch.setattr(
-        "orchestrator.admin_catalog._list_tiers_sync", lambda _id: rows
-    )
+    monkeypatch.setattr("orchestrator.admin_catalog._list_tiers_sync", lambda _id: rows)
     from orchestrator.main import app
 
     client = TestClient(app)
@@ -731,12 +675,8 @@ def test_list_tiers_happy(monkeypatch: pytest.MonkeyPatch, _no_auth: None) -> No
     assert body["items"][2]["gb"] == 200
 
 
-def test_list_tiers_404_sku_missing(
-    monkeypatch: pytest.MonkeyPatch, _no_auth: None
-) -> None:
-    monkeypatch.setattr(
-        "orchestrator.admin_catalog._list_tiers_sync", lambda _id: "sku_not_found"
-    )
+def test_list_tiers_404_sku_missing(monkeypatch: pytest.MonkeyPatch, _no_auth: None) -> None:
+    monkeypatch.setattr("orchestrator.admin_catalog._list_tiers_sync", lambda _id: "sku_not_found")
     from orchestrator.main import app
 
     client = TestClient(app)
@@ -744,9 +684,7 @@ def test_list_tiers_404_sku_missing(
     assert r.status_code == 404
 
 
-def test_list_tiers_empty_returns_empty_list(
-    monkeypatch: pytest.MonkeyPatch, _no_auth: None
-) -> None:
+def test_list_tiers_empty_returns_empty_list(monkeypatch: pytest.MonkeyPatch, _no_auth: None) -> None:
     monkeypatch.setattr("orchestrator.admin_catalog._list_tiers_sync", lambda _id: [])
     from orchestrator.main import app
 
@@ -790,9 +728,7 @@ def test_put_tiers_happy(monkeypatch: pytest.MonkeyPatch, _no_auth: None) -> Non
     assert captured["tiers"] == [(10, "1.00"), (100, "0.70")]
 
 
-def test_put_tiers_422_when_gb_not_ascending(
-    monkeypatch: pytest.MonkeyPatch, _no_auth: None
-) -> None:
+def test_put_tiers_422_when_gb_not_ascending(monkeypatch: pytest.MonkeyPatch, _no_auth: None) -> None:
     monkeypatch.setattr(
         "orchestrator.admin_catalog._replace_tiers_sync",
         lambda _id, _p: (_ for _ in ()).throw(AssertionError("must not run")),
@@ -812,9 +748,7 @@ def test_put_tiers_422_when_gb_not_ascending(
     assert r.status_code == 422
 
 
-def test_put_tiers_422_when_price_not_monotonic(
-    monkeypatch: pytest.MonkeyPatch, _no_auth: None
-) -> None:
+def test_put_tiers_422_when_price_not_monotonic(monkeypatch: pytest.MonkeyPatch, _no_auth: None) -> None:
     monkeypatch.setattr(
         "orchestrator.admin_catalog._replace_tiers_sync",
         lambda _id, _p: (_ for _ in ()).throw(AssertionError("must not run")),
@@ -834,9 +768,7 @@ def test_put_tiers_422_when_price_not_monotonic(
     assert r.status_code == 422
 
 
-def test_put_tiers_404_when_sku_missing(
-    monkeypatch: pytest.MonkeyPatch, _no_auth: None
-) -> None:
+def test_put_tiers_404_when_sku_missing(monkeypatch: pytest.MonkeyPatch, _no_auth: None) -> None:
     monkeypatch.setattr(
         "orchestrator.admin_catalog._replace_tiers_sync",
         lambda _id, _p: "sku_not_found",
@@ -851,9 +783,7 @@ def test_put_tiers_404_when_sku_missing(
     assert r.status_code == 404
 
 
-def test_put_tiers_400_when_sku_not_pergb(
-    monkeypatch: pytest.MonkeyPatch, _no_auth: None
-) -> None:
+def test_put_tiers_400_when_sku_not_pergb(monkeypatch: pytest.MonkeyPatch, _no_auth: None) -> None:
     monkeypatch.setattr(
         "orchestrator.admin_catalog._replace_tiers_sync",
         lambda _id, _p: "sku_not_pergb",
@@ -915,9 +845,7 @@ def test_list_product_kinds_returns_hardcoded_with_counts(
         {"product_kind": "ipv6", "sku_count": 7},
         {"product_kind": "datacenter_pergb", "sku_count": 1},
     ]
-    monkeypatch.setattr(
-        "orchestrator.admin_catalog.fetch_all", lambda *_a, **_kw: rows
-    )
+    monkeypatch.setattr("orchestrator.admin_catalog.fetch_all", lambda *_a, **_kw: rows)
     from orchestrator.main import app
 
     client = TestClient(app)
@@ -932,9 +860,7 @@ def test_list_product_kinds_returns_hardcoded_with_counts(
     assert by_kind["datacenter_pergb"]["sku_count"] == 1
 
 
-def test_list_product_kinds_zero_counts_when_no_skus(
-    monkeypatch: pytest.MonkeyPatch, _no_auth: None
-) -> None:
+def test_list_product_kinds_zero_counts_when_no_skus(monkeypatch: pytest.MonkeyPatch, _no_auth: None) -> None:
     monkeypatch.setattr("orchestrator.admin_catalog.fetch_all", lambda *_a, **_kw: [])
     from orchestrator.main import app
 

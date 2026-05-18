@@ -45,9 +45,7 @@ admin_catalog_router = APIRouter(prefix="/v1/admin")
 
 
 def _problem(status_code: int, error: str, **extra: Any) -> JSONResponse:
-    payload = ProblemResponse(error=error, extra=extra or None).model_dump(
-        exclude_none=True, mode="json"
-    )
+    payload = ProblemResponse(error=error, extra=extra or None).model_dump(exclude_none=True, mode="json")
     return JSONResponse(status_code=status_code, content=payload)
 
 
@@ -283,9 +281,7 @@ _PATCHABLE_FIELDS = (
 )
 
 
-def _update_sku_sync(
-    sku_id: int, payload: SkuUpdateRequest
-) -> dict[str, Any] | str:
+def _update_sku_sync(sku_id: int, payload: SkuUpdateRequest) -> dict[str, Any] | str:
     """Apply partial update + audit diff. Returns row, or error code.
 
     Audit ``details`` records ``old``/``new`` snapshots of only the
@@ -546,7 +542,7 @@ def _list_bindings_sync(sku_id: int) -> list[dict[str, Any]] | str:
     sku = fetch_one("SELECT 1 FROM skus WHERE id = %s", (sku_id,))
     if not sku:
         return "sku_not_found"
-    rows = fetch_all(
+    return fetch_all(
         """
         SELECT b.node_id, n.name AS node_name, n.geo AS node_geo,
                b.weight, b.max_batch_size, b.is_active,
@@ -558,12 +554,9 @@ def _list_bindings_sync(sku_id: int) -> list[dict[str, Any]] | str:
         """,
         (sku_id,),
     )
-    return rows
 
 
-def _add_binding_sync(
-    sku_id: int, payload: BindingCreateRequest
-) -> dict[str, Any] | str:
+def _add_binding_sync(sku_id: int, payload: BindingCreateRequest) -> dict[str, Any] | str:
     """Bind a node to an SKU with geo validation.
 
     Geo rule: ``node.geo`` must equal ``sku.geo_code``, OR ``sku.geo_code``
@@ -576,9 +569,7 @@ def _add_binding_sync(
         sku = cur.fetchone()
         if not sku:
             return "sku_not_found"
-        cur.execute(
-            "SELECT id, name, geo FROM nodes WHERE id = %s", (payload.node_id,)
-        )
+        cur.execute("SELECT id, name, geo FROM nodes WHERE id = %s", (payload.node_id,))
         node = cur.fetchone()
         if not node:
             return "node_not_found"
@@ -623,9 +614,7 @@ def _add_binding_sync(
         return result
 
 
-def _update_binding_sync(
-    sku_id: int, node_id: str, payload: BindingUpdateRequest
-) -> dict[str, Any] | str:
+def _update_binding_sync(sku_id: int, node_id: str, payload: BindingUpdateRequest) -> dict[str, Any] | str:
     update_fields = payload.model_dump(exclude_none=True)
     if not update_fields:
         return "no_fields_to_update"
@@ -661,9 +650,7 @@ def _update_binding_sync(
         new_row = cur.fetchone()
         assert new_row is not None
         diff = {
-            col: {"old": old[col], "new": new_row[col]}
-            for col in update_fields
-            if old[col] != new_row[col]
+            col: {"old": old[col], "new": new_row[col]} for col in update_fields if old[col] != new_row[col]
         }
         _audit(
             cur,
@@ -709,9 +696,7 @@ async def list_bindings(sku_id: int) -> JSONResponse:
         return _problem(404, "sku_not_found")
     assert isinstance(result, list)
     items = [BindingItem(**r) for r in result]
-    return JSONResponse(
-        content=BindingListResponse(items=items).model_dump(mode="json")
-    )
+    return JSONResponse(content=BindingListResponse(items=items).model_dump(mode="json"))
 
 
 @admin_catalog_router.post("/skus/{sku_id}/bindings", status_code=201)
@@ -730,9 +715,7 @@ async def add_binding(sku_id: int, payload: BindingCreateRequest) -> JSONRespons
 
 
 @admin_catalog_router.patch("/skus/{sku_id}/bindings/{node_id}")
-async def patch_binding(
-    sku_id: int, node_id: str, payload: BindingUpdateRequest
-) -> JSONResponse:
+async def patch_binding(sku_id: int, node_id: str, payload: BindingUpdateRequest) -> JSONResponse:
     """Update weight, max_batch_size, or is_active for a binding."""
     result = await asyncio.to_thread(_update_binding_sync, sku_id, node_id, payload)
     if result == "no_fields_to_update":
@@ -750,9 +733,7 @@ async def delete_binding(sku_id: int, node_id: str) -> JSONResponse:
     if result == "binding_not_found":
         return _problem(404, "binding_not_found")
     assert isinstance(result, dict)
-    return JSONResponse(
-        content={"success": True, "sku_id": result["sku_id"], "node_id": result["node_id"]}
-    )
+    return JSONResponse(content={"success": True, "sku_id": result["sku_id"], "node_id": result["node_id"]})
 
 
 # === /v1/admin/skus/{sku_id}/tiers — CATALOG-1 Phase A.5 ===
@@ -766,7 +747,7 @@ def _list_tiers_sync(sku_id: int) -> list[dict[str, Any]] | str:
     sku = fetch_one("SELECT 1 FROM skus WHERE id = %s", (sku_id,))
     if not sku:
         return "sku_not_found"
-    rows = fetch_all(
+    return fetch_all(
         """
         SELECT gb, price_per_gb
           FROM sku_tiers
@@ -775,12 +756,9 @@ def _list_tiers_sync(sku_id: int) -> list[dict[str, Any]] | str:
         """,
         (sku_id,),
     )
-    return rows
 
 
-def _replace_tiers_sync(
-    sku_id: int, payload: PergbTiersPutRequest
-) -> list[dict[str, Any]] | str:
+def _replace_tiers_sync(sku_id: int, payload: PergbTiersPutRequest) -> list[dict[str, Any]] | str:
     """Atomically replace the tier table for an SKU.
 
     Uses a single txn: soft-delete all existing tiers (is_active=false)
@@ -836,12 +814,7 @@ def _replace_tiers_sync(
             action="tiers_replaced",
             target_type="sku_tiers",
             target_id=sku_id,
-            details={
-                "tiers": [
-                    {"gb": t.gb, "price_per_gb": str(t.price_per_gb)}
-                    for t in payload.tiers
-                ]
-            },
+            details={"tiers": [{"gb": t.gb, "price_per_gb": str(t.price_per_gb)} for t in payload.tiers]},
         )
         return new_rows
 
@@ -858,9 +831,7 @@ async def list_tiers(sku_id: int) -> JSONResponse:
         return _problem(404, "sku_not_found")
     assert isinstance(result, list)
     items = [PergbTierItem(**r) for r in result]
-    return JSONResponse(
-        content=PergbTiersResponse(items=items).model_dump(mode="json")
-    )
+    return JSONResponse(content=PergbTiersResponse(items=items).model_dump(mode="json"))
 
 
 # Hardcoded product_kind catalog — mirrors the CHECK constraint on
@@ -893,9 +864,7 @@ async def put_tiers(sku_id: int, payload: PergbTiersPutRequest) -> JSONResponse:
         return _problem(400, "sku_not_pergb")
     assert isinstance(result, list)
     items = [PergbTierItem(**r) for r in result]
-    return JSONResponse(
-        content=PergbTiersResponse(items=items).model_dump(mode="json")
-    )
+    return JSONResponse(content=PergbTiersResponse(items=items).model_dump(mode="json"))
 
 
 # === /v1/admin/geos, /v1/admin/product_kinds — CATALOG-1 Phase A.6 ===
@@ -946,6 +915,4 @@ async def list_product_kinds() -> JSONResponse:
         ProductKindItem(kind=kind, name=label, sku_count=counts.get(kind, 0))
         for kind, label in _PRODUCT_KIND_LABELS.items()
     ]
-    return JSONResponse(
-        content=ProductKindListResponse(items=items).model_dump(mode="json")
-    )
+    return JSONResponse(content=ProductKindListResponse(items=items).model_dump(mode="json"))
