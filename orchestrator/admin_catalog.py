@@ -649,6 +649,13 @@ async def create_sku(payload: SkuCreateRequest) -> JSONResponse:
 
 
 def _list_bindings_sync(sku_id: int) -> list[dict[str, Any]] | str:
+    """List bindings for a SKU with per-node available_count joined in.
+
+    D-Polishing-A.4: scalar sub-SELECT for available_count is preferred
+    over a LEFT JOIN GROUP BY because bindings list is small (≤ N nodes
+    bound to one SKU); the sub-SELECT is index-friendly
+    (proxy_inventory(sku_id, node_id, status)) and keeps the SQL flat.
+    """
     sku = fetch_one("SELECT 1 FROM skus WHERE id = %s", (sku_id,))
     if not sku:
         return "sku_not_found"
@@ -656,7 +663,11 @@ def _list_bindings_sync(sku_id: int) -> list[dict[str, Any]] | str:
         """
         SELECT b.node_id, n.name AS node_name, n.geo AS node_geo,
                b.weight, b.max_batch_size, b.is_active,
-               b.created_at, b.updated_at
+               b.created_at, b.updated_at,
+               (SELECT COUNT(*) FROM proxy_inventory pi
+                 WHERE pi.sku_id = b.sku_id
+                   AND pi.node_id = b.node_id
+                   AND pi.status = 'available')::int AS available_count
           FROM sku_node_bindings b
           JOIN nodes n ON n.id = b.node_id
          WHERE b.sku_id = %s

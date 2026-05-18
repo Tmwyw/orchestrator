@@ -636,7 +636,15 @@ class SkuUpdateRequest(BaseModel):
 
 
 class BindingItem(BaseModel):
-    """One row in GET /v1/admin/skus/{id}/bindings."""
+    """One row in GET /v1/admin/skus/{id}/bindings.
+
+    ``available_count`` (D-Polishing-A.4) is the count of
+    ``proxy_inventory`` rows with ``status='available'`` for this
+    (sku_id, node_id) pair — the bot now renders it directly instead
+    of looking it up from ``sku.stock_breakdown`` after-the-fact.
+    Default 0 keeps backward compat with single-row INSERT paths
+    (POST + PATCH) that build the response without the JOIN.
+    """
 
     model_config = ConfigDict(str_strip_whitespace=True, extra="ignore")
 
@@ -646,6 +654,7 @@ class BindingItem(BaseModel):
     weight: int
     max_batch_size: int
     is_active: bool
+    available_count: int = 0
     created_at: datetime
     updated_at: datetime
 

@@ -1064,3 +1064,67 @@ def test_list_geos_query_uses_case_aggregation(monkeypatch: pytest.MonkeyPatch, 
     client.get("/v1/admin/geos")
     assert "CASE WHEN is_active" in captured["query"]
     assert "active_count" in captured["query"]
+
+
+# === CATALOG-1 Phase D-Polishing-A.4 — BindingItem.available_count ===
+
+
+def test_list_bindings_includes_available_count(monkeypatch: pytest.MonkeyPatch, _no_auth: None) -> None:
+    """available_count surfaces from the proxy_inventory sub-SELECT."""
+    rows = [
+        {**_stub_binding("node-us-1"), "available_count": 2340},
+        {**_stub_binding("node-us-2"), "available_count": 0},
+    ]
+    monkeypatch.setattr("orchestrator.admin_catalog._list_bindings_sync", lambda _id: rows)
+    from orchestrator.main import app
+
+    client = TestClient(app)
+    r = client.get("/v1/admin/skus/1/bindings")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["items"][0]["available_count"] == 2340
+    assert body["items"][1]["available_count"] == 0
+
+
+def test_list_bindings_sql_joins_proxy_inventory_for_available_count(
+    monkeypatch: pytest.MonkeyPatch, _no_auth: None
+) -> None:
+    """_list_bindings_sync must sub-SELECT count from proxy_inventory
+    with status='available' so callers don't need to combine with
+    sku.stock_breakdown."""
+    captured: dict[str, Any] = {}
+
+    def fake_fetch_one(_query: str, _params: Any = None) -> dict[str, Any]:
+        # pre-check returns non-None to advance to fetch_all
+        return {"?column?": 1}
+
+    def fake_fetch_all(query: str, _params: Any = None) -> list[dict[str, Any]]:
+        captured["query"] = query
+        return []
+
+    monkeypatch.setattr("orchestrator.admin_catalog.fetch_one", fake_fetch_one)
+    monkeypatch.setattr("orchestrator.admin_catalog.fetch_all", fake_fetch_all)
+
+    from orchestrator.main import app
+
+    client = TestClient(app)
+    client.get("/v1/admin/skus/1/bindings")
+    assert "proxy_inventory" in captured["query"]
+    assert "status = 'available'" in captured["query"]
+    assert "available_count" in captured["query"]
+
+
+def test_list_bindings_existing_test_still_passes_with_default_count(
+    monkeypatch: pytest.MonkeyPatch, _no_auth: None
+) -> None:
+    """Legacy stub rows that omit available_count are still parsed via
+    the Pydantic default — proves backward compat with old fixtures
+    and any caller that hasn't migrated yet."""
+    rows = [_stub_binding("node-us-1")]  # NO available_count key
+    monkeypatch.setattr("orchestrator.admin_catalog._list_bindings_sync", lambda _id: rows)
+    from orchestrator.main import app
+
+    client = TestClient(app)
+    r = client.get("/v1/admin/skus/1/bindings")
+    assert r.status_code == 200
+    assert r.json()["items"][0]["available_count"] == 0
