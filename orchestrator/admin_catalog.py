@@ -24,10 +24,14 @@ from orchestrator.api_schemas import (
     BindingItem,
     BindingListResponse,
     BindingUpdateRequest,
+    GeoListResponse,
+    GeoUsageItem,
     PergbTierItem,
     PergbTiersPutRequest,
     PergbTiersResponse,
     ProblemResponse,
+    ProductKindItem,
+    ProductKindListResponse,
     SkuAdminDetail,
     SkuAdminItem,
     SkuCreateRequest,
@@ -859,6 +863,15 @@ async def list_tiers(sku_id: int) -> JSONResponse:
     )
 
 
+# Hardcoded product_kind catalog — mirrors the CHECK constraint on
+# skus.product_kind (migration 005) and PRODUCT_KIND_NAMES in main.py.
+# Add a row here when adding a new value to the CHECK constraint.
+_PRODUCT_KIND_LABELS: dict[str, str] = {
+    "ipv6": "IPv6 SOCKS5",
+    "datacenter_pergb": "Pay-per-GB Datacenter",
+}
+
+
 @admin_catalog_router.put("/skus/{sku_id}/tiers")
 async def put_tiers(sku_id: int, payload: PergbTiersPutRequest) -> JSONResponse:
     """Atomic replace of the pergb tier table for an SKU.
@@ -882,4 +895,57 @@ async def put_tiers(sku_id: int, payload: PergbTiersPutRequest) -> JSONResponse:
     items = [PergbTierItem(**r) for r in result]
     return JSONResponse(
         content=PergbTiersResponse(items=items).model_dump(mode="json")
+    )
+
+
+# === /v1/admin/geos, /v1/admin/product_kinds — CATALOG-1 Phase A.6 ===
+
+
+@admin_catalog_router.get("/geos")
+async def list_geos() -> JSONResponse:
+    """List used geo codes with SKU counts.
+
+    Reads ``DISTINCT geo_code FROM skus WHERE geo_code != ''`` —
+    pergb / global SKUs (geo_code='') are intentionally excluded since
+    "no geo" isn't a real geo to manage. Returns empty list if no SKUs
+    have a populated geo_code.
+    """
+    rows = await asyncio.to_thread(
+        fetch_all,
+        """
+        SELECT geo_code, COUNT(*)::int AS sku_count
+          FROM skus
+         WHERE geo_code <> ''
+         GROUP BY geo_code
+         ORDER BY geo_code
+        """,
+    )
+    items = [GeoUsageItem(**r) for r in rows]
+    return JSONResponse(content=GeoListResponse(items=items).model_dump(mode="json"))
+
+
+@admin_catalog_router.get("/product_kinds")
+async def list_product_kinds() -> JSONResponse:
+    """List known product_kind values + usage counts.
+
+    The list of kinds is hardcoded in ``_PRODUCT_KIND_LABELS`` (mirrors
+    the CHECK constraint on ``skus.product_kind``). For each kind we
+    return its human-readable name and how many SKUs use it currently —
+    useful for the bot's "🏷 Типы прокси" read-only page.
+    """
+    rows = await asyncio.to_thread(
+        fetch_all,
+        """
+        SELECT product_kind, COUNT(*)::int AS sku_count
+          FROM skus
+         GROUP BY product_kind
+        """,
+    )
+    counts = {r["product_kind"]: int(r["sku_count"]) for r in rows}
+    items = [
+        ProductKindItem(kind=kind, name=label, sku_count=counts.get(kind, 0))
+        for kind, label in _PRODUCT_KIND_LABELS.items()
+    ]
+    return JSONResponse(
+        content=ProductKindListResponse(items=items).model_dump(mode="json")
     )

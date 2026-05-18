@@ -867,3 +867,80 @@ def test_put_tiers_400_when_sku_not_pergb(
     )
     assert r.status_code == 400
     assert r.json()["error"] == "sku_not_pergb"
+
+
+# === GET /v1/admin/geos ===
+
+
+def test_list_geos_populated(monkeypatch: pytest.MonkeyPatch, _no_auth: None) -> None:
+    rows = [
+        {"geo_code": "DE", "sku_count": 2},
+        {"geo_code": "UK", "sku_count": 1},
+        {"geo_code": "US", "sku_count": 4},
+    ]
+
+    def fake_fetch_all(query: str, params: Any = None) -> list[dict[str, Any]]:
+        assert "DISTINCT" not in query.upper() or "GROUP BY geo_code" in query
+        assert "geo_code <> ''" in query
+        return rows
+
+    monkeypatch.setattr("orchestrator.admin_catalog.fetch_all", fake_fetch_all)
+    from orchestrator.main import app
+
+    client = TestClient(app)
+    r = client.get("/v1/admin/geos")
+    assert r.status_code == 200
+    body = r.json()
+    assert len(body["items"]) == 3
+    assert body["items"][0] == {"geo_code": "DE", "sku_count": 2}
+
+
+def test_list_geos_empty(monkeypatch: pytest.MonkeyPatch, _no_auth: None) -> None:
+    monkeypatch.setattr("orchestrator.admin_catalog.fetch_all", lambda *_a, **_kw: [])
+    from orchestrator.main import app
+
+    client = TestClient(app)
+    r = client.get("/v1/admin/geos")
+    assert r.status_code == 200
+    assert r.json() == {"items": []}
+
+
+# === GET /v1/admin/product_kinds ===
+
+
+def test_list_product_kinds_returns_hardcoded_with_counts(
+    monkeypatch: pytest.MonkeyPatch, _no_auth: None
+) -> None:
+    rows = [
+        {"product_kind": "ipv6", "sku_count": 7},
+        {"product_kind": "datacenter_pergb", "sku_count": 1},
+    ]
+    monkeypatch.setattr(
+        "orchestrator.admin_catalog.fetch_all", lambda *_a, **_kw: rows
+    )
+    from orchestrator.main import app
+
+    client = TestClient(app)
+    r = client.get("/v1/admin/product_kinds")
+    assert r.status_code == 200
+    body = r.json()
+    assert len(body["items"]) == 2
+    by_kind = {it["kind"]: it for it in body["items"]}
+    assert by_kind["ipv6"]["name"] == "IPv6 SOCKS5"
+    assert by_kind["ipv6"]["sku_count"] == 7
+    assert by_kind["datacenter_pergb"]["name"] == "Pay-per-GB Datacenter"
+    assert by_kind["datacenter_pergb"]["sku_count"] == 1
+
+
+def test_list_product_kinds_zero_counts_when_no_skus(
+    monkeypatch: pytest.MonkeyPatch, _no_auth: None
+) -> None:
+    monkeypatch.setattr("orchestrator.admin_catalog.fetch_all", lambda *_a, **_kw: [])
+    from orchestrator.main import app
+
+    client = TestClient(app)
+    r = client.get("/v1/admin/product_kinds")
+    assert r.status_code == 200
+    body = r.json()
+    assert all(it["sku_count"] == 0 for it in body["items"])
+    assert {it["kind"] for it in body["items"]} == {"ipv6", "datacenter_pergb"}
