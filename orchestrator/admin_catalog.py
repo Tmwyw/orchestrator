@@ -24,6 +24,9 @@ from orchestrator.api_schemas import (
     BindingItem,
     BindingListResponse,
     BindingUpdateRequest,
+    PergbTierItem,
+    PergbTiersPutRequest,
+    PergbTiersResponse,
     ProblemResponse,
     SkuAdminDetail,
     SkuAdminItem,
@@ -745,4 +748,138 @@ async def delete_binding(sku_id: int, node_id: str) -> JSONResponse:
     assert isinstance(result, dict)
     return JSONResponse(
         content={"success": True, "sku_id": result["sku_id"], "node_id": result["node_id"]}
+    )
+
+
+# === /v1/admin/skus/{sku_id}/tiers — CATALOG-1 Phase A.5 ===
+#
+# Tiers are stored in the dedicated ``sku_tiers`` table (migration 024),
+# NOT in ``skus.metadata.tiers`` as the original plan text suggested.
+# Reasoning recorded in wave_catalog1_plan.md "Решения / отклонения".
+
+
+def _list_tiers_sync(sku_id: int) -> list[dict[str, Any]] | str:
+    sku = fetch_one("SELECT 1 FROM skus WHERE id = %s", (sku_id,))
+    if not sku:
+        return "sku_not_found"
+    rows = fetch_all(
+        """
+        SELECT gb, price_per_gb
+          FROM sku_tiers
+         WHERE sku_id = %s AND is_active = TRUE
+         ORDER BY gb ASC
+        """,
+        (sku_id,),
+    )
+    return rows
+
+
+def _replace_tiers_sync(
+    sku_id: int, payload: PergbTiersPutRequest
+) -> list[dict[str, Any]] | str:
+    """Atomically replace the tier table for an SKU.
+
+    Uses a single txn: soft-delete all existing tiers (is_active=false)
+    then insert the new ones. The bot's /v1/skus/active reader filters
+    by is_active so a partial intermediate state is never visible. We
+    soft-delete rather than DELETE so historical tier values stay
+    queryable for audit / debugging.
+
+    Validates that the target SKU is product_kind=datacenter_pergb —
+    tiers are only meaningful there.
+    """
+    with connect() as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT id, product_kind FROM skus WHERE id = %s FOR UPDATE",
+            (sku_id,),
+        )
+        sku = cur.fetchone()
+        if not sku:
+            return "sku_not_found"
+        if sku["product_kind"] != "datacenter_pergb":
+            return "sku_not_pergb"
+
+        cur.execute(
+            "UPDATE sku_tiers SET is_active = FALSE, updated_at = now() "
+            "WHERE sku_id = %s AND is_active = TRUE",
+            (sku_id,),
+        )
+
+        new_rows: list[dict[str, Any]] = []
+        for tier in payload.tiers:
+            # Re-insert: there might be an existing (sku_id, gb) row from
+            # a previous version since UNIQUE(sku_id, gb) is on the table.
+            # Upsert pattern resurrects soft-deleted rows in-place rather
+            # than inserting a sibling.
+            cur.execute(
+                """
+                INSERT INTO sku_tiers (sku_id, gb, price_per_gb, is_active)
+                VALUES (%s, %s, %s, TRUE)
+                ON CONFLICT (sku_id, gb) DO UPDATE
+                  SET price_per_gb = EXCLUDED.price_per_gb,
+                      is_active    = TRUE,
+                      updated_at   = now()
+                RETURNING gb, price_per_gb
+                """,
+                (sku_id, tier.gb, tier.price_per_gb),
+            )
+            row = cur.fetchone()
+            assert row is not None
+            new_rows.append(dict(row))
+
+        _audit(
+            cur,
+            action="tiers_replaced",
+            target_type="sku_tiers",
+            target_id=sku_id,
+            details={
+                "tiers": [
+                    {"gb": t.gb, "price_per_gb": str(t.price_per_gb)}
+                    for t in payload.tiers
+                ]
+            },
+        )
+        return new_rows
+
+
+@admin_catalog_router.get("/skus/{sku_id}/tiers")
+async def list_tiers(sku_id: int) -> JSONResponse:
+    """List active pergb tiers for an SKU.
+
+    Returns 404 if the SKU does not exist. An SKU with no active tiers
+    returns ``{items: []}``.
+    """
+    result = await asyncio.to_thread(_list_tiers_sync, sku_id)
+    if result == "sku_not_found":
+        return _problem(404, "sku_not_found")
+    assert isinstance(result, list)
+    items = [PergbTierItem(**r) for r in result]
+    return JSONResponse(
+        content=PergbTiersResponse(items=items).model_dump(mode="json")
+    )
+
+
+@admin_catalog_router.put("/skus/{sku_id}/tiers")
+async def put_tiers(sku_id: int, payload: PergbTiersPutRequest) -> JSONResponse:
+    """Atomic replace of the pergb tier table for an SKU.
+
+    Pydantic enforces:
+      - ``gb`` strictly ascending across the list
+      - ``price_per_gb`` monotonically non-increasing (cheaper-or-equal
+        at higher quantities)
+      - 1..100 tiers per SKU
+
+    Endpoint checks the SKU exists and is ``product_kind=datacenter_pergb``
+    (returns 400 ``sku_not_pergb`` otherwise — tiers on a per-piece SKU
+    are meaningless).
+    """
+    result = await asyncio.to_thread(_replace_tiers_sync, sku_id, payload)
+    if result == "sku_not_found":
+        return _problem(404, "sku_not_found")
+    if result == "sku_not_pergb":
+        return _problem(400, "sku_not_pergb")
+    assert isinstance(result, list)
+    items = [PergbTierItem(**r) for r in result]
+    return JSONResponse(
+        content=PergbTiersResponse(items=items).model_dump(mode="json")
     )

@@ -705,3 +705,165 @@ def test_delete_binding_404(monkeypatch: pytest.MonkeyPatch, _no_auth: None) -> 
     client = TestClient(app)
     r = client.delete("/v1/admin/skus/1/bindings/node-missing")
     assert r.status_code == 404
+
+
+# === GET /v1/admin/skus/{id}/tiers ===
+
+
+def test_list_tiers_happy(monkeypatch: pytest.MonkeyPatch, _no_auth: None) -> None:
+    rows = [
+        {"gb": 10, "price_per_gb": Decimal("1.00")},
+        {"gb": 50, "price_per_gb": Decimal("0.80")},
+        {"gb": 200, "price_per_gb": Decimal("0.50")},
+    ]
+    monkeypatch.setattr(
+        "orchestrator.admin_catalog._list_tiers_sync", lambda _id: rows
+    )
+    from orchestrator.main import app
+
+    client = TestClient(app)
+    r = client.get("/v1/admin/skus/1/tiers")
+    assert r.status_code == 200
+    body = r.json()
+    assert len(body["items"]) == 3
+    assert body["items"][0]["gb"] == 10
+    assert body["items"][0]["price_per_gb"] == "1.00"
+    assert body["items"][2]["gb"] == 200
+
+
+def test_list_tiers_404_sku_missing(
+    monkeypatch: pytest.MonkeyPatch, _no_auth: None
+) -> None:
+    monkeypatch.setattr(
+        "orchestrator.admin_catalog._list_tiers_sync", lambda _id: "sku_not_found"
+    )
+    from orchestrator.main import app
+
+    client = TestClient(app)
+    r = client.get("/v1/admin/skus/9999/tiers")
+    assert r.status_code == 404
+
+
+def test_list_tiers_empty_returns_empty_list(
+    monkeypatch: pytest.MonkeyPatch, _no_auth: None
+) -> None:
+    monkeypatch.setattr("orchestrator.admin_catalog._list_tiers_sync", lambda _id: [])
+    from orchestrator.main import app
+
+    client = TestClient(app)
+    r = client.get("/v1/admin/skus/1/tiers")
+    assert r.status_code == 200
+    assert r.json() == {"items": []}
+
+
+# === PUT /v1/admin/skus/{id}/tiers ===
+
+
+def test_put_tiers_happy(monkeypatch: pytest.MonkeyPatch, _no_auth: None) -> None:
+    new_rows = [
+        {"gb": 10, "price_per_gb": Decimal("1.00")},
+        {"gb": 100, "price_per_gb": Decimal("0.70")},
+    ]
+    captured: dict[str, Any] = {}
+
+    def fake_replace(sku_id: int, payload: Any) -> list[dict[str, Any]]:
+        captured["sku_id"] = sku_id
+        captured["tiers"] = [(t.gb, str(t.price_per_gb)) for t in payload.tiers]
+        return new_rows
+
+    monkeypatch.setattr("orchestrator.admin_catalog._replace_tiers_sync", fake_replace)
+    from orchestrator.main import app
+
+    client = TestClient(app)
+    r = client.put(
+        "/v1/admin/skus/1/tiers",
+        json={
+            "tiers": [
+                {"gb": 10, "price_per_gb": "1.00"},
+                {"gb": 100, "price_per_gb": "0.70"},
+            ]
+        },
+    )
+    assert r.status_code == 200
+    assert len(r.json()["items"]) == 2
+    assert captured["sku_id"] == 1
+    assert captured["tiers"] == [(10, "1.00"), (100, "0.70")]
+
+
+def test_put_tiers_422_when_gb_not_ascending(
+    monkeypatch: pytest.MonkeyPatch, _no_auth: None
+) -> None:
+    monkeypatch.setattr(
+        "orchestrator.admin_catalog._replace_tiers_sync",
+        lambda _id, _p: (_ for _ in ()).throw(AssertionError("must not run")),
+    )
+    from orchestrator.main import app
+
+    client = TestClient(app)
+    r = client.put(
+        "/v1/admin/skus/1/tiers",
+        json={
+            "tiers": [
+                {"gb": 100, "price_per_gb": "0.50"},
+                {"gb": 50, "price_per_gb": "0.80"},
+            ]
+        },
+    )
+    assert r.status_code == 422
+
+
+def test_put_tiers_422_when_price_not_monotonic(
+    monkeypatch: pytest.MonkeyPatch, _no_auth: None
+) -> None:
+    monkeypatch.setattr(
+        "orchestrator.admin_catalog._replace_tiers_sync",
+        lambda _id, _p: (_ for _ in ()).throw(AssertionError("must not run")),
+    )
+    from orchestrator.main import app
+
+    client = TestClient(app)
+    r = client.put(
+        "/v1/admin/skus/1/tiers",
+        json={
+            "tiers": [
+                {"gb": 10, "price_per_gb": "0.50"},
+                {"gb": 100, "price_per_gb": "1.00"},  # higher price at higher gb
+            ]
+        },
+    )
+    assert r.status_code == 422
+
+
+def test_put_tiers_404_when_sku_missing(
+    monkeypatch: pytest.MonkeyPatch, _no_auth: None
+) -> None:
+    monkeypatch.setattr(
+        "orchestrator.admin_catalog._replace_tiers_sync",
+        lambda _id, _p: "sku_not_found",
+    )
+    from orchestrator.main import app
+
+    client = TestClient(app)
+    r = client.put(
+        "/v1/admin/skus/9999/tiers",
+        json={"tiers": [{"gb": 10, "price_per_gb": "1.00"}]},
+    )
+    assert r.status_code == 404
+
+
+def test_put_tiers_400_when_sku_not_pergb(
+    monkeypatch: pytest.MonkeyPatch, _no_auth: None
+) -> None:
+    monkeypatch.setattr(
+        "orchestrator.admin_catalog._replace_tiers_sync",
+        lambda _id, _p: "sku_not_pergb",
+    )
+    from orchestrator.main import app
+
+    client = TestClient(app)
+    r = client.put(
+        "/v1/admin/skus/1/tiers",
+        json={"tiers": [{"gb": 10, "price_per_gb": "1.00"}]},
+    )
+    assert r.status_code == 400
+    assert r.json()["error"] == "sku_not_pergb"
