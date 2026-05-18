@@ -729,6 +729,7 @@ class GeoUsageItem(BaseModel):
 
     geo_code: str
     sku_count: int
+    active_count: int = 0  # D-Polishing-A.3 — count of is_active=true SKUs
 
 
 class GeoListResponse(BaseModel):
@@ -743,6 +744,8 @@ class ProductKindItem(BaseModel):
     kind: str
     name: str
     sku_count: int
+    total_stock: int = 0  # D-Polishing-A.3 — SUM of stock_available
+    #   across all SKUs of this kind
 
 
 class ProductKindListResponse(BaseModel):

@@ -811,9 +811,9 @@ def test_put_tiers_400_when_sku_not_pergb(monkeypatch: pytest.MonkeyPatch, _no_a
 
 def test_list_geos_populated(monkeypatch: pytest.MonkeyPatch, _no_auth: None) -> None:
     rows = [
-        {"geo_code": "DE", "sku_count": 2},
-        {"geo_code": "UK", "sku_count": 1},
-        {"geo_code": "US", "sku_count": 4},
+        {"geo_code": "DE", "sku_count": 2, "active_count": 2},
+        {"geo_code": "UK", "sku_count": 1, "active_count": 0},
+        {"geo_code": "US", "sku_count": 4, "active_count": 3},
     ]
 
     def fake_fetch_all(query: str, params: Any = None) -> list[dict[str, Any]]:
@@ -829,7 +829,10 @@ def test_list_geos_populated(monkeypatch: pytest.MonkeyPatch, _no_auth: None) ->
     assert r.status_code == 200
     body = r.json()
     assert len(body["items"]) == 3
-    assert body["items"][0] == {"geo_code": "DE", "sku_count": 2}
+    # D-Polishing-A.3: active_count surfaces alongside sku_count
+    assert body["items"][0] == {"geo_code": "DE", "sku_count": 2, "active_count": 2}
+    assert body["items"][1] == {"geo_code": "UK", "sku_count": 1, "active_count": 0}
+    assert body["items"][2] == {"geo_code": "US", "sku_count": 4, "active_count": 3}
 
 
 def test_list_geos_empty(monkeypatch: pytest.MonkeyPatch, _no_auth: None) -> None:
@@ -849,8 +852,8 @@ def test_list_product_kinds_returns_hardcoded_with_counts(
     monkeypatch: pytest.MonkeyPatch, _no_auth: None
 ) -> None:
     rows = [
-        {"product_kind": "ipv6", "sku_count": 7},
-        {"product_kind": "datacenter_pergb", "sku_count": 1},
+        {"product_kind": "ipv6", "sku_count": 7, "total_stock": 12450},
+        {"product_kind": "datacenter_pergb", "sku_count": 1, "total_stock": 0},
     ]
     monkeypatch.setattr("orchestrator.admin_catalog.fetch_all", lambda *_a, **_kw: rows)
     from orchestrator.main import app
@@ -863,8 +866,10 @@ def test_list_product_kinds_returns_hardcoded_with_counts(
     by_kind = {it["kind"]: it for it in body["items"]}
     assert by_kind["ipv6"]["name"] == "IPv6 SOCKS5"
     assert by_kind["ipv6"]["sku_count"] == 7
+    assert by_kind["ipv6"]["total_stock"] == 12450  # D-Polishing-A.3
     assert by_kind["datacenter_pergb"]["name"] == "Pay-per-GB Datacenter"
     assert by_kind["datacenter_pergb"]["sku_count"] == 1
+    assert by_kind["datacenter_pergb"]["total_stock"] == 0
 
 
 def test_list_product_kinds_zero_counts_when_no_skus(monkeypatch: pytest.MonkeyPatch, _no_auth: None) -> None:
@@ -976,3 +981,86 @@ def test_display_name_unknown_kind_uses_raw_code() -> None:
         _compute_display_name(kind="future_kind", geo_code="US", protocol="socks5", duration_days=30)
         == "🇺🇸 future_kind US SOCKS5 (30d)"
     )
+
+
+# === CATALOG-1 Phase D-Polishing-A.3 — total_stock + active_count ===
+
+
+def test_list_kinds_query_sums_available_inventory(monkeypatch: pytest.MonkeyPatch, _no_auth: None) -> None:
+    """SQL must join proxy_inventory with status='available' filter."""
+    captured: dict[str, Any] = {}
+
+    def fake_fetch_all(query: str, _params: Any = None) -> list[dict[str, Any]]:
+        captured["query"] = query
+        return [{"product_kind": "ipv6", "sku_count": 5, "total_stock": 4000}]
+
+    monkeypatch.setattr("orchestrator.admin_catalog.fetch_all", fake_fetch_all)
+    from orchestrator.main import app
+
+    client = TestClient(app)
+    r = client.get("/v1/admin/product_kinds")
+    assert r.status_code == 200
+    # Query should aggregate proxy_inventory with status='available'
+    assert "proxy_inventory" in captured["query"]
+    assert "status = 'available'" in captured["query"]
+
+
+def test_list_kinds_zero_total_stock_for_kind_without_inventory(
+    monkeypatch: pytest.MonkeyPatch, _no_auth: None
+) -> None:
+    """A kind row missing from fetch_all results (e.g. datacenter_pergb
+    with no SKUs at all) still appears in the response with both counts
+    at 0 — the response is anchored on _PRODUCT_KIND_LABELS, not on the
+    query rows."""
+    monkeypatch.setattr(
+        "orchestrator.admin_catalog.fetch_all",
+        lambda *_a, **_kw: [
+            {"product_kind": "ipv6", "sku_count": 3, "total_stock": 250},
+        ],
+    )
+    from orchestrator.main import app
+
+    client = TestClient(app)
+    r = client.get("/v1/admin/product_kinds")
+    body = r.json()
+    by_kind = {it["kind"]: it for it in body["items"]}
+    assert by_kind["datacenter_pergb"]["sku_count"] == 0
+    assert by_kind["datacenter_pergb"]["total_stock"] == 0
+
+
+def test_list_geos_active_count_can_be_less_than_sku_count(
+    monkeypatch: pytest.MonkeyPatch, _no_auth: None
+) -> None:
+    """active_count = SUM(CASE WHEN is_active THEN 1 ELSE 0 END), which
+    can be < sku_count when some SKUs are soft-deleted."""
+    monkeypatch.setattr(
+        "orchestrator.admin_catalog.fetch_all",
+        lambda *_a, **_kw: [
+            {"geo_code": "RU", "sku_count": 5, "active_count": 2},
+        ],
+    )
+    from orchestrator.main import app
+
+    client = TestClient(app)
+    r = client.get("/v1/admin/geos")
+    body = r.json()
+    assert body["items"][0]["sku_count"] == 5
+    assert body["items"][0]["active_count"] == 2
+
+
+def test_list_geos_query_uses_case_aggregation(monkeypatch: pytest.MonkeyPatch, _no_auth: None) -> None:
+    """SQL should aggregate active_count via CASE WHEN is_active, not a
+    second query."""
+    captured: dict[str, Any] = {}
+
+    def fake_fetch_all(query: str, _params: Any = None) -> list[dict[str, Any]]:
+        captured["query"] = query
+        return []
+
+    monkeypatch.setattr("orchestrator.admin_catalog.fetch_all", fake_fetch_all)
+    from orchestrator.main import app
+
+    client = TestClient(app)
+    client.get("/v1/admin/geos")
+    assert "CASE WHEN is_active" in captured["query"]
+    assert "active_count" in captured["query"]

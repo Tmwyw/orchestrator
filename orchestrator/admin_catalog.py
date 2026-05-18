@@ -988,11 +988,18 @@ async def list_geos() -> JSONResponse:
     pergb / global SKUs (geo_code='') are intentionally excluded since
     "no geo" isn't a real geo to manage. Returns empty list if no SKUs
     have a populated geo_code.
+
+    D-Polishing-A.3: also reports ``active_count`` (is_active=true subset)
+    so the bot can render "🇺🇸 US — 3 SKU (1 неактивный)" without a
+    follow-up admin_list_skus(geo=US) round-trip.
     """
     rows = await asyncio.to_thread(
         fetch_all,
         """
-        SELECT geo_code, COUNT(*)::int AS sku_count
+        SELECT
+          geo_code,
+          COUNT(*)::int AS sku_count,
+          COALESCE(SUM(CASE WHEN is_active THEN 1 ELSE 0 END), 0)::int AS active_count
           FROM skus
          WHERE geo_code <> ''
          GROUP BY geo_code
@@ -1009,20 +1016,36 @@ async def list_product_kinds() -> JSONResponse:
 
     The list of kinds is hardcoded in ``_PRODUCT_KIND_LABELS`` (mirrors
     the CHECK constraint on ``skus.product_kind``). For each kind we
-    return its human-readable name and how many SKUs use it currently —
-    useful for the bot's "🏷 Типы прокси" read-only page.
+    return its human-readable name, sku_count, and aggregate
+    ``total_stock`` (sum of available inventory across all SKUs of
+    this kind) so the bot's "🏷 Типы прокси" page can show "12450 в
+    пуле" without N+1 detail fetches.
+
+    LEFT JOIN proxy_inventory because a kind with zero SKUs still
+    needs a row in the response (sku_count + total_stock both 0).
     """
     rows = await asyncio.to_thread(
         fetch_all,
         """
-        SELECT product_kind, COUNT(*)::int AS sku_count
-          FROM skus
-         GROUP BY product_kind
+        SELECT
+          s.product_kind,
+          COUNT(DISTINCT s.id)::int AS sku_count,
+          COALESCE(SUM(CASE WHEN pi.status = 'available' THEN 1 ELSE 0 END), 0)::int
+            AS total_stock
+          FROM skus s
+          LEFT JOIN proxy_inventory pi ON pi.sku_id = s.id
+         GROUP BY s.product_kind
         """,
     )
     counts = {r["product_kind"]: int(r["sku_count"]) for r in rows}
+    totals = {r["product_kind"]: int(r["total_stock"]) for r in rows}
     items = [
-        ProductKindItem(kind=kind, name=label, sku_count=counts.get(kind, 0))
+        ProductKindItem(
+            kind=kind,
+            name=label,
+            sku_count=counts.get(kind, 0),
+            total_stock=totals.get(kind, 0),
+        )
         for kind, label in _PRODUCT_KIND_LABELS.items()
     ]
     return JSONResponse(content=ProductKindListResponse(items=items).model_dump(mode="json"))
