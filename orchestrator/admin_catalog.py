@@ -12,6 +12,7 @@ so each can be feature-flagged off if needed.
 from __future__ import annotations
 
 import asyncio
+from decimal import Decimal
 from typing import Any
 
 import psycopg
@@ -218,6 +219,45 @@ async def list_skus(
     return JSONResponse(content=response.model_dump(mode="json"))
 
 
+# ── Sales-30d aggregation (D-Polishing-A.5) ────────────────────────
+
+
+def _fetch_sales_30d(sku_id: int) -> tuple[int, Decimal]:
+    """Aggregate 30-day sales for a SKU.
+
+    Counts orders in ('committed', 'expired') created within the
+    trailing 30 days. ``committed`` = paid and proxies live;
+    ``expired`` = proxies aged out (still a sale that produced
+    revenue). ``reserved`` and ``released`` are excluded — reserved
+    isn't paid yet, released was either cancelled or refunded.
+
+    The orders table has no ``is_admin_gift`` column (gifts are flagged
+    bot-side in ``orders_local``), so admin-gift filtering is a no-op
+    here — bot's admin-gift orders still hit ``price_amount > 0``
+    when the gift_service paths through reserve+commit, but the
+    refund/release path zeroes it out. If admin gifts ever appear in
+    the catalog stats they're indistinguishable from regular sales.
+
+    Returns ``(count, revenue)`` — revenue is ``Decimal('0')`` when
+    no rows match (COALESCE in SQL).
+    """
+    row = fetch_one(
+        """
+        SELECT
+          COUNT(*)::int AS sales_count,
+          COALESCE(SUM(price_amount), 0) AS sales_revenue
+          FROM orders
+         WHERE sku_id = %s
+           AND status IN ('committed', 'expired')
+           AND created_at >= now() - INTERVAL '30 days'
+        """,
+        (sku_id,),
+    )
+    if not row:
+        return 0, Decimal("0")
+    return int(row["sales_count"]), Decimal(str(row["sales_revenue"] or 0))
+
+
 # === GET /v1/admin/skus/{id} ===
 
 
@@ -280,6 +320,7 @@ async def get_sku(sku_id: int) -> JSONResponse:
         "expired_grace": sum(int(r["expired_grace"]) for r in breakdown_rows),
         "pending_validation": sum(int(r["pending_validation"]) for r in breakdown_rows),
     }
+    sales_count, sales_revenue = await asyncio.to_thread(_fetch_sales_30d, sku_id)
     detail = SkuAdminDetail(
         **sku_row,
         stock_total=stock_total,
@@ -290,6 +331,8 @@ async def get_sku(sku_id: int) -> JSONResponse:
             protocol=sku_row.get("protocol"),
             duration_days=sku_row.get("duration_days"),
         ),
+        sales_30d_count=sales_count,
+        sales_30d_revenue=sales_revenue,
     )
     return JSONResponse(content=detail.model_dump(mode="json"))
 
@@ -594,6 +637,7 @@ async def _fresh_sku_detail(sku_row: dict[str, Any]) -> JSONResponse:
         "expired_grace": sum(int(r["expired_grace"]) for r in breakdown_rows),
         "pending_validation": sum(int(r["pending_validation"]) for r in breakdown_rows),
     }
+    sales_count, sales_revenue = await asyncio.to_thread(_fetch_sales_30d, sku_row["id"])
     detail = SkuAdminDetail(
         **sku_row,
         stock_total=stock_total,
@@ -604,6 +648,8 @@ async def _fresh_sku_detail(sku_row: dict[str, Any]) -> JSONResponse:
             protocol=sku_row.get("protocol"),
             duration_days=sku_row.get("duration_days"),
         ),
+        sales_30d_count=sales_count,
+        sales_30d_revenue=sales_revenue,
     )
     return JSONResponse(content=detail.model_dump(mode="json"))
 

@@ -158,6 +158,10 @@ def test_get_sku_returns_detail_with_breakdown(monkeypatch: pytest.MonkeyPatch, 
     ]
 
     def fake_fetch_one(query: str, params: Any = None) -> dict[str, Any]:
+        # D-Polishing-A.5 added a sales_30d fetch_one alongside the
+        # primary SKU SELECT — route by table name.
+        if "FROM orders" in query:
+            return {"sales_count": 0, "sales_revenue": Decimal("0")}
         assert "FROM skus" in query
         assert params == (1,)
         return sku_row
@@ -401,6 +405,8 @@ def test_patch_sku_happy_path(monkeypatch: pytest.MonkeyPatch, _no_auth: None) -
 
     monkeypatch.setattr("orchestrator.admin_catalog._update_sku_sync", fake_update)
     monkeypatch.setattr("orchestrator.admin_catalog.fetch_all", lambda *_a, **_kw: [])
+    # D-Polishing-A.5: _fresh_sku_detail now also fetches sales_30d
+    monkeypatch.setattr("orchestrator.admin_catalog._fetch_sales_30d", lambda _id: (0, Decimal("0")))
 
     from orchestrator.main import app
 
@@ -926,7 +932,9 @@ def test_get_sku_detail_includes_display_name(monkeypatch: pytest.MonkeyPatch, _
         "metadata": {},
     }
 
-    def fake_fetch_one(_query: str, _params: Any = None) -> dict[str, Any]:
+    def fake_fetch_one(query: str, _params: Any = None) -> dict[str, Any]:
+        if "FROM orders" in query:
+            return {"sales_count": 0, "sales_revenue": Decimal("0")}
         return detail_row
 
     def fake_fetch_all(_query: str, _params: Any = None) -> list[dict[str, Any]]:
@@ -1128,3 +1136,121 @@ def test_list_bindings_existing_test_still_passes_with_default_count(
     r = client.get("/v1/admin/skus/1/bindings")
     assert r.status_code == 200
     assert r.json()["items"][0]["available_count"] == 0
+
+
+# === CATALOG-1 Phase D-Polishing-A.5 — sales_30d ===
+
+
+def _sku_detail_row() -> dict[str, Any]:
+    return {
+        **_ipv6_us_row(),
+        "validation_require_ipv6": True,
+        "metadata": {},
+    }
+
+
+def test_sku_detail_sales_30d_surfaces_count_and_revenue(
+    monkeypatch: pytest.MonkeyPatch, _no_auth: None
+) -> None:
+    """sales_30d aggregate is fetched via _fetch_sales_30d and flows
+    out as sales_30d_count + sales_30d_revenue."""
+
+    def fake_fetch_one(query: str, _params: Any = None) -> dict[str, Any]:
+        if "FROM orders" in query:
+            return {"sales_count": 234, "sales_revenue": Decimal("585.00")}
+        return _sku_detail_row()
+
+    monkeypatch.setattr("orchestrator.admin_catalog.fetch_one", fake_fetch_one)
+    monkeypatch.setattr("orchestrator.admin_catalog.fetch_all", lambda *_a, **_kw: [])
+
+    from orchestrator.main import app
+
+    client = TestClient(app)
+    r = client.get("/v1/admin/skus/1")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["sales_30d_count"] == 234
+    assert body["sales_30d_revenue"] == "585.00"
+
+
+def test_sku_detail_sales_30d_query_only_committed_and_expired(
+    monkeypatch: pytest.MonkeyPatch, _no_auth: None
+) -> None:
+    """SQL filter: status IN ('committed', 'expired') AND 30-day window."""
+    captured: dict[str, str] = {}
+
+    def fake_fetch_one(query: str, _params: Any = None) -> dict[str, Any]:
+        if "FROM orders" in query:
+            captured["sales_query"] = query
+            return {"sales_count": 0, "sales_revenue": Decimal("0")}
+        return _sku_detail_row()
+
+    monkeypatch.setattr("orchestrator.admin_catalog.fetch_one", fake_fetch_one)
+    monkeypatch.setattr("orchestrator.admin_catalog.fetch_all", lambda *_a, **_kw: [])
+
+    from orchestrator.main import app
+
+    client = TestClient(app)
+    client.get("/v1/admin/skus/1")
+    sql = captured["sales_query"]
+    assert "status IN ('committed', 'expired')" in sql
+    assert "INTERVAL '30 days'" in sql
+    # Reserved + released MUST be excluded (refunds + open carts).
+    assert "'reserved'" not in sql
+    assert "'released'" not in sql
+
+
+def test_sku_detail_sales_30d_zero_when_no_rows(monkeypatch: pytest.MonkeyPatch, _no_auth: None) -> None:
+    """Empty sales fetch (no orders this month) → (0, Decimal('0'))."""
+
+    def fake_fetch_one(query: str, _params: Any = None) -> dict[str, Any] | None:
+        if "FROM orders" in query:
+            # Real query returns COUNT/COALESCE so it never returns None,
+            # but exercise the fallback defensively.
+            return {"sales_count": 0, "sales_revenue": Decimal("0")}
+        return _sku_detail_row()
+
+    monkeypatch.setattr("orchestrator.admin_catalog.fetch_one", fake_fetch_one)
+    monkeypatch.setattr("orchestrator.admin_catalog.fetch_all", lambda *_a, **_kw: [])
+
+    from orchestrator.main import app
+
+    client = TestClient(app)
+    r = client.get("/v1/admin/skus/1")
+    body = r.json()
+    assert body["sales_30d_count"] == 0
+    assert body["sales_30d_revenue"] == "0"
+
+
+def test_create_sku_response_has_zero_sales_30d(monkeypatch: pytest.MonkeyPatch, _no_auth: None) -> None:
+    """Freshly created SKU has no orders — default sales_30d_count=0
+    + sales_30d_revenue='0' applied without a DB hit."""
+    inserted_row = {
+        **_ipv6_us_row(),
+        "validation_require_ipv6": True,
+        "metadata": {},
+        "code": "ipv6_fr_socks5",
+        "geo_code": "FR",
+        "id": 99,
+    }
+    monkeypatch.setattr("orchestrator.admin_catalog._create_sku_sync", lambda _payload: inserted_row)
+
+    from orchestrator.main import app
+
+    client = TestClient(app)
+    r = client.post(
+        "/v1/admin/skus",
+        json={
+            "code": "ipv6_fr_socks5",
+            "product_kind": "ipv6",
+            "geo_code": "FR",
+            "protocol": "socks5",
+            "duration_days": 30,
+            "price_per_piece": "2.50",
+            "target_stock": 5000,
+        },
+    )
+    assert r.status_code == 201
+    body = r.json()
+    assert body["sales_30d_count"] == 0
+    assert body["sales_30d_revenue"] == "0"
