@@ -870,3 +870,102 @@ def test_list_product_kinds_zero_counts_when_no_skus(monkeypatch: pytest.MonkeyP
     body = r.json()
     assert all(it["sku_count"] == 0 for it in body["items"])
     assert {it["kind"] for it in body["items"]} == {"ipv6", "datacenter_pergb"}
+
+
+# === CATALOG-1 Phase D-Polishing-A.1 — display_name ===
+
+
+def _ipv6_us_row(stock_available: int = 100) -> dict[str, Any]:
+    return {
+        "id": 1,
+        "code": "ipv6_us_socks5",
+        "product_kind": "ipv6",
+        "geo_code": "US",
+        "protocol": "socks5",
+        "duration_days": 30,
+        "price_per_piece": Decimal("2.50"),
+        "price_per_gb": None,
+        "target_stock": 5000,
+        "refill_batch_size": 500,
+        "is_active": True,
+        "stock_available": stock_available,
+        "created_at": datetime(2026, 4, 1, tzinfo=timezone.utc),
+        "updated_at": datetime(2026, 4, 1, tzinfo=timezone.utc),
+    }
+
+
+def test_list_skus_includes_display_name(monkeypatch: pytest.MonkeyPatch, _no_auth: None) -> None:
+    monkeypatch.setattr(
+        "orchestrator.admin_catalog.fetch_all",
+        lambda *_a, **_kw: [_ipv6_us_row()],
+    )
+    from orchestrator.main import app
+
+    client = TestClient(app)
+    r = client.get("/v1/admin/skus")
+    assert r.status_code == 200
+    assert r.json()["items"][0]["display_name"] == "🇺🇸 IPv6 US SOCKS5 (30d)"
+
+
+def test_get_sku_detail_includes_display_name(monkeypatch: pytest.MonkeyPatch, _no_auth: None) -> None:
+    detail_row = {
+        **_ipv6_us_row(),
+        "validation_require_ipv6": True,
+        "metadata": {},
+    }
+
+    def fake_fetch_one(_query: str, _params: Any = None) -> dict[str, Any]:
+        return detail_row
+
+    def fake_fetch_all(_query: str, _params: Any = None) -> list[dict[str, Any]]:
+        # bindings / breakdown query — empty list is fine for display_name check.
+        return []
+
+    monkeypatch.setattr("orchestrator.admin_catalog.fetch_one", fake_fetch_one)
+    monkeypatch.setattr("orchestrator.admin_catalog.fetch_all", fake_fetch_all)
+
+    from orchestrator.main import app
+
+    client = TestClient(app)
+    r = client.get("/v1/admin/skus/1")
+    assert r.status_code == 200
+    assert r.json()["display_name"] == "🇺🇸 IPv6 US SOCKS5 (30d)"
+
+
+def test_display_name_pergb_no_geo() -> None:
+    from orchestrator.admin_catalog import _compute_display_name
+
+    assert (
+        _compute_display_name(kind="datacenter_pergb", geo_code="", protocol="socks5", duration_days=30)
+        == "🌐 Datacenter Pay-per-GB"
+    )
+
+
+def test_display_name_pergb_with_geo_keeps_geo_drops_protocol_duration() -> None:
+    """Pergb shows geo when present, but protocol/duration are
+    irrelevant for it."""
+    from orchestrator.admin_catalog import _compute_display_name
+
+    assert (
+        _compute_display_name(kind="datacenter_pergb", geo_code="DE", protocol="socks5", duration_days=30)
+        == "🇩🇪 Datacenter Pay-per-GB DE"
+    )
+
+
+def test_display_name_unknown_geo_falls_back_to_white_flag() -> None:
+    from orchestrator.admin_catalog import _compute_display_name
+
+    assert (
+        _compute_display_name(kind="ipv6", geo_code="ZZ", protocol="http", duration_days=7)
+        == "🏳️ IPv6 ZZ HTTP (7d)"
+    )
+
+
+def test_display_name_unknown_kind_uses_raw_code() -> None:
+    """Unknown product_kind falls through as-is (no dictionary entry)."""
+    from orchestrator.admin_catalog import _compute_display_name
+
+    assert (
+        _compute_display_name(kind="future_kind", geo_code="US", protocol="socks5", duration_days=30)
+        == "🇺🇸 future_kind US SOCKS5 (30d)"
+    )

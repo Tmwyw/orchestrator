@@ -480,7 +480,13 @@ class SkusListResponse(BaseModel):
 
 
 class SkuAdminItem(BaseModel):
-    """Row in GET /v1/admin/skus list. Includes inactive SKUs."""
+    """Row in GET /v1/admin/skus list. Includes inactive SKUs.
+
+    ``display_name`` is computed at query time (see
+    ``admin_catalog._compute_display_name``) — emoji + kind label + geo
+    + protocol + duration — so the bot can render SKU buttons / cards
+    without maintaining its own copy of the label / flag dictionaries.
+    """
 
     model_config = ConfigDict(str_strip_whitespace=True, extra="ignore")
 
@@ -496,6 +502,7 @@ class SkuAdminItem(BaseModel):
     refill_batch_size: int
     is_active: bool
     stock_available: int
+    display_name: str
     created_at: datetime
     updated_at: datetime
 
@@ -522,7 +529,13 @@ class SkuStockBreakdownItem(BaseModel):
 
 
 class SkuAdminDetail(BaseModel):
-    """GET /v1/admin/skus/{id} — full SKU info + per-node breakdown."""
+    """GET /v1/admin/skus/{id} — full SKU info + per-node breakdown.
+
+    ``display_name`` mirrors the value on ``SkuAdminItem``.
+    ``sales_30d_count`` / ``sales_30d_revenue`` aggregate committed
+    and expired orders over the trailing 30 days (excludes reserved
+    and released — reserved isn't paid yet, released was refunded).
+    """
 
     model_config = ConfigDict(str_strip_whitespace=True, extra="ignore")
 
@@ -543,6 +556,9 @@ class SkuAdminDetail(BaseModel):
     updated_at: datetime
     stock_total: dict[str, int]
     stock_breakdown: list[SkuStockBreakdownItem]
+    display_name: str
+    sales_30d_count: int = 0
+    sales_30d_revenue: Decimal = Field(default_factory=lambda: Decimal("0"))
 
 
 class SkuCreateRequest(BaseModel):

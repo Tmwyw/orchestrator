@@ -44,6 +44,85 @@ from orchestrator.db import connect, fetch_all, fetch_one
 admin_catalog_router = APIRouter(prefix="/v1/admin")
 
 
+# ── display_name source-of-truth (CATALOG-1 Phase D-Polishing-A.1) ──
+#
+# Bot used to maintain its own _KIND_LABEL_FALLBACK + _GEO_FLAGS dicts
+# and assemble the same string client-side; centralising here means
+# adding a new kind or geo is a single-place edit + the bot benefits
+# without a redeploy. ``_KIND_DISPLAY_LABELS`` is distinct from the
+# existing ``_PRODUCT_KIND_LABELS`` below because display_name appends
+# protocol as a separate token — keeping "IPv6" without "SOCKS5" baked
+# in avoids double-rendering ("IPv6 SOCKS5 US SOCKS5 (30d)").
+
+_KIND_DISPLAY_LABELS: dict[str, str] = {
+    "ipv6": "IPv6",
+    "datacenter_pergb": "Datacenter Pay-per-GB",
+}
+
+_GEO_FLAGS: dict[str, str] = {
+    "US": "🇺🇸",
+    "GB": "🇬🇧",
+    "UK": "🇬🇧",
+    "DE": "🇩🇪",
+    "FR": "🇫🇷",
+    "RU": "🇷🇺",
+    "UA": "🇺🇦",
+    "PL": "🇵🇱",
+    "JP": "🇯🇵",
+    "IN": "🇮🇳",
+    "NL": "🇳🇱",
+    "CA": "🇨🇦",
+    "MX": "🇲🇽",
+    "ES": "🇪🇸",
+    "IT": "🇮🇹",
+    "SE": "🇸🇪",
+    "BR": "🇧🇷",
+    "AU": "🇦🇺",
+    "SG": "🇸🇬",
+    "KR": "🇰🇷",
+    "TR": "🇹🇷",
+    "RO": "🇷🇴",
+    "IL": "🇮🇱",
+    "AE": "🇦🇪",
+    "ID": "🇮🇩",
+    "CL": "🇨🇱",
+    "ZA": "🇿🇦",
+}
+
+
+def _compute_display_name(
+    *,
+    kind: str,
+    geo_code: str | None,
+    protocol: str | None,
+    duration_days: int | None,
+) -> str:
+    """Build the SKU display label: emoji + kind + geo + protocol + duration.
+
+    Examples (kind == "ipv6"):
+        "🇺🇸 IPv6 US SOCKS5 (30d)"
+        "🇩🇪 IPv6 DE HTTP (7d)"
+    Pergb (no protocol / duration suffix, no geo if empty):
+        "🌐 Datacenter Pay-per-GB"
+        "🇩🇪 Datacenter Pay-per-GB DE"
+    Unknown geo (not in ``_GEO_FLAGS``) falls back to ``🏳️`` so the
+    string never looks "broken" — operator sees flag-or-fallback +
+    code and recognises the SKU.
+    """
+    geo_upper = (geo_code or "").upper()
+    flag = "🌐" if not geo_upper else _GEO_FLAGS.get(geo_upper, "🏳️")
+    kind_label = _KIND_DISPLAY_LABELS.get(kind, kind)
+    parts: list[str] = [flag, kind_label]
+    if geo_upper:
+        parts.append(geo_upper)
+    if kind != "datacenter_pergb":
+        if protocol:
+            parts.append(protocol.upper())
+        if duration_days:
+            parts.append(f"({duration_days}d)")
+    return " ".join(parts)
+
+
 def _problem(status_code: int, error: str, **extra: Any) -> JSONResponse:
     payload = ProblemResponse(error=error, extra=extra or None).model_dump(exclude_none=True, mode="json")
     return JSONResponse(status_code=status_code, content=payload)
@@ -123,7 +202,18 @@ async def list_skus(
         ORDER BY s.id
     """
     rows = await asyncio.to_thread(fetch_all, sql, tuple(params))
-    items = [SkuAdminItem(**r) for r in rows]
+    items = [
+        SkuAdminItem(
+            **r,
+            display_name=_compute_display_name(
+                kind=r["product_kind"],
+                geo_code=r.get("geo_code"),
+                protocol=r.get("protocol"),
+                duration_days=r.get("duration_days"),
+            ),
+        )
+        for r in rows
+    ]
     response = SkuListResponse(items=items, total=len(items))
     return JSONResponse(content=response.model_dump(mode="json"))
 
@@ -194,6 +284,12 @@ async def get_sku(sku_id: int) -> JSONResponse:
         **sku_row,
         stock_total=stock_total,
         stock_breakdown=[SkuStockBreakdownItem(**r) for r in breakdown_rows],
+        display_name=_compute_display_name(
+            kind=sku_row["product_kind"],
+            geo_code=sku_row.get("geo_code"),
+            protocol=sku_row.get("protocol"),
+            duration_days=sku_row.get("duration_days"),
+        ),
     )
     return JSONResponse(content=detail.model_dump(mode="json"))
 
@@ -500,6 +596,12 @@ async def _fresh_sku_detail(sku_row: dict[str, Any]) -> JSONResponse:
         **sku_row,
         stock_total=stock_total,
         stock_breakdown=[SkuStockBreakdownItem(**r) for r in breakdown_rows],
+        display_name=_compute_display_name(
+            kind=sku_row["product_kind"],
+            geo_code=sku_row.get("geo_code"),
+            protocol=sku_row.get("protocol"),
+            duration_days=sku_row.get("duration_days"),
+        ),
     )
     return JSONResponse(content=detail.model_dump(mode="json"))
 
@@ -531,6 +633,12 @@ async def create_sku(payload: SkuCreateRequest) -> JSONResponse:
             "pending_validation": 0,
         },
         stock_breakdown=[],
+        display_name=_compute_display_name(
+            kind=result["product_kind"],
+            geo_code=result.get("geo_code"),
+            protocol=result.get("protocol"),
+            duration_days=result.get("duration_days"),
+        ),
     )
     return JSONResponse(status_code=201, content=detail.model_dump(mode="json"))
 
