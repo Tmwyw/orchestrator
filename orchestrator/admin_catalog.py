@@ -26,6 +26,7 @@ from orchestrator.api_schemas import (
     SkuCreateRequest,
     SkuListResponse,
     SkuStockBreakdownItem,
+    SkuUpdateRequest,
 )
 from orchestrator.db import connect, fetch_all, fetch_one
 
@@ -258,6 +259,242 @@ def _create_sku_sync(payload: SkuCreateRequest) -> dict[str, Any] | str:
             details=payload.model_dump(mode="json"),
         )
         return dict(row)
+
+
+_PATCHABLE_FIELDS = (
+    "price_per_piece",
+    "price_per_gb",
+    "target_stock",
+    "refill_batch_size",
+    "duration_days",
+    "validation_require_ipv6",
+    "is_active",
+)
+
+
+def _update_sku_sync(
+    sku_id: int, payload: SkuUpdateRequest
+) -> dict[str, Any] | str:
+    """Apply partial update + audit diff. Returns row, or error code.
+
+    Audit ``details`` records ``old``/``new`` snapshots of only the
+    changed fields — easy to render as a diff later.
+    """
+    update_fields = payload.model_dump(exclude_none=True)
+    if not update_fields:
+        return "no_fields_to_update"
+
+    with connect() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT id, code, product_kind, geo_code, protocol, duration_days,
+                   price_per_piece, price_per_gb, target_stock, refill_batch_size,
+                   validation_require_ipv6, is_active, metadata,
+                   created_at, updated_at
+            FROM skus
+            WHERE id = %s
+            FOR UPDATE
+            """,
+            (sku_id,),
+        )
+        old_row = cur.fetchone()
+        if not old_row:
+            return "sku_not_found"
+
+        set_clauses = [f"{col} = %s" for col in update_fields]
+        set_clauses.append("updated_at = now()")
+        params = list(update_fields.values()) + [sku_id]
+        cur.execute(
+            f"""
+            UPDATE skus
+               SET {", ".join(set_clauses)}
+             WHERE id = %s
+            RETURNING id, code, product_kind, geo_code, protocol, duration_days,
+                      price_per_piece, price_per_gb, target_stock, refill_batch_size,
+                      validation_require_ipv6, is_active, metadata,
+                      created_at, updated_at
+            """,
+            tuple(params),
+        )
+        new_row = cur.fetchone()
+        assert new_row is not None
+
+        diff = {
+            col: {"old": old_row[col], "new": new_row[col]}
+            for col in update_fields
+            if old_row[col] != new_row[col]
+        }
+        _audit(
+            cur,
+            action="sku_updated",
+            target_type="sku",
+            target_id=sku_id,
+            details={"diff": _jsonify_diff(diff)},
+        )
+        return dict(new_row)
+
+
+def _jsonify_diff(diff: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    """Coerce Decimal/datetime values in a diff dict to JSON-safe strings."""
+    out: dict[str, dict[str, Any]] = {}
+    for col, vals in diff.items():
+        out[col] = {
+            "old": _jsonify_scalar(vals["old"]),
+            "new": _jsonify_scalar(vals["new"]),
+        }
+    return out
+
+
+def _jsonify_scalar(v: Any) -> Any:
+    if v is None or isinstance(v, (bool, int, str)):
+        return v
+    return str(v)
+
+
+def _delete_sku_sync(sku_id: int) -> dict[str, Any] | str:
+    """Soft-delete SKU. Blocks if any non-terminal orders exist.
+
+    Returns:
+      - dict with deleted row on success
+      - ``"sku_not_found"`` if id unknown
+      - ``"pending_orders"`` if any order with status in
+        (``reserved``, ``committed``) still has an active expiry
+
+    Idempotent: re-deleting an already-inactive SKU returns the row but
+    still audits the event (so an operator-initiated re-delete is
+    visible). Inventory rows are not touched — refill worker will drain
+    via natural expiry.
+    """
+    with connect() as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT id, code, is_active FROM skus WHERE id = %s FOR UPDATE",
+            (sku_id,),
+        )
+        sku_row = cur.fetchone()
+        if not sku_row:
+            return "sku_not_found"
+
+        cur.execute(
+            """
+            SELECT count(*)::int AS n
+              FROM orders
+             WHERE sku_id = %s
+               AND status IN ('reserved', 'committed')
+               AND (
+                     (status = 'reserved'  AND expires_at > now()) OR
+                     (status = 'committed' AND (proxies_expires_at IS NULL
+                                                OR proxies_expires_at > now()))
+                   )
+            """,
+            (sku_id,),
+        )
+        pending_row = cur.fetchone()
+        pending = int(pending_row["n"]) if pending_row else 0
+        if pending > 0:
+            return "pending_orders"
+
+        cur.execute(
+            """
+            UPDATE skus
+               SET is_active = false, updated_at = now()
+             WHERE id = %s
+            RETURNING id, code, is_active, updated_at
+            """,
+            (sku_id,),
+        )
+        deleted = cur.fetchone()
+        assert deleted is not None
+        _audit(
+            cur,
+            action="sku_deleted",
+            target_type="sku",
+            target_id=sku_id,
+            details={"code": sku_row["code"], "was_active": bool(sku_row["is_active"])},
+        )
+        return dict(deleted)
+
+
+@admin_catalog_router.patch("/skus/{sku_id}")
+async def patch_sku(sku_id: int, payload: SkuUpdateRequest) -> JSONResponse:
+    """Partial update for SKU mutable fields.
+
+    Returns 200 with the updated row + freshly-computed stock breakdown
+    so the caller doesn't need a second GET. Returns 400 if the request
+    body had zero fields to update, 404 if the SKU doesn't exist.
+    """
+    result = await asyncio.to_thread(_update_sku_sync, sku_id, payload)
+    if result == "no_fields_to_update":
+        return _problem(400, "no_fields_to_update")
+    if result == "sku_not_found":
+        return _problem(404, "sku_not_found")
+    assert isinstance(result, dict)
+    return await _fresh_sku_detail(result)
+
+
+@admin_catalog_router.delete("/skus/{sku_id}")
+async def delete_sku(sku_id: int) -> JSONResponse:
+    """Soft-delete SKU (set ``is_active=false``).
+
+    Blocked with 409 ``pending_orders`` if any order with status
+    ``reserved`` or ``committed`` is still within its TTL — operators
+    must wait or release explicitly. Restore via direct SQL
+    (``UPDATE skus SET is_active=true WHERE id=N``).
+    """
+    result = await asyncio.to_thread(_delete_sku_sync, sku_id)
+    if result == "sku_not_found":
+        return _problem(404, "sku_not_found")
+    if result == "pending_orders":
+        return _problem(409, "pending_orders")
+    assert isinstance(result, dict)
+    return JSONResponse(content={"success": True, "deleted_id": result["id"]})
+
+
+async def _fresh_sku_detail(sku_row: dict[str, Any]) -> JSONResponse:
+    """Build a SkuAdminDetail response for an existing SKU row.
+
+    Reuses the same per-node breakdown query as ``get_sku`` so PATCH
+    responses match GET responses exactly.
+    """
+    sku_id = sku_row["id"]
+    breakdown_rows = await asyncio.to_thread(
+        fetch_all,
+        """
+        SELECT
+          n.id AS node_id,
+          n.name AS node_name,
+          COALESCE(SUM(CASE WHEN pi.status = 'available' THEN 1 ELSE 0 END), 0)::int
+            AS available,
+          COALESCE(SUM(CASE WHEN pi.status = 'reserved' THEN 1 ELSE 0 END), 0)::int
+            AS reserved,
+          COALESCE(SUM(CASE WHEN pi.status = 'sold' THEN 1 ELSE 0 END), 0)::int
+            AS sold,
+          COALESCE(SUM(CASE WHEN pi.status = 'expired_grace' THEN 1 ELSE 0 END), 0)::int
+            AS expired_grace,
+          COALESCE(SUM(CASE WHEN pi.status = 'pending_validation' THEN 1 ELSE 0 END), 0)::int
+            AS pending_validation
+        FROM sku_node_bindings b
+        JOIN nodes n ON n.id = b.node_id
+        LEFT JOIN proxy_inventory pi
+               ON pi.node_id = n.id AND pi.sku_id = b.sku_id
+        WHERE b.sku_id = %s
+        GROUP BY n.id, n.name
+        ORDER BY n.name
+        """,
+        (sku_id,),
+    )
+    stock_total = {
+        "available": sum(int(r["available"]) for r in breakdown_rows),
+        "reserved": sum(int(r["reserved"]) for r in breakdown_rows),
+        "sold": sum(int(r["sold"]) for r in breakdown_rows),
+        "expired_grace": sum(int(r["expired_grace"]) for r in breakdown_rows),
+        "pending_validation": sum(int(r["pending_validation"]) for r in breakdown_rows),
+    }
+    detail = SkuAdminDetail(
+        **sku_row,
+        stock_total=stock_total,
+        stock_breakdown=[SkuStockBreakdownItem(**r) for r in breakdown_rows],
+    )
+    return JSONResponse(content=detail.model_dump(mode="json"))
 
 
 @admin_catalog_router.post("/skus", status_code=201)

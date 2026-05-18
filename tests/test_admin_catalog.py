@@ -383,3 +383,151 @@ def test_create_sku_400_when_pergb_missing_price_per_gb(
         },
     )
     assert r.status_code == 422
+
+
+# === PATCH /v1/admin/skus/{id} ===
+
+
+def _stub_updated_row(price: str = "2.80", target_stock: int = 6000) -> dict[str, Any]:
+    return {
+        "id": 1,
+        "code": "ipv6_us_socks5",
+        "product_kind": "ipv6",
+        "geo_code": "US",
+        "protocol": "socks5",
+        "duration_days": 30,
+        "price_per_piece": Decimal(price),
+        "price_per_gb": None,
+        "target_stock": target_stock,
+        "refill_batch_size": 500,
+        "validation_require_ipv6": True,
+        "is_active": True,
+        "metadata": {},
+        "created_at": datetime(2026, 4, 1, tzinfo=timezone.utc),
+        "updated_at": datetime(2026, 5, 18, tzinfo=timezone.utc),
+    }
+
+
+def test_patch_sku_happy_path(
+    monkeypatch: pytest.MonkeyPatch, _no_auth: None
+) -> None:
+    new_row = _stub_updated_row(price="3.00", target_stock=8000)
+    captured: dict[str, Any] = {}
+
+    def fake_update(sku_id: int, payload: Any) -> dict[str, Any]:
+        captured["sku_id"] = sku_id
+        captured["fields"] = payload.model_dump(exclude_none=True)
+        return new_row
+
+    monkeypatch.setattr("orchestrator.admin_catalog._update_sku_sync", fake_update)
+    monkeypatch.setattr(
+        "orchestrator.admin_catalog.fetch_all", lambda *_a, **_kw: []
+    )
+
+    from orchestrator.main import app
+
+    client = TestClient(app)
+    r = client.patch(
+        "/v1/admin/skus/1",
+        json={"price_per_piece": "3.00", "target_stock": 8000},
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["id"] == 1
+    assert body["price_per_piece"] == "3.00"
+    assert body["target_stock"] == 8000
+    assert captured["sku_id"] == 1
+    assert captured["fields"]["target_stock"] == 8000
+
+
+def test_patch_sku_404_when_missing(
+    monkeypatch: pytest.MonkeyPatch, _no_auth: None
+) -> None:
+    monkeypatch.setattr(
+        "orchestrator.admin_catalog._update_sku_sync",
+        lambda _id, _p: "sku_not_found",
+    )
+    from orchestrator.main import app
+
+    client = TestClient(app)
+    r = client.patch("/v1/admin/skus/9999", json={"price_per_piece": "3.00"})
+    assert r.status_code == 404
+    assert r.json()["error"] == "sku_not_found"
+
+
+def test_patch_sku_400_when_no_fields(
+    monkeypatch: pytest.MonkeyPatch, _no_auth: None
+) -> None:
+    monkeypatch.setattr(
+        "orchestrator.admin_catalog._update_sku_sync",
+        lambda _id, _p: "no_fields_to_update",
+    )
+    from orchestrator.main import app
+
+    client = TestClient(app)
+    r = client.patch("/v1/admin/skus/1", json={})
+    assert r.status_code == 400
+    assert r.json()["error"] == "no_fields_to_update"
+
+
+# === DELETE /v1/admin/skus/{id} ===
+
+
+def test_delete_sku_happy(monkeypatch: pytest.MonkeyPatch, _no_auth: None) -> None:
+    monkeypatch.setattr(
+        "orchestrator.admin_catalog._delete_sku_sync",
+        lambda _id: {"id": 1, "is_active": False, "updated_at": "now"},
+    )
+    from orchestrator.main import app
+
+    client = TestClient(app)
+    r = client.delete("/v1/admin/skus/1")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["success"] is True
+    assert body["deleted_id"] == 1
+
+
+def test_delete_sku_blocked_by_pending_orders(
+    monkeypatch: pytest.MonkeyPatch, _no_auth: None
+) -> None:
+    monkeypatch.setattr(
+        "orchestrator.admin_catalog._delete_sku_sync", lambda _id: "pending_orders"
+    )
+    from orchestrator.main import app
+
+    client = TestClient(app)
+    r = client.delete("/v1/admin/skus/1")
+    assert r.status_code == 409
+    assert r.json()["error"] == "pending_orders"
+
+
+def test_delete_sku_404_when_missing(
+    monkeypatch: pytest.MonkeyPatch, _no_auth: None
+) -> None:
+    monkeypatch.setattr(
+        "orchestrator.admin_catalog._delete_sku_sync", lambda _id: "sku_not_found"
+    )
+    from orchestrator.main import app
+
+    client = TestClient(app)
+    r = client.delete("/v1/admin/skus/9999")
+    assert r.status_code == 404
+    assert r.json()["error"] == "sku_not_found"
+
+
+# === Unit test for _jsonify_diff ===
+
+
+def test_jsonify_diff_coerces_decimals_to_strings() -> None:
+    from orchestrator.admin_catalog import _jsonify_diff
+
+    diff = {
+        "price_per_piece": {"old": Decimal("2.50"), "new": Decimal("3.00")},
+        "target_stock": {"old": 5000, "new": 8000},
+        "is_active": {"old": True, "new": False},
+    }
+    result = _jsonify_diff(diff)
+    assert result["price_per_piece"] == {"old": "2.50", "new": "3.00"}
+    assert result["target_stock"] == {"old": 5000, "new": 8000}
+    assert result["is_active"] == {"old": True, "new": False}
