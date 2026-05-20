@@ -474,3 +474,290 @@ class SkusListResponse(BaseModel):
     success: bool = True
     items: list[SkuItem]
     count: int
+
+
+# === /v1/admin/skus, /v1/admin/skus/{id}/* (CATALOG-1 Phase A) ===
+
+
+class SkuAdminItem(BaseModel):
+    """Row in GET /v1/admin/skus list. Includes inactive SKUs.
+
+    ``display_name`` is computed at query time (see
+    ``admin_catalog._compute_display_name``) — emoji + kind label + geo
+    + protocol + duration — so the bot can render SKU buttons / cards
+    without maintaining its own copy of the label / flag dictionaries.
+    """
+
+    model_config = ConfigDict(str_strip_whitespace=True, extra="ignore")
+
+    id: int
+    code: str
+    product_kind: str
+    geo_code: str
+    protocol: str
+    duration_days: int
+    price_per_piece: Decimal | None = None
+    price_per_gb: Decimal | None = None
+    target_stock: int
+    refill_batch_size: int
+    is_active: bool
+    stock_available: int
+    display_name: str
+    created_at: datetime
+    updated_at: datetime
+
+
+class SkuListResponse(BaseModel):
+    model_config = _API_MODEL_CONFIG
+
+    items: list[SkuAdminItem]
+    total: int
+
+
+class SkuStockBreakdownItem(BaseModel):
+    """Per-node stock counts on GET /v1/admin/skus/{id}."""
+
+    model_config = _API_MODEL_CONFIG
+
+    node_id: str
+    node_name: str
+    available: int
+    reserved: int
+    sold: int
+    expired_grace: int
+    pending_validation: int
+
+
+class SkuAdminDetail(BaseModel):
+    """GET /v1/admin/skus/{id} — full SKU info + per-node breakdown.
+
+    ``display_name`` mirrors the value on ``SkuAdminItem``.
+    ``sales_30d_count`` / ``sales_30d_revenue`` aggregate committed
+    and expired orders over the trailing 30 days (excludes reserved
+    and released — reserved isn't paid yet, released was refunded).
+    """
+
+    model_config = ConfigDict(str_strip_whitespace=True, extra="ignore")
+
+    id: int
+    code: str
+    product_kind: str
+    geo_code: str
+    protocol: str
+    duration_days: int
+    price_per_piece: Decimal | None = None
+    price_per_gb: Decimal | None = None
+    target_stock: int
+    refill_batch_size: int
+    validation_require_ipv6: bool
+    is_active: bool
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    created_at: datetime
+    updated_at: datetime
+    stock_total: dict[str, int]
+    stock_breakdown: list[SkuStockBreakdownItem]
+    display_name: str
+    sales_30d_count: int = 0
+    sales_30d_revenue: Decimal = Field(default_factory=lambda: Decimal("0"))
+
+
+class SkuCreateRequest(BaseModel):
+    """POST /v1/admin/skus body."""
+
+    model_config = _API_MODEL_CONFIG
+
+    code: str = Field(min_length=3, max_length=64, pattern=r"^[a-z0-9_]+$")
+    product_kind: str = Field(min_length=1, max_length=32)
+    geo_code: str = Field(default="", max_length=8)
+    protocol: str = Field(min_length=1, max_length=16)
+    duration_days: int = Field(default=30, ge=1, le=365)
+    price_per_piece: Decimal | None = None
+    price_per_gb: Decimal | None = None
+    target_stock: int = Field(ge=1, le=1_000_000)
+    refill_batch_size: int = Field(default=500, ge=1, le=1_000_000)
+    validation_require_ipv6: bool = True
+    is_active: bool = True
+
+    @field_validator("price_per_piece", "price_per_gb", mode="before")
+    @classmethod
+    def _parse_decimal(cls, v: Any) -> Any:
+        return _coerce_decimal(v)
+
+    @field_validator("price_per_piece", "price_per_gb")
+    @classmethod
+    def _positive_bounded(cls, v: Decimal | None) -> Decimal | None:
+        if v is None:
+            return v
+        if v <= 0:
+            raise ValueError("price must be > 0")
+        if v > Decimal("10000"):
+            raise ValueError("price must be <= 10000")
+        return v
+
+    @model_validator(mode="after")
+    def _check_price_kind_match(self) -> SkuCreateRequest:
+        if self.product_kind == "datacenter_pergb":
+            if self.price_per_gb is None:
+                raise ValueError("price_per_gb required for datacenter_pergb")
+        else:
+            if self.price_per_piece is None:
+                raise ValueError("price_per_piece required for per-piece SKU")
+        return self
+
+
+class SkuUpdateRequest(BaseModel):
+    """PATCH /v1/admin/skus/{id} body — all fields optional."""
+
+    model_config = _API_MODEL_CONFIG
+
+    price_per_piece: Decimal | None = None
+    price_per_gb: Decimal | None = None
+    target_stock: int | None = Field(default=None, ge=1, le=1_000_000)
+    refill_batch_size: int | None = Field(default=None, ge=1, le=1_000_000)
+    duration_days: int | None = Field(default=None, ge=1, le=365)
+    validation_require_ipv6: bool | None = None
+    is_active: bool | None = None
+
+    @field_validator("price_per_piece", "price_per_gb", mode="before")
+    @classmethod
+    def _parse_decimal(cls, v: Any) -> Any:
+        return _coerce_decimal(v)
+
+    @field_validator("price_per_piece", "price_per_gb")
+    @classmethod
+    def _positive_bounded(cls, v: Decimal | None) -> Decimal | None:
+        if v is None:
+            return v
+        if v <= 0:
+            raise ValueError("price must be > 0")
+        if v > Decimal("10000"):
+            raise ValueError("price must be <= 10000")
+        return v
+
+
+class BindingItem(BaseModel):
+    """One row in GET /v1/admin/skus/{id}/bindings.
+
+    ``available_count`` (D-Polishing-A.4) is the count of
+    ``proxy_inventory`` rows with ``status='available'`` for this
+    (sku_id, node_id) pair — the bot now renders it directly instead
+    of looking it up from ``sku.stock_breakdown`` after-the-fact.
+    Default 0 keeps backward compat with single-row INSERT paths
+    (POST + PATCH) that build the response without the JOIN.
+    """
+
+    model_config = ConfigDict(str_strip_whitespace=True, extra="ignore")
+
+    node_id: str
+    node_name: str
+    node_geo: str
+    weight: int
+    max_batch_size: int
+    is_active: bool
+    available_count: int = 0
+    created_at: datetime
+    updated_at: datetime
+
+
+class BindingListResponse(BaseModel):
+    model_config = _API_MODEL_CONFIG
+
+    items: list[BindingItem]
+
+
+class BindingCreateRequest(BaseModel):
+    """POST /v1/admin/skus/{id}/bindings body."""
+
+    model_config = _API_MODEL_CONFIG
+
+    node_id: str = Field(min_length=1, max_length=64)
+    weight: int = Field(default=100, ge=0, le=10_000)
+    max_batch_size: int = Field(default=1500, ge=1, le=1_000_000)
+
+
+class BindingUpdateRequest(BaseModel):
+    """PATCH /v1/admin/skus/{id}/bindings/{node_id} body."""
+
+    model_config = _API_MODEL_CONFIG
+
+    weight: int | None = Field(default=None, ge=0, le=10_000)
+    max_batch_size: int | None = Field(default=None, ge=1, le=1_000_000)
+    is_active: bool | None = None
+
+
+class PergbTierItem(BaseModel):
+    """One pergb tier row (sku_tiers table)."""
+
+    model_config = _API_MODEL_CONFIG
+
+    gb: int = Field(ge=1)
+    price_per_gb: Decimal
+
+    @field_validator("price_per_gb", mode="before")
+    @classmethod
+    def _parse_decimal(cls, v: Any) -> Any:
+        return _coerce_decimal(v)
+
+    @field_validator("price_per_gb")
+    @classmethod
+    def _positive(cls, v: Decimal) -> Decimal:
+        if v <= 0:
+            raise ValueError("price_per_gb must be > 0")
+        return v
+
+
+class PergbTiersResponse(BaseModel):
+    model_config = _API_MODEL_CONFIG
+
+    items: list[PergbTierItem]
+
+
+class PergbTiersPutRequest(BaseModel):
+    """PUT /v1/admin/skus/{id}/tiers — atomic replace."""
+
+    model_config = _API_MODEL_CONFIG
+
+    tiers: list[PergbTierItem] = Field(min_length=1, max_length=100)
+
+    @model_validator(mode="after")
+    def _check_monotonicity(self) -> PergbTiersPutRequest:
+        prev_gb = 0
+        prev_price: Decimal | None = None
+        for tier in self.tiers:
+            if tier.gb <= prev_gb:
+                raise ValueError("gb_brackets must be strictly ascending")
+            if prev_price is not None and tier.price_per_gb > prev_price:
+                raise ValueError("price_per_gb must be monotonically non-increasing")
+            prev_gb = tier.gb
+            prev_price = tier.price_per_gb
+        return self
+
+
+class GeoUsageItem(BaseModel):
+    model_config = _API_MODEL_CONFIG
+
+    geo_code: str
+    sku_count: int
+    active_count: int = 0  # D-Polishing-A.3 — count of is_active=true SKUs
+
+
+class GeoListResponse(BaseModel):
+    model_config = _API_MODEL_CONFIG
+
+    items: list[GeoUsageItem]
+
+
+class ProductKindItem(BaseModel):
+    model_config = _API_MODEL_CONFIG
+
+    kind: str
+    name: str
+    sku_count: int
+    total_stock: int = 0  # D-Polishing-A.3 — SUM of stock_available
+    #   across all SKUs of this kind
+
+
+class ProductKindListResponse(BaseModel):
+    model_config = _API_MODEL_CONFIG
+
+    items: list[ProductKindItem]
