@@ -2,6 +2,7 @@ import asyncio
 import json
 import time
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -184,6 +185,110 @@ def health():
 def list_nodes():
     rows = fetch_all("select * from nodes order by created_at asc")
     return {"success": True, "status": "ready", "items": [public_node(row) for row in rows]}
+
+
+# Per-node ping deadline. The endpoint fans out across all nodes
+# concurrently via asyncio.gather, so the worst-case latency for the
+# whole report is ~NODE_HEALTH_TIMEOUT_SEC, not N * timeout.
+NODE_HEALTH_TIMEOUT_SEC = 5
+
+
+async def _ping_one_node(node: dict[str, Any]) -> tuple[dict[str, Any], bool, int | None]:
+    """Live-ping a single node and report (node, reachable, latency_ms).
+
+    Wraps the sync :func:`node_client.check_health` in
+    :func:`asyncio.to_thread` so the gather() over all nodes runs the
+    HTTP calls truly in parallel. Any exception (timeout, transport,
+    non-2xx, body-shape) maps to ``reachable=False`` with
+    ``latency_ms=None`` — caller never raises out of gather().
+    """
+    start = time.perf_counter()
+    try:
+        result = await asyncio.to_thread(
+            check_health,
+            node["url"],
+            node.get("api_key"),
+            NODE_HEALTH_TIMEOUT_SEC,
+        )
+    except Exception as exc:
+        logger.info(
+            "node_health_ping_failed",
+            extra={"node_id": node.get("id"), "error": str(exc)},
+        )
+        return node, False, None
+    latency_ms = int((time.perf_counter() - start) * 1000)
+    reachable = node_health_ready(result)
+    return node, reachable, latency_ms
+
+
+@app.get("/v1/nodes/health", dependencies=[Depends(require_api_key)])
+async def nodes_health() -> dict[str, Any]:
+    """Live health snapshot — pings every node in parallel.
+
+    Wave HEALTH-FIX-1 Phase A. The bot's «🩺 Здоровье» panel used to
+    read ``nodes.status`` (a provisioning flag stuck on ``'ready'``)
+    and stale ``runtime_status`` (updated only by the pergb traffic
+    poll, and only for nodes carrying live traffic). This endpoint
+    gives the panel a *fresh* per-node verdict by hitting each node's
+    ``/health`` directly.
+
+    Wire shape (per item):
+
+    .. code-block:: json
+
+       {
+         "id": "<node id>",
+         "name": "<node name>",
+         "geo": "<geo code>",
+         "runtime_status": "<active|degraded|offline|disabled|unknown>",
+         "reachable": true,
+         "latency_ms": 47,
+         "last_check": "2026-05-23T12:34:56+00:00"
+       }
+
+    ``reachable`` is ``True`` iff ``check_health`` returned and the
+    payload satisfied :func:`node_health_ready` (success + ipv6 ok).
+    ``latency_ms`` is ``None`` for unreachable nodes.
+
+    Side effect (Wave HEALTH-FIX-1 Phase A bonus): for every reachable
+    node, ``last_heartbeat_at`` is bumped to ``now()`` in a single
+    bulk ``UPDATE`` so the dormant column starts carrying live data —
+    future tooling (Vultr watchdog, degraded→active recovery) can rely
+    on it. DB write failure is logged but never blocks the response.
+    """
+    rows = fetch_all("select id, name, geo, url, api_key, runtime_status from nodes order by created_at asc")
+
+    if not rows:
+        return {"success": True, "items": []}
+
+    results = await asyncio.gather(*(_ping_one_node(row) for row in rows))
+
+    reachable_ids = [node["id"] for node, reachable, _ in results if reachable]
+    if reachable_ids:
+        try:
+            with connect() as conn, conn.cursor() as cur:
+                cur.execute(
+                    "update nodes set last_heartbeat_at = now() where id = ANY(%s)",
+                    (reachable_ids,),
+                )
+        except Exception as exc:
+            logger.warning("node_heartbeat_update_failed", extra={"error": str(exc)})
+
+    last_check_iso = datetime.now(timezone.utc).isoformat()
+    items: list[dict[str, Any]] = []
+    for node, reachable, latency_ms in results:
+        items.append(
+            {
+                "id": node["id"],
+                "name": node["name"],
+                "geo": node.get("geo") or "",
+                "runtime_status": node.get("runtime_status") or "unknown",
+                "reachable": reachable,
+                "latency_ms": latency_ms,
+                "last_check": last_check_iso,
+            }
+        )
+    return {"success": True, "items": items}
 
 
 @app.post("/nodes", dependencies=[Depends(require_api_key)])
@@ -453,7 +558,11 @@ async def create_job(request: Request):
             conn,
             job["id"],
             "queued",
-            {"profile": job_profile, "ipv6_policy": job_profile["ipv6_policy"], "idempotency_key": idempotency_key},
+            {
+                "profile": job_profile,
+                "ipv6_policy": job_profile["ipv6_policy"],
+                "idempotency_key": idempotency_key,
+            },
         )
 
     logger.info(
