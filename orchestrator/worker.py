@@ -48,8 +48,12 @@ def claim_next_job() -> dict[str, Any] | None:
                 (job["id"],),
             )
             claimed = cur.fetchone()
+        claimed_profile = claimed.get("profile") or PRODUCTION_PROFILE
         log_job_event(
-            conn, claimed["id"], "running", {"profile": PRODUCTION_PROFILE, "ipv6_policy": "ipv6_only"}
+            conn,
+            claimed["id"],
+            "running",
+            {"profile": claimed_profile, "ipv6_policy": claimed_profile["ipv6_policy"]},
         )
         return dict(claimed)
 
@@ -110,14 +114,15 @@ def process_job(job: dict[str, Any]) -> None:
 
 def process_simple_job(job: dict[str, Any]) -> None:
     job_id = str(job["id"])
+    job_profile = job.get("profile") or PRODUCTION_PROFILE
     try:
         node, start_port = assign_node_and_port(job)
         logger.info(
             "worker_generation_started",
             job_id=job_id,
             node_id=node["id"],
-            fingerprint_profile=PRODUCTION_PROFILE["fingerprint_profile_version"],
-            ipv6_policy="ipv6_only",
+            fingerprint_profile=job_profile["fingerprint_profile_version"],
+            ipv6_policy=job_profile["ipv6_policy"],
         )
         result = generate(
             url=node["url"],
@@ -126,12 +131,13 @@ def process_simple_job(job: dict[str, Any]) -> None:
             count=int(job["count"]),
             start_port=start_port,
             timeout_sec=get_config().node_request_timeout_sec,
+            profile=job_profile,
         )
 
         event_base = {
             "node": node["id"],
-            "profile": PRODUCTION_PROFILE,
-            "ipv6_policy": "ipv6_only",
+            "profile": job_profile,
+            "ipv6_policy": job_profile["ipv6_policy"],
             "node_response": response_diagnostics(result),
         }
         if result.get("success") is not True or result.get("status") != "ready":
@@ -167,7 +173,7 @@ def process_simple_job(job: dict[str, Any]) -> None:
         mark_failed(
             job_id,
             "node_unavailable",
-            {"profile": PRODUCTION_PROFILE, "ipv6_policy": "ipv6_only", "detail": str(exc)},
+            {"profile": job_profile, "ipv6_policy": job_profile["ipv6_policy"], "detail": str(exc)},
         )
         logger.warning(
             "worker_job_failed",
@@ -182,14 +188,16 @@ def process_simple_job(job: dict[str, Any]) -> None:
             else "generation_failed"
         )
         mark_failed(
-            job_id, error, {"profile": PRODUCTION_PROFILE, "ipv6_policy": "ipv6_only", "detail": str(exc)}
+            job_id,
+            error,
+            {"profile": job_profile, "ipv6_policy": job_profile["ipv6_policy"], "detail": str(exc)},
         )
         logger.warning("worker_job_failed", job_id=job_id, error=error)
     except Exception:
         mark_failed(
             job_id,
             "generation_failed",
-            {"profile": PRODUCTION_PROFILE, "ipv6_policy": "ipv6_only"},
+            {"profile": job_profile, "ipv6_policy": job_profile["ipv6_policy"]},
         )
         logger.exception("worker_job_failed", job_id=job_id, error="generation_failed")
 
@@ -215,6 +223,7 @@ def process_refill_job(job: dict[str, Any]) -> None:
 
     sku_id = int(sku_id_raw)
     node_id = str(node_id)
+    job_profile = job.get("profile") or PRODUCTION_PROFILE
 
     try:
         with connect() as conn, conn.cursor() as cur:
@@ -232,6 +241,7 @@ def process_refill_job(job: dict[str, Any]) -> None:
             sku_id=sku_id,
             count=count,
             start_port=start_port,
+            ipv6_policy=job_profile["ipv6_policy"],
         )
         result = generate(
             url=node["url"],
@@ -240,13 +250,14 @@ def process_refill_job(job: dict[str, Any]) -> None:
             count=count,
             start_port=int(start_port),
             timeout_sec=get_config().node_request_timeout_sec,
+            profile=job_profile,
         )
 
         event_base = {
             "node": node_id,
             "sku_id": sku_id,
-            "profile": PRODUCTION_PROFILE,
-            "ipv6_policy": "ipv6_only",
+            "profile": job_profile,
+            "ipv6_policy": job_profile["ipv6_policy"],
             "node_response": response_diagnostics(result),
         }
         if result.get("success") is not True or result.get("status") != "ready":
@@ -296,8 +307,8 @@ def process_refill_job(job: dict[str, Any]) -> None:
             job_id,
             "node_unavailable",
             {
-                "profile": PRODUCTION_PROFILE,
-                "ipv6_policy": "ipv6_only",
+                "profile": job_profile,
+                "ipv6_policy": job_profile["ipv6_policy"],
                 "detail": str(exc),
                 "node": node_id,
                 "sku_id": sku_id,
@@ -325,8 +336,8 @@ def process_refill_job(job: dict[str, Any]) -> None:
             job_id,
             error,
             {
-                "profile": PRODUCTION_PROFILE,
-                "ipv6_policy": "ipv6_only",
+                "profile": job_profile,
+                "ipv6_policy": job_profile["ipv6_policy"],
                 "detail": str(exc),
                 "node": node_id,
                 "sku_id": sku_id,
@@ -348,8 +359,8 @@ def process_refill_job(job: dict[str, Any]) -> None:
             job_id,
             "internal_error",
             {
-                "profile": PRODUCTION_PROFILE,
-                "ipv6_policy": "ipv6_only",
+                "profile": job_profile,
+                "ipv6_policy": job_profile["ipv6_policy"],
                 "detail": str(exc),
                 "node": node_id,
                 "sku_id": sku_id,

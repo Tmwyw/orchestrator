@@ -8,6 +8,20 @@ PRODUCTION_PROFILE = {
     "effective_client_os_profile": "not_controlled_by_proxy",
 }
 
+DUALSTACK_PROFILE = {**PRODUCTION_PROFILE, "ipv6_policy": "strict_dual_stack"}
+
+
+def profile_for_sku(sku: dict) -> dict:
+    if str((sku or {}).get("product_kind") or "") == "dualstack":
+        return DUALSTACK_PROFILE
+    return PRODUCTION_PROFILE
+
+
+def profile_for_product(product: str) -> dict:
+    if str(product or "") == "dualstack_ipv6":
+        return DUALSTACK_PROFILE
+    return PRODUCTION_PROFILE
+
 FORBIDDEN_JOB_FIELDS = {
     "actualClientProfile",
     "actual_client_profile",

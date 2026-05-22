@@ -57,7 +57,7 @@ def test_shared_contracts_forbidden_job_fields() -> None:
 
 
 def test_main_allowed_products() -> None:
-    """ALLOWED_PRODUCTS is exactly two entries: android_ipv6_only and smoke."""
+    """ALLOWED_PRODUCTS now includes dualstack_ipv6 alongside legacy entries."""
     from orchestrator.main import ALLOWED_PRODUCTS
 
-    assert {"android_ipv6_only", "smoke"} == ALLOWED_PRODUCTS
+    assert {"android_ipv6_only", "smoke", "dualstack_ipv6"} == ALLOWED_PRODUCTS

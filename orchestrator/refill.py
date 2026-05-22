@@ -12,7 +12,7 @@ from orchestrator.db import connect
 from orchestrator.distribution import equal_share
 from orchestrator.jobs import allocate_port_range_via_table, log_job_event
 from orchestrator.logging_setup import get_logger
-from shared.contracts import PRODUCTION_PROFILE
+from shared.contracts import profile_for_sku
 
 logger = get_logger("netrun-orchestrator-refill")
 
@@ -22,6 +22,7 @@ logger = get_logger("netrun-orchestrator-refill")
 _PRODUCT_BY_KIND: dict[str, str] = {
     "ipv6": "android_ipv6_only",
     "datacenter_pergb": "datacenter_pergb",
+    "dualstack": "dualstack_ipv6",
 }
 
 
@@ -114,6 +115,7 @@ class RefillService:
                             priority=cfg.refill_default_priority,
                             product=_PRODUCT_BY_KIND.get(str(sku["product_kind"]), str(sku["code"])),
                             payload=payload,
+                            sku=sku,
                         )
                         job_inserted = True
                         start_port, _ = allocate_port_range_via_table(
@@ -256,6 +258,7 @@ class RefillService:
         priority: int,
         product: str,
         payload: dict[str, Any],
+        sku: dict[str, Any],
     ) -> None:
         with conn.cursor() as cur:
             cur.execute(
@@ -277,7 +280,7 @@ class RefillService:
                     sku_id,
                     priority,
                     Jsonb(payload),
-                    Jsonb(PRODUCTION_PROFILE),
+                    Jsonb(profile_for_sku(sku)),
                 ),
             )
 
@@ -294,7 +297,7 @@ class RefillService:
 
     def _build_refill_payload(self, *, sku: dict[str, Any], count: int) -> dict[str, Any]:
         return {
-            "profile": PRODUCTION_PROFILE,
+            "profile": profile_for_sku(sku),
             "sku_code": sku["code"],
             "protocol": sku["protocol"],
             "geo_code": sku["geo_code"],

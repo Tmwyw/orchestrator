@@ -48,21 +48,23 @@ def generate(
     count: int,
     start_port: int,
     timeout_sec: int,
+    profile: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     endpoint = f"{url.rstrip('/')}/generate"
+    profile = profile or PRODUCTION_PROFILE
     payload = {
         "jobId": job_id,
         "proxyCount": count,
         "startPort": start_port,
         "proxyType": "socks5",
         "random": True,
-        "ipv6Policy": PRODUCTION_PROFILE["ipv6_policy"],
-        "networkProfile": PRODUCTION_PROFILE["network_profile"],
-        "fingerprintProfileVersion": PRODUCTION_PROFILE["fingerprint_profile_version"],
-        "intendedClientOsProfile": PRODUCTION_PROFILE["intended_client_os_profile"],
-        "clientOsProfileEnforcement": PRODUCTION_PROFILE["client_os_profile_enforcement"],
-        "actualClientProfile": PRODUCTION_PROFILE["actual_client_profile"],
-        "effectiveClientOsProfile": PRODUCTION_PROFILE["effective_client_os_profile"],
+        "ipv6Policy": profile["ipv6_policy"],
+        "networkProfile": profile["network_profile"],
+        "fingerprintProfileVersion": profile["fingerprint_profile_version"],
+        "intendedClientOsProfile": profile["intended_client_os_profile"],
+        "clientOsProfileEnforcement": profile["client_os_profile_enforcement"],
+        "actualClientProfile": profile["actual_client_profile"],
+        "effectiveClientOsProfile": profile["effective_client_os_profile"],
         "generatorScript": "/opt/netrun/node_runtime/soft/generator/proxyyy_automated.sh",
         "timeoutSec": timeout_sec,
     }

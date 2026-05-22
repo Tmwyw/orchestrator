@@ -40,7 +40,7 @@ from orchestrator.metrics import HTTP_DURATION_SEC, HTTP_REQUESTS
 from orchestrator.node_client import check_health
 from orchestrator.pergb import pergb_router
 from orchestrator.schemas import DeliveryFormat
-from shared.contracts import FORBIDDEN_JOB_FIELDS, PRODUCTION_PROFILE
+from shared.contracts import FORBIDDEN_JOB_FIELDS, profile_for_product
 
 configure_logging()
 logger = get_logger("netrun-orchestrator")
@@ -78,7 +78,7 @@ def metrics():
     return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
 
-ALLOWED_PRODUCTS = {"android_ipv6_only", "smoke"}
+ALLOWED_PRODUCTS = {"android_ipv6_only", "smoke", "dualstack_ipv6"}
 ALLOWED_JOB_FIELDS = {"count", "product", "idempotency_key"}
 ALLOWED_NODE_FIELDS = {"id", "name", "url", "geo", "capacity", "api_key", "force"}
 
@@ -409,6 +409,7 @@ async def create_job(request: Request):
 
     job_id = str(uuid.uuid4())
     idempotency_key = job_input["idempotency_key"]
+    job_profile = profile_for_product(job_input["product"])
 
     with connect() as conn:
         with conn.cursor() as cur:
@@ -425,7 +426,7 @@ async def create_job(request: Request):
                         job_input["count"],
                         job_input["product"],
                         idempotency_key,
-                        Jsonb(PRODUCTION_PROFILE),
+                        Jsonb(job_profile),
                     ),
                 )
                 job = cur.fetchone()
@@ -445,22 +446,22 @@ async def create_job(request: Request):
                     values (%s, 'queued', %s, %s, %s)
                     returning *
                     """,
-                    (job_id, job_input["count"], job_input["product"], Jsonb(PRODUCTION_PROFILE)),
+                    (job_id, job_input["count"], job_input["product"], Jsonb(job_profile)),
                 )
                 job = cur.fetchone()
         log_job_event(
             conn,
             job["id"],
             "queued",
-            {"profile": PRODUCTION_PROFILE, "ipv6_policy": "ipv6_only", "idempotency_key": idempotency_key},
+            {"profile": job_profile, "ipv6_policy": job_profile["ipv6_policy"], "idempotency_key": idempotency_key},
         )
 
     logger.info(
         "main_job_queued",
         job_id=job["id"],
         idempotency_key=idempotency_key,
-        fingerprint_profile=PRODUCTION_PROFILE["fingerprint_profile_version"],
-        ipv6_policy="ipv6_only",
+        fingerprint_profile=job_profile["fingerprint_profile_version"],
+        ipv6_policy=job_profile["ipv6_policy"],
     )
     return {"success": True, "status": "queued", "idempotent": False, "job": public_job(job)}
 

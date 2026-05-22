@@ -8,6 +8,7 @@ Usage: bash scripts/add_sku.sh <code> <product_kind> <geo_code> <protocol> <dura
 Example:
   bash scripts/add_sku.sh ipv6_us_socks5 ipv6 US socks5 30 0.14 100 50
   bash scripts/add_sku.sh ipv6_de_socks5 ipv6 DE socks5 30 0.14 100 50
+  bash scripts/add_sku.sh dual_us       dualstack US socks5 30 0.14 100 50
 
 Requires:
   - DATABASE_URL env (or .env in /opt/netrun-orchestrator/)
@@ -33,7 +34,7 @@ if [ -f "$APP_HOME/.env" ] && [ -z "${DATABASE_URL:-}" ]; then
 fi
 [ -n "${DATABASE_URL:-}" ] || { echo "ERROR: DATABASE_URL not set" >&2; exit 2; }
 
-case "$PRODUCT_KIND" in ipv6|datacenter_pergb) ;; *) echo "ERROR: product_kind must be ipv6 or datacenter_pergb" >&2; exit 2 ;; esac
+case "$PRODUCT_KIND" in ipv6|datacenter_pergb|dualstack) ;; *) echo "ERROR: product_kind must be ipv6, datacenter_pergb, or dualstack" >&2; exit 2 ;; esac
 case "$PROTOCOL" in socks5|http) ;; *) echo "ERROR: protocol must be socks5 or http" >&2; exit 2 ;; esac
 
 psql "$DATABASE_URL" <<SQL
