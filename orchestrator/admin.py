@@ -3,12 +3,21 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime, timezone
 from typing import Any
 
-from fastapi import APIRouter
+# Mypy on py310 doesn't recognise ``datetime.UTC`` (added in 3.11);
+# keep the alias compatible with both runtime + type-check.
+UTC = timezone.utc
+
+from fastapi import APIRouter, HTTPException
 from fastapi.responses import JSONResponse
 
 from orchestrator.api_schemas import (
+    AdminChangeExpiryRequest,
+    AdminChangeExpiryResponse,
+    AdminSetQuotaRequest,
+    AdminSetQuotaResponse,
     AdminTrafficPollResponse,
     ArchiveExportItem,
     ArchiveExportResponse,
@@ -21,7 +30,7 @@ from orchestrator.api_schemas import (
     StatsResponse,
     StatsSales,
 )
-from orchestrator.db import fetch_all, fetch_one
+from orchestrator.db import connect, fetch_all, fetch_one
 from orchestrator.traffic_poll import TrafficPollService
 
 admin_router = APIRouter(prefix="/v1/admin")
@@ -226,3 +235,195 @@ async def force_poll(
         accounts_marked_depleted=counters.accounts_depleted,
     )
     return JSONResponse(content=response.model_dump(mode="json"))
+
+
+# === Wave PER-USER-TOOLS-1: per-user admin tools ===
+#
+# SET-traffic-quota and change-order-expiry. Mirror the legacy
+# panel/proxy_api_v2 admin verbs we relied on in NETRUN, scoped to
+# our domain (orchestrator owns proxies + traffic; bot is just the
+# UI). Both endpoints are admin-only (mounted under admin_router
+# which has require_api_key globally) and operate atomically.
+
+
+@admin_router.patch("/orders/{order_ref}/quota")
+async def admin_set_quota(order_ref: str, payload: AdminSetQuotaRequest) -> JSONResponse:
+    """SET (not topup-add) the traffic quota of a pay-per-GB order.
+
+    Semantics:
+    * Resolves ``traffic_accounts`` via ``orders.id`` (404 if no
+      pergb account is bound to ``order_ref``).
+    * Replaces ``bytes_quota`` with ``round(gb_amount * 1024**3)``.
+      ``bytes_used`` is preserved untouched.
+    * Recomputes ``status``: ``active`` when new quota > used,
+      ``depleted`` otherwise. ``archived`` / ``expired`` accounts are
+      refused with 409 (we don't resurrect closed accounts).
+    """
+    bytes_quota = round(payload.gb_amount * (1024**3))
+    result = await asyncio.to_thread(_sync_set_quota, order_ref, bytes_quota)
+    if result["error"] == "not_found":
+        raise HTTPException(status_code=404, detail="pergb traffic account not found")
+    if result["error"] == "closed":
+        raise HTTPException(
+            status_code=409, detail=f"traffic account status={result['status']} — refusing to mutate"
+        )
+    response = AdminSetQuotaResponse(
+        order_ref=order_ref,
+        bytes_quota=result["bytes_quota"],
+        bytes_used=result["bytes_used"],
+        bytes_remaining=max(0, result["bytes_quota"] - result["bytes_used"]),
+        status=result["status"],
+        expires_at=result["expires_at"],
+    )
+    return JSONResponse(content=response.model_dump(mode="json"))
+
+
+def _sync_set_quota(order_ref: str, bytes_quota: int) -> dict[str, Any]:
+    """Atomic SET — single UPDATE recomputes status.
+
+    Returns a dict with ``error`` field for the handler to map to HTTP
+    status codes; on success ``error`` is empty string and the rest of
+    the row carries the post-update state."""
+    with connect() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            select ta.id, ta.bytes_used, ta.status, ta.expires_at
+              from traffic_accounts ta
+              join orders o on o.id = ta.order_id
+             where o.order_ref = %s
+             for update of ta
+            """,
+            (order_ref,),
+        )
+        row = cur.fetchone()
+        if row is None:
+            return {"error": "not_found"}
+        if row["status"] in ("archived", "expired"):
+            return {"error": "closed", "status": row["status"]}
+        new_status = "active" if bytes_quota > row["bytes_used"] else "depleted"
+        cur.execute(
+            """
+            update traffic_accounts
+               set bytes_quota = %s,
+                   status      = %s,
+                   updated_at  = now()
+             where id = %s
+             returning bytes_quota, bytes_used, status, expires_at
+            """,
+            (bytes_quota, new_status, row["id"]),
+        )
+        updated = cur.fetchone()
+        assert updated is not None  # UPDATE RETURNING on locked row
+        return {
+            "error": "",
+            "bytes_quota": updated["bytes_quota"],
+            "bytes_used": updated["bytes_used"],
+            "status": updated["status"],
+            "expires_at": updated["expires_at"],
+        }
+
+
+@admin_router.patch("/orders/{order_ref}/expiry")
+async def admin_change_expiry(order_ref: str, payload: AdminChangeExpiryRequest) -> JSONResponse:
+    """Change the expiry of an order in either direction.
+
+    * ``add`` — new = current + days (NULL current → now() + days).
+    * ``set`` — new = now() + days (unconditional).
+    * ``subtract`` — new = current - days. Guarded: new must be ≥ now()
+      (422 otherwise); 409 if current is NULL.
+
+    Cascades to all ``proxy_inventory`` of this order (expires_at =
+    new) AND to ``traffic_accounts.expires_at`` for pergb orders.
+    """
+    result = await asyncio.to_thread(_sync_change_expiry, order_ref, payload.mode, payload.days)
+    if result["error"] == "not_found":
+        raise HTTPException(status_code=404, detail="order not found")
+    if result["error"] == "null_base":
+        raise HTTPException(
+            status_code=409,
+            detail="order has no expiry — cannot subtract from NULL",
+        )
+    if result["error"] == "past":
+        raise HTTPException(
+            status_code=422,
+            detail="resulting expiry lies in the past",
+        )
+    response = AdminChangeExpiryResponse(
+        order_ref=order_ref,
+        mode=payload.mode,
+        days=payload.days,
+        old_expires_at=result["old_expires_at"],
+        new_expires_at=result["new_expires_at"],
+        affected_inventory_count=result["affected_inventory_count"],
+    )
+    return JSONResponse(content=response.model_dump(mode="json"))
+
+
+def _sync_change_expiry(order_ref: str, mode: str, days: int) -> dict[str, Any]:
+    """Compute target expiry + atomic cascade across the order row,
+    proxy_inventory rows, and traffic_accounts.expires_at."""
+    now = datetime.now(tz=UTC)
+    with connect() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            select id, proxies_expires_at
+              from orders
+             where order_ref = %s
+             for update
+            """,
+            (order_ref,),
+        )
+        order = cur.fetchone()
+        if order is None:
+            return {"error": "not_found"}
+        old: datetime | None = order["proxies_expires_at"]
+
+        if mode == "set":
+            new = now.replace(microsecond=0) + _days(days)
+        elif mode == "add":
+            base = old if old is not None else now
+            new = base + _days(days)
+        else:  # subtract
+            if old is None:
+                return {"error": "null_base"}
+            new = old - _days(days)
+        if new < now:
+            return {"error": "past"}
+
+        cur.execute(
+            "update orders set proxies_expires_at = %s, updated_at = now() where id = %s",
+            (new, order["id"]),
+        )
+        cur.execute(
+            """
+            update proxy_inventory
+               set expires_at = %s,
+                   updated_at = now()
+             where order_id = %s
+               and status in ('sold', 'expired_grace')
+            """,
+            (new, order["id"]),
+        )
+        affected = cur.rowcount
+        cur.execute(
+            """
+            update traffic_accounts
+               set expires_at = %s,
+                   updated_at = now()
+             where order_id = %s
+            """,
+            (new, order["id"]),
+        )
+    return {
+        "error": "",
+        "old_expires_at": old,
+        "new_expires_at": new,
+        "affected_inventory_count": affected,
+    }
+
+
+def _days(n: int) -> Any:
+    """timedelta sugar for the cascade computations above."""
+    from datetime import timedelta
+
+    return timedelta(days=n)
