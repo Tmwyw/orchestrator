@@ -451,6 +451,58 @@ class AdminTrafficPollResponse(BaseModel):
     accounts_marked_depleted: int
 
 
+# === Wave PER-USER-TOOLS-1 — admin SET quota + change-expiry =====
+
+
+class AdminSetQuotaRequest(BaseModel):
+    """Body for PATCH /v1/admin/orders/{ref}/quota.
+
+    SET semantics (NOT topup-add) — replaces ``bytes_quota`` with
+    ``round(gb_amount * 1024**3)``. ``bytes_used`` is preserved; the
+    status recomputes (active vs depleted) against the new quota."""
+
+    model_config = _API_MODEL_CONFIG
+
+    gb_amount: float = Field(gt=0, le=100_000)
+
+
+class AdminSetQuotaResponse(BaseModel):
+    model_config = _API_MODEL_CONFIG
+
+    order_ref: str
+    bytes_quota: int
+    bytes_used: int
+    bytes_remaining: int
+    status: str
+    expires_at: datetime
+
+
+class AdminChangeExpiryRequest(BaseModel):
+    """Body for PATCH /v1/admin/orders/{ref}/expiry.
+
+    ``mode`` selects the operation:
+      * ``add`` — new = current + days (NULL current → now() + days)
+      * ``set`` — new = now() + days (replaces unconditionally)
+      * ``subtract`` — new = current - days (422 if new < now(); 409 if NULL current)
+    """
+
+    model_config = _API_MODEL_CONFIG
+
+    mode: str = Field(pattern=r"^(add|set|subtract)$")
+    days: int = Field(ge=1, le=365)
+
+
+class AdminChangeExpiryResponse(BaseModel):
+    model_config = _API_MODEL_CONFIG
+
+    order_ref: str
+    mode: str
+    days: int
+    old_expires_at: datetime | None
+    new_expires_at: datetime
+    affected_inventory_count: int
+
+
 # === /v1/skus/active (Wave B catalog endpoint) ===
 
 
