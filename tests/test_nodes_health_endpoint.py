@@ -346,3 +346,249 @@ def test_nodes_health_endpoint_heartbeat_includes_all_reachable_ids(
     assert len(updates) == 1
     (id_list,) = updates[0]
     assert sorted(id_list) == ["node-degraded", "node-down", "node-up"]
+
+
+# ── Wave NODE-MGMT-2 Stage A: degraded → active auto-recovery ───────
+
+
+def _recovery_calls(db_calls: dict[str, Any]) -> list[Any]:
+    """Collect param-tuples from the degraded→active UPDATE only."""
+    return [
+        params
+        for query, params in db_calls.get("calls", [])
+        if "runtime_status='active'" in query and "runtime_status='degraded'" in query
+    ]
+
+
+def test_nodes_health_recovers_degraded_when_reachable(
+    monkeypatch: pytest.MonkeyPatch, _no_auth: None
+) -> None:
+    """Reachable + runtime_status='degraded' → UPDATE issued + response flips."""
+    nodes = _make_nodes()
+    monkeypatch.setattr("orchestrator.main.fetch_all", lambda *a, **k: nodes)
+    # All three nodes return ready payload → all reachable.
+    monkeypatch.setattr(
+        "orchestrator.main.check_health",
+        lambda *a, **k: _ready_payload(),
+    )
+
+    db_calls: dict[str, Any] = {}
+    _patch_connect(monkeypatch, db_calls)
+
+    from orchestrator.main import app
+
+    client = TestClient(app)
+    response = client.get("/v1/nodes/health", headers={"X-NETRUN-API-KEY": "test-api-key"})
+    assert response.status_code == 200
+    body = response.json()
+
+    # Exactly one degraded → active UPDATE, scoped to the degraded id.
+    recovery = _recovery_calls(db_calls)
+    assert len(recovery) == 1
+    (recovered_ids,) = recovery[0]
+    assert recovered_ids == ["node-degraded"]
+
+    # Response reflects the recovery: node-degraded now reports 'active'.
+    by_id = {item["id"]: item for item in body["items"]}
+    assert by_id["node-degraded"]["runtime_status"] == "active"
+    # Other nodes' runtime_status unchanged.
+    assert by_id["node-up"]["runtime_status"] == "active"
+    assert by_id["node-down"]["runtime_status"] == "offline"
+
+
+def test_nodes_health_no_recovery_when_degraded_unreachable(
+    monkeypatch: pytest.MonkeyPatch, _no_auth: None
+) -> None:
+    """Degraded + unreachable → no recovery UPDATE, response stays 'degraded'."""
+    nodes = _make_nodes()
+    monkeypatch.setattr("orchestrator.main.fetch_all", lambda *a, **k: nodes)
+
+    def fake_check_health(url: str, api_key: str | None, timeout_sec: int) -> dict[str, Any]:
+        # The degraded node is the one we make unreachable.
+        if url == "http://node-degraded.example":
+            raise RuntimeError("connection refused")
+        return _ready_payload()
+
+    monkeypatch.setattr("orchestrator.main.check_health", fake_check_health)
+
+    db_calls: dict[str, Any] = {}
+    _patch_connect(monkeypatch, db_calls)
+
+    from orchestrator.main import app
+
+    client = TestClient(app)
+    response = client.get("/v1/nodes/health", headers={"X-NETRUN-API-KEY": "test-api-key"})
+    assert response.status_code == 200
+    body = response.json()
+
+    # No degraded→active UPDATE fired.
+    assert _recovery_calls(db_calls) == []
+
+    by_id = {item["id"]: item for item in body["items"]}
+    assert by_id["node-degraded"]["runtime_status"] == "degraded"
+    assert by_id["node-degraded"]["reachable"] is False
+
+
+def test_nodes_health_does_not_recover_disabled_or_offline(
+    monkeypatch: pytest.MonkeyPatch, _no_auth: None
+) -> None:
+    """Reachable but admin-set 'disabled' / 'offline' → never auto-flipped."""
+    nodes = [
+        {
+            "id": "node-disabled",
+            "name": "Disabled-Box",
+            "geo": "X1",
+            "url": "http://node-disabled.example",
+            "api_key": "kd",
+            "runtime_status": "disabled",
+        },
+        {
+            "id": "node-offline",
+            "name": "Offline-Box",
+            "geo": "X2",
+            "url": "http://node-offline.example",
+            "api_key": "ko",
+            "runtime_status": "offline",
+        },
+    ]
+    monkeypatch.setattr("orchestrator.main.fetch_all", lambda *a, **k: nodes)
+    monkeypatch.setattr(
+        "orchestrator.main.check_health",
+        lambda *a, **k: _ready_payload(),
+    )
+
+    db_calls: dict[str, Any] = {}
+    _patch_connect(monkeypatch, db_calls)
+
+    from orchestrator.main import app
+
+    client = TestClient(app)
+    response = client.get("/v1/nodes/health", headers={"X-NETRUN-API-KEY": "test-api-key"})
+    assert response.status_code == 200
+    body = response.json()
+
+    # No recovery UPDATE fired (the predicate only matches 'degraded').
+    assert _recovery_calls(db_calls) == []
+
+    by_id = {item["id"]: item for item in body["items"]}
+    assert by_id["node-disabled"]["runtime_status"] == "disabled"
+    assert by_id["node-offline"]["runtime_status"] == "offline"
+    # Both still report reachable=True — admin status is decoupled from ping.
+    assert by_id["node-disabled"]["reachable"] is True
+    assert by_id["node-offline"]["reachable"] is True
+
+
+def test_nodes_health_recovery_db_failure_keeps_response_unchanged(
+    monkeypatch: pytest.MonkeyPatch, _no_auth: None
+) -> None:
+    """If the DB block raises, response must NOT pretend the flip happened."""
+    nodes = [_make_nodes()[2]]  # only node-degraded, reachable
+    monkeypatch.setattr("orchestrator.main.fetch_all", lambda *a, **k: nodes)
+    monkeypatch.setattr(
+        "orchestrator.main.check_health",
+        lambda *a, **k: _ready_payload(),
+    )
+
+    @contextmanager
+    def boom_connect():  # type: ignore[no-untyped-def]
+        raise RuntimeError("database down")
+        yield  # pragma: no cover
+
+    monkeypatch.setattr("orchestrator.main.connect", boom_connect)
+
+    from orchestrator.main import app
+
+    client = TestClient(app)
+    response = client.get("/v1/nodes/health", headers={"X-NETRUN-API-KEY": "test-api-key"})
+    assert response.status_code == 200
+    body = response.json()
+    # Reachable still true (the ping is independent of the DB), but
+    # runtime_status must remain 'degraded' because the UPDATE rolled back.
+    item = body["items"][0]
+    assert item["reachable"] is True
+    assert item["runtime_status"] == "degraded"
+
+
+# ── Wave NODE-MGMT-2 Stage B: dns passthrough ───────────────────────
+
+
+def test_nodes_health_passes_through_dns_payload(
+    monkeypatch: pytest.MonkeyPatch, _no_auth: None
+) -> None:
+    """Node /health returns a dns dict → it appears verbatim in the item."""
+    nodes = [_make_nodes()[0]]  # node-up
+    monkeypatch.setattr("orchestrator.main.fetch_all", lambda *a, **k: nodes)
+
+    dns_payload = {
+        "configured": ["1.1.1.1", "8.8.8.8"],
+        "resolve_ok": True,
+        "last_check_sec": 12,
+    }
+
+    def fake_check_health(url: str, api_key: str | None, timeout_sec: int) -> dict[str, Any]:
+        return {**_ready_payload(), "dns": dns_payload}
+
+    monkeypatch.setattr("orchestrator.main.check_health", fake_check_health)
+
+    db_calls: dict[str, Any] = {}
+    _patch_connect(monkeypatch, db_calls)
+
+    from orchestrator.main import app
+
+    client = TestClient(app)
+    response = client.get("/v1/nodes/health", headers={"X-NETRUN-API-KEY": "test-api-key"})
+    assert response.status_code == 200
+    item = response.json()["items"][0]
+    assert "dns" in item
+    assert item["dns"] == dns_payload
+
+
+def test_nodes_health_dns_is_null_when_absent(
+    monkeypatch: pytest.MonkeyPatch, _no_auth: None
+) -> None:
+    """Old-node /health without a dns field → item.dns is JSON null."""
+    nodes = [_make_nodes()[0]]
+    monkeypatch.setattr("orchestrator.main.fetch_all", lambda *a, **k: nodes)
+    monkeypatch.setattr(
+        "orchestrator.main.check_health",
+        lambda *a, **k: _ready_payload(),  # no "dns" key
+    )
+
+    db_calls: dict[str, Any] = {}
+    _patch_connect(monkeypatch, db_calls)
+
+    from orchestrator.main import app
+
+    client = TestClient(app)
+    response = client.get("/v1/nodes/health", headers={"X-NETRUN-API-KEY": "test-api-key"})
+    assert response.status_code == 200
+    item = response.json()["items"][0]
+    assert "dns" in item
+    assert item["dns"] is None
+
+
+def test_nodes_health_dns_is_null_when_unreachable(
+    monkeypatch: pytest.MonkeyPatch, _no_auth: None
+) -> None:
+    """Ping raises → item still includes a dns field, value is null."""
+    nodes = [_make_nodes()[1]]  # node-down
+
+    monkeypatch.setattr("orchestrator.main.fetch_all", lambda *a, **k: nodes)
+
+    def fake_check_health(*a: Any, **k: Any) -> dict[str, Any]:
+        raise RuntimeError("connection refused")
+
+    monkeypatch.setattr("orchestrator.main.check_health", fake_check_health)
+
+    db_calls: dict[str, Any] = {}
+    _patch_connect(monkeypatch, db_calls)
+
+    from orchestrator.main import app
+
+    client = TestClient(app)
+    response = client.get("/v1/nodes/health", headers={"X-NETRUN-API-KEY": "test-api-key"})
+    assert response.status_code == 200
+    item = response.json()["items"][0]
+    assert item["reachable"] is False
+    assert "dns" in item
+    assert item["dns"] is None
