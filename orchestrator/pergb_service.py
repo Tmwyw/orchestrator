@@ -625,7 +625,7 @@ class PergbService:
                     join skus s on s.id = pi.sku_id
                     where pi.status = 'available'
                       and s.is_active = true
-                      and s.product_kind = 'ipv6'
+                      and s.product_kind in ('ipv6', 'dualstack')
                       and s.geo_code = %s
                     order by pi.id
                     for update skip locked
@@ -664,7 +664,7 @@ class PergbService:
                 join skus s on s.id = pi.sku_id
                 where pi.status = 'available'
                   and s.is_active = true
-                  and s.product_kind = 'ipv6'
+                  and s.product_kind in ('ipv6', 'dualstack')
                   and s.geo_code = %s
                 """,
                 (geo_code,),
