@@ -194,14 +194,22 @@ def list_nodes():
 NODE_HEALTH_TIMEOUT_SEC = 5
 
 
-async def _ping_one_node(node: dict[str, Any]) -> tuple[dict[str, Any], bool, int | None]:
-    """Live-ping a single node and report (node, reachable, latency_ms).
+async def _ping_one_node(
+    node: dict[str, Any],
+) -> tuple[dict[str, Any], bool, int | None, Any]:
+    """Live-ping a single node and report (node, reachable, latency_ms, dns).
 
     Wraps the sync :func:`node_client.check_health` in
     :func:`asyncio.to_thread` so the gather() over all nodes runs the
     HTTP calls truly in parallel. Any exception (timeout, transport,
     non-2xx, body-shape) maps to ``reachable=False`` with
-    ``latency_ms=None`` — caller never raises out of gather().
+    ``latency_ms=None`` and ``dns=None`` — caller never raises out of
+    gather().
+
+    ``dns`` is a raw passthrough of ``result.get("dns")`` from the
+    node-agent's ``/health`` payload (Wave NODE-MGMT-2 Stage B). The
+    orchestrator does not validate its shape — old nodes that never
+    populate it simply yield ``None``.
     """
     start = time.perf_counter()
     try:
@@ -216,10 +224,11 @@ async def _ping_one_node(node: dict[str, Any]) -> tuple[dict[str, Any], bool, in
             "node_health_ping_failed",
             extra={"node_id": node.get("id"), "error": str(exc)},
         )
-        return node, False, None
+        return node, False, None, None
     latency_ms = int((time.perf_counter() - start) * 1000)
     reachable = node_health_ready(result)
-    return node, reachable, latency_ms
+    dns = result.get("dns") if isinstance(result, dict) else None
+    return node, reachable, latency_ms, dns
 
 
 @app.get("/v1/nodes/health", dependencies=[Depends(require_api_key)])
@@ -256,6 +265,21 @@ async def nodes_health() -> dict[str, Any]:
     bulk ``UPDATE`` so the dormant column starts carrying live data —
     future tooling (Vultr watchdog, degraded→active recovery) can rely
     on it. DB write failure is logged but never blocks the response.
+
+    Side effect (Wave NODE-MGMT-2 Stage A): in the same DB session,
+    any reachable node currently sitting in ``runtime_status='degraded'``
+    is flipped back to ``'active'`` with ``heartbeat_failures=0``. This
+    closes the loop on the pergb traffic-poll that auto-degrades nodes
+    on heartbeat misses but never recovers them. ``'disabled'`` /
+    ``'offline'`` are admin-set and explicitly NOT touched. Recovery
+    cadence is opportunistic — driven by callers of this endpoint
+    (today: the bot's health panel + its 30 s cache); a guaranteed
+    interval would need a scheduled call or watchdog sweep.
+
+    Side effect (Wave NODE-MGMT-2 Stage B): each item gains a ``dns``
+    field, raw passthrough from the node-agent's ``/health`` payload.
+    Old nodes that never populate it yield ``null`` — purely additive,
+    no breakage.
     """
     rows = fetch_all("select id, name, geo, url, api_key, runtime_status from nodes order by created_at asc")
 
@@ -264,7 +288,13 @@ async def nodes_health() -> dict[str, Any]:
 
     results = await asyncio.gather(*(_ping_one_node(row) for row in rows))
 
-    reachable_ids = [node["id"] for node, reachable, _ in results if reachable]
+    reachable_ids = [node["id"] for node, reachable, _, _ in results if reachable]
+    recovered_ids = [
+        node["id"]
+        for node, reachable, _, _ in results
+        if reachable and (node.get("runtime_status") == "degraded")
+    ]
+    recovered_set: set[str] = set()
     if reachable_ids:
         try:
             with connect() as conn, conn.cursor() as cur:
@@ -272,21 +302,35 @@ async def nodes_health() -> dict[str, Any]:
                     "update nodes set last_heartbeat_at = now() where id = ANY(%s)",
                     (reachable_ids,),
                 )
+                if recovered_ids:
+                    cur.execute(
+                        "update nodes set runtime_status='active', "
+                        "heartbeat_failures=0, updated_at=now() "
+                        "where id = ANY(%s) and runtime_status='degraded'",
+                        (recovered_ids,),
+                    )
+                    recovered_set = set(recovered_ids)
+                    for rid in recovered_ids:
+                        logger.info("node_auto_recovered", extra={"node_id": rid})
         except Exception as exc:
             logger.warning("node_heartbeat_update_failed", extra={"error": str(exc)})
 
     last_check_iso = datetime.now(timezone.utc).isoformat()
     items: list[dict[str, Any]] = []
-    for node, reachable, latency_ms in results:
+    for node, reachable, latency_ms, dns in results:
+        runtime_status = node.get("runtime_status") or "unknown"
+        if node["id"] in recovered_set:
+            runtime_status = "active"
         items.append(
             {
                 "id": node["id"],
                 "name": node["name"],
                 "geo": node.get("geo") or "",
-                "runtime_status": node.get("runtime_status") or "unknown",
+                "runtime_status": runtime_status,
                 "reachable": reachable,
                 "latency_ms": latency_ms,
                 "last_check": last_check_iso,
+                "dns": dns,
             }
         )
     return {"success": True, "items": items}
