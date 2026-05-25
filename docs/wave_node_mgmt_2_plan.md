@@ -79,4 +79,36 @@ contract fields change shape.
 
 ## Journal
 
-* (filled in as work progresses)
+* **Stage 0** — `wave/node-mgmt-2` branched from `origin/main`
+  (`1226f43`). Journal scaffold committed (`98d0e33`). Baseline pytest:
+  337 passed, 0 skipped.
+* **Stage A + B** — `orchestrator/main.py` edits committed (`7de9ab6`).
+  `_ping_one_node` return tuple grew to 4-arity
+  `(node, reachable, latency_ms, dns)`; `dns` is `result.get("dns")`
+  guarded by `isinstance(result, dict)`. In `nodes_health()`,
+  `recovered_ids` is computed alongside `reachable_ids` and a sibling
+  UPDATE fires inside the same `with connect()` block. Both writes
+  share one psycopg transaction — DB failure rolls back together and
+  the response keeps the pre-recovery `runtime_status`. Recovery is
+  logged per-node via `logger.info("node_auto_recovered", ...)`. The
+  response item-dict gains `dns` (raw passthrough).
+* **Stage C** — 7 new tests added (`f5d6b22`). All 14
+  `test_nodes_health_endpoint.py` tests green; full suite **344 passed
+  / 0 skipped** (baseline 337 + 7 new). `ruff check`: clean on changed
+  files. `mypy orchestrator/main.py`: 1 pre-existing error in
+  `redis_client.py:23` (`Awaitable[bool] | bool` await mismatch),
+  reproduces on `origin/main` without any of this wave's edits — not
+  introduced here.
+
+## Caveats / open questions
+
+* Cadence: auto-recovery fires only when `/v1/nodes/health` is called.
+  Today that means the bot panel's on-demand fetch + 30 s cache. A
+  guaranteed interval (e.g. for a node that recovers while no one is
+  looking at the panel) would need a scheduled call or a sweep inside
+  `watchdog.run_once()`. Deliberately out of scope for this wave.
+* No migrations — `runtime_status` / `heartbeat_failures` already
+  exist from `003_extend_nodes.sql`. Nothing to apply at deploy.
+* DNS rendering is the bot's job; the node-agent's `dns` shape is
+  defined by a separate node-agent prompt. This wave's contract is
+  "raw passthrough or null".
