@@ -14,6 +14,7 @@ from psycopg.types.json import Jsonb
 from orchestrator import node_client
 from orchestrator.admin import admin_router
 from orchestrator.admin_catalog import admin_catalog_router
+from orchestrator.admin_nodes import admin_nodes_router
 from orchestrator.allocator import AllocatorService
 from orchestrator.api_schemas import (
     CommitRequest,
@@ -833,6 +834,9 @@ app.include_router(admin_router, dependencies=[Depends(require_api_key)])
 
 # === /v1/admin/skus, /v1/admin/skus/{id}/* — Wave CATALOG-1 Phase A ===
 app.include_router(admin_catalog_router, dependencies=[Depends(require_api_key)])
+
+# === /v1/admin/nodes/* — Wave NODE-MGMT (Phase 2: list / enable-disable / reboot) ===
+app.include_router(admin_nodes_router, dependencies=[Depends(require_api_key)])
 
 # === Pay-per-GB stubs — Wave B-8.1 (real impl in B-8.2) ===
 app.include_router(pergb_router, dependencies=[Depends(require_api_key)])
