@@ -1,0 +1,11 @@
+[Unit]
+Description=NETRUN — fire the Vultr node watchdog every 60s
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=60s
+AccuracySec=5s
+Unit=netrun-vultr-node-watchdog.service
+
+[Install]
+WantedBy=timers.target

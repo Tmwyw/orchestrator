@@ -19,10 +19,11 @@ import re
 from pathlib import Path
 from typing import Any
 
-import httpx
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import JSONResponse
 
+from orchestrator import vultr
+from orchestrator.crypto import FernetKeyError
 from orchestrator.db import execute, fetch_all, fetch_one
 
 admin_nodes_router = APIRouter(prefix="/v1/admin")
@@ -107,47 +108,50 @@ async def set_node_runtime_status(node_id: str, payload: dict[str, Any]) -> JSON
 
 @admin_nodes_router.post("/nodes/{node_id}/reboot")
 async def reboot_node(node_id: str) -> JSONResponse:
-    """Reboot the node's Vultr instance (instance id looked up by the node IP)."""
-    node = await asyncio.to_thread(fetch_one, "select url from nodes where id = %s", (node_id,))
+    """Reboot the node's Vultr instance using ITS account's key (Wave PROVISION-1 ②).
+
+    Per-account: a node tied to vultr_account is rebooted with that account's
+    decrypted key (a Vultr key only sees its own instances). Legacy nodes with
+    no account fall back to the single VULTR_API_KEY env / watchdog.env file.
+    The instance id is taken from nodes.vultr_instance_id when present, else
+    looked up by the node IP.
+    """
+    node = await asyncio.to_thread(
+        fetch_one,
+        "select url, vultr_account, vultr_instance_id from nodes where id = %s",
+        (node_id,),
+    )
     if not node:
         raise HTTPException(status_code=404, detail="node_not_found")
     ip = _ip_from_url(str(node.get("url") or ""))
-    if not ip:
-        raise HTTPException(status_code=400, detail="cannot_parse_node_ip")
-    key = _vultr_api_key()
-    if not key:
-        raise HTTPException(status_code=500, detail="vultr_api_key_unavailable")
+    iid: str | None = (str(node.get("vultr_instance_id") or "").strip()) or None
+    account_id = node.get("vultr_account")
 
-    headers = {"Authorization": f"Bearer {key}"}
-    iid: str | None = None
-    cursor = ""
-    async with httpx.AsyncClient(timeout=20) as client:
-        for _ in range(10):  # paginate defensively
-            params: dict[str, Any] = {"per_page": 100}
-            if cursor:
-                params["cursor"] = cursor
-            r = await client.get(
-                "https://api.vultr.com/v2/instances", headers=headers, params=params
-            )
-            if r.status_code != 200:
-                raise HTTPException(status_code=502, detail=f"vultr_list_failed:{r.status_code}")
-            data = r.json()
-            for inst in data.get("instances", []):
-                if inst.get("main_ip") == ip:
-                    iid = inst.get("id")
-                    break
-            if iid:
-                break
-            cursor = ((data.get("meta") or {}).get("links") or {}).get("next") or ""
-            if not cursor:
-                break
+    if account_id is not None:
+        try:
+            client = await vultr.client_for_account(int(account_id))
+        except (vultr.VultrError, FernetKeyError) as exc:
+            raise HTTPException(status_code=502, detail=f"vultr_account_key_error:{exc}") from exc
+    else:
+        key = _vultr_api_key()
+        if not key:
+            raise HTTPException(status_code=500, detail="vultr_api_key_unavailable")
+        client = vultr.VultrClient(key)
+
+    if not iid:
+        if not ip:
+            raise HTTPException(status_code=400, detail="cannot_parse_node_ip")
+        try:
+            iid = await client.find_instance_id_by_main_ip(ip)
+        except vultr.VultrError as exc:
+            raise HTTPException(status_code=502, detail=f"vultr_list_failed:{exc}") from exc
         if not iid:
             raise HTTPException(status_code=404, detail=f"vultr_instance_not_found_for_ip:{ip}")
-        rb = await client.post(
-            f"https://api.vultr.com/v2/instances/{iid}/reboot", headers=headers
-        )
-        if rb.status_code not in (202, 204):
-            raise HTTPException(status_code=502, detail=f"vultr_reboot_failed:{rb.status_code}")
+
+    try:
+        await client.reboot(iid)
+    except vultr.VultrError as exc:
+        raise HTTPException(status_code=502, detail=f"vultr_reboot_failed:{exc}") from exc
     return JSONResponse(
         content={"id": node_id, "ip": ip, "vultr_instance_id": iid, "rebooted": True}
     )

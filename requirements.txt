@@ -1,3 +1,4 @@
+cryptography>=42
 fastapi==0.115.6
 geoip2>=4.8.0
 httpx==0.28.1

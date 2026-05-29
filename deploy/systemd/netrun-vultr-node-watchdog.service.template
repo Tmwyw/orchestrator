@@ -1,0 +1,12 @@
+[Unit]
+Description=NETRUN — DB-driven Vultr node watchdog (reboots unreachable nodes via orchestrator)
+After=network-online.target netrun-orchestrator.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/netrun-orchestrator
+EnvironmentFile=/opt/netrun-orchestrator/.env
+ExecStart=/usr/bin/bash /opt/netrun-orchestrator/scripts/vultr_node_watchdog.sh
+StandardOutput=journal
+StandardError=journal

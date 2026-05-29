@@ -11,10 +11,11 @@ from fastapi.responses import FileResponse, JSONResponse, Response
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from psycopg.types.json import Jsonb
 
-from orchestrator import node_client
+from orchestrator import node_client, provision, vultr
 from orchestrator.admin import admin_router
 from orchestrator.admin_catalog import admin_catalog_router
 from orchestrator.admin_nodes import admin_nodes_router
+from orchestrator.admin_vultr import admin_vultr_router
 from orchestrator.allocator import AllocatorService
 from orchestrator.api_schemas import (
     CommitRequest,
@@ -27,6 +28,7 @@ from orchestrator.api_schemas import (
     OrderResponse,
     ProblemResponse,
     ProxiesErrorResponse,
+    RegisterRequest,
     ReleaseResponse,
     ReserveErrorResponse,
     ReserveRequest,
@@ -35,6 +37,7 @@ from orchestrator.api_schemas import (
     SkusListResponse,
 )
 from orchestrator.config import get_config
+from orchestrator.crypto import FernetKeyError
 from orchestrator.db import connect, fetch_all, fetch_one
 from orchestrator.jobs import log_job_event, node_health_diagnostics, node_health_ready, public_job
 from orchestrator.logging_setup import configure_logging, get_logger
@@ -547,6 +550,79 @@ async def enroll_node(payload: EnrollRequest):
     )
 
 
+@app.post("/v1/nodes/register")
+async def register_node_self(payload: RegisterRequest):
+    """Zero-terminal self-registration (Wave PROVISION-1 ②, variant B).
+
+    Auth is the shared secret in the BODY (no X-NETRUN-API-KEY): sha256(secret)
+    must match an active node_provisions row. Idempotent: a repeat call re-runs
+    the same upserts. A failed install (install_result.ok=false) flips the
+    provision to 'failed' so it never hangs in 'installing'.
+    """
+    ip = payload.ip.strip()
+    install = payload.install_result
+
+    job = await asyncio.to_thread(provision.lookup_provision_job, payload.secret)
+    if not job:
+        return JSONResponse(status_code=401, content={"error": "secret_not_recognized"})
+    job_id = str(job["job_id"])
+
+    # STEP 1 — partial-failure: record + return, do not register the node.
+    if not install.ok:
+        await asyncio.to_thread(
+            provision.mark_provision_failed,
+            job_id=job_id,
+            exit_code=install.exit_code,
+            log_tail=install.log_tail,
+            ip=ip,
+        )
+        logger.warning(
+            "node_provision_install_failed",
+            job_id=job_id,
+            ip=ip,
+            exit_code=install.exit_code,
+        )
+        return JSONResponse(
+            status_code=200, content={"ok": False, "job_id": job_id, "status": "failed"}
+        )
+
+    # STEP 2 — resolve the Vultr instance id by IP using the JOB's account key
+    # (best-effort: missing Fernet key / Vultr hiccup must not block registration).
+    vultr_iid: str | None = None
+    account_id = job.get("account_id")
+    if account_id is not None:
+        try:
+            client = await vultr.client_for_account(int(account_id))
+            vultr_iid = await client.find_instance_id_by_main_ip(ip)
+        except (vultr.VultrError, FernetKeyError) as exc:
+            logger.warning(
+                "register_instance_lookup_failed", job_id=job_id, ip=ip, error=str(exc)
+            )
+
+    # STEPS 3-6 — upsert node, bind SKUs, archive phantom inventory, mark registered.
+    result = await asyncio.to_thread(
+        provision.complete_registration,
+        job=job,
+        ip=ip,
+        vultr_instance_id=vultr_iid,
+        log_tail=install.log_tail,
+    )
+    logger.info(
+        "node_registered_self",
+        job_id=job_id,
+        ip=ip,
+        node_id=result["node_id"],
+        geo=result["geo"],
+        vultr_instance_id=vultr_iid,
+    )
+    # STEP 7-8: watchdog picks the node up from the DB automatically; refill
+    # scheduler (every ~30s) fills the bound SKUs — no inline refill needed.
+    return JSONResponse(
+        status_code=200,
+        content={"ok": True, "job_id": job_id, "status": "registered", **result},
+    )
+
+
 @app.post("/jobs", dependencies=[Depends(require_api_key)])
 async def create_job(request: Request):
     payload = await request.json()
@@ -881,6 +957,9 @@ app.include_router(admin_catalog_router, dependencies=[Depends(require_api_key)]
 
 # === /v1/admin/nodes/* — Wave NODE-MGMT (Phase 2: list / enable-disable / reboot) ===
 app.include_router(admin_nodes_router, dependencies=[Depends(require_api_key)])
+
+# === /v1/admin/vultr-accounts/*, /v1/admin/nodes/provision* — Wave PROVISION-1 ② ===
+app.include_router(admin_vultr_router, dependencies=[Depends(require_api_key)])
 
 # === Pay-per-GB stubs — Wave B-8.1 (real impl in B-8.2) ===
 app.include_router(pergb_router, dependencies=[Depends(require_api_key)])
