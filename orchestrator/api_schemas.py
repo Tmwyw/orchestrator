@@ -173,6 +173,27 @@ class EnrollRequest(BaseModel):
     auto_bind_active_skus: bool = False
 
 
+class InstallResultIn(BaseModel):
+    # Tolerant of future fields the node-side cloud-init might add.
+    model_config = ConfigDict(str_strip_whitespace=True, extra="ignore")
+
+    ok: bool
+    exit_code: int = 0
+    log_tail: str = ""
+
+
+class RegisterRequest(BaseModel):
+    """Body of POST /v1/nodes/register (contract fixed by Промпт ①)."""
+
+    model_config = ConfigDict(str_strip_whitespace=True, extra="ignore")
+
+    ip: str = Field(min_length=3, max_length=64)
+    secret: str = Field(min_length=8, max_length=256)
+    install_result: InstallResultIn
+    hostname: str = Field(default="", max_length=255)
+    agent_version: str = Field(default="", max_length=64)
+
+
 class NodeSummary(BaseModel):
     model_config = _API_MODEL_CONFIG
 

@@ -66,6 +66,8 @@ class Config:
     traffic_poll_min_interval_sec: int
     traffic_poll_request_timeout_sec: int
     traffic_poll_degrade_after: int
+    orch_base_url: str
+    cloud_init_template_path: str
 
 
 def get_config() -> Config:
@@ -103,4 +105,9 @@ def get_config() -> Config:
         traffic_poll_min_interval_sec=_int_env("TRAFFIC_POLL_MIN_INTERVAL_SEC", 30),
         traffic_poll_request_timeout_sec=_int_env("TRAFFIC_POLL_REQUEST_TIMEOUT_SEC", 10),
         traffic_poll_degrade_after=_int_env("TRAFFIC_POLL_DEGRADE_AFTER", 5),
+        orch_base_url=os.getenv("ORCHESTRATOR_BASE_URL", "").strip(),
+        cloud_init_template_path=os.getenv(
+            "CLOUD_INIT_TEMPLATE_PATH",
+            str(PROJECT_ROOT / "deploy" / "node" / "cloud-init.sh.tmpl"),
+        ).strip(),
     )
