@@ -227,9 +227,11 @@ async def create_and_provision(
     user_data = render_user_data(orch_url=cfg.orch_base_url, secret=secret, job_id=job_id)
     user_data_b64 = base64.b64encode(user_data.encode("utf-8")).decode("ascii")
 
-    short = job_id[:8]
-    label = f"netrun-{geo.lower()}-{short}" if geo else f"netrun-{short}"
-    hostname = label
+    # Operator convention: every node's Vultr hostname + label is "NETRUN"
+    # (matches the 7 manual nodes). Internal node.name (node-<geo>-<id8>, set at
+    # /register) is what distinguishes them in the bot panel.
+    label = "NETRUN"
+    hostname = "NETRUN"
 
     try:
         client = await vultr.client_for_account(account_id)
