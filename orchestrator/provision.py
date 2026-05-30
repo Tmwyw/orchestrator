@@ -188,6 +188,7 @@ async def create_and_provision(
     plan: str,
     geo: str,
     target_stock: int,
+    backups: str = "disabled",
 ) -> dict[str, Any]:
     """Variant A: create the Vultr instance (cloud-init injected via user_data),
     then let the node self-register via POST /v1/nodes/register.
@@ -240,6 +241,7 @@ async def create_and_provision(
             user_data_b64=user_data_b64,
             label=label,
             hostname=hostname,
+            backups=backups,
         )
     except Exception:
         await asyncio.to_thread(_mark_create_failed, job_id)

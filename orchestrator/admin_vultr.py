@@ -229,6 +229,16 @@ async def list_vultr_plans(account_id: int) -> JSONResponse:
     return JSONResponse(content={"plans": plans})
 
 
+def _normalize_backups(raw: Any) -> str:
+    """Normalize the provision-create 'backups' payload (bool | str | None) into
+    the Vultr literal 'enabled' / 'disabled'. Default 'disabled'."""
+    if isinstance(raw, bool):
+        return "enabled" if raw else "disabled"
+    if isinstance(raw, str):
+        return "enabled" if raw.strip().lower() in ("enabled", "true", "yes", "on", "1") else "disabled"
+    return "disabled"
+
+
 def _count_live_nodes() -> int:
     """Cost-guard tally: every node row that still represents a billed Vultr box
     (anything not explicitly disabled)."""
@@ -250,6 +260,7 @@ async def provision_create(payload: dict[str, Any]) -> JSONResponse:
     if not geo:
         raise HTTPException(status_code=400, detail="geo_required")
     target_stock = int(payload.get("target_stock") or 4000)
+    backups = _normalize_backups(payload.get("backups"))
 
     # COST-GUARD: refuse to spin up another paid box past the configured ceiling.
     max_nodes = get_config().max_nodes
@@ -264,6 +275,7 @@ async def provision_create(payload: dict[str, Any]) -> JSONResponse:
             plan=plan,
             geo=geo,
             target_stock=target_stock,
+            backups=backups,
         )
     except LookupError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc

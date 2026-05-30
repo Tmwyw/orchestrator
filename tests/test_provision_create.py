@@ -104,11 +104,31 @@ async def test_create_and_provision_happy(_env, monkeypatch: pytest.MonkeyPatch)
     assert fake.create_kwargs["os_id"] == 2284
     assert fake.create_kwargs["region"] == "cdg"
     assert fake.create_kwargs["label"].startswith("netrun-fr-")
+    assert fake.create_kwargs["backups"] == "disabled"  # default when not requested
 
     # instance id + ip recorded on the job row
     update_sql, update_params = sink[-1]
     assert "vultr_instance_id" in update_sql
     assert "iid-9" in update_params and "1.2.3.4" in update_params
+
+
+@pytest.mark.asyncio
+async def test_create_and_provision_passes_backups(_env, monkeypatch: pytest.MonkeyPatch) -> None:
+    sink: list[tuple] = []
+    monkeypatch.setattr(provision, "fetch_one", lambda q, p=None: {"id": 2, "enabled": True})
+    monkeypatch.setattr(provision, "connect", _fake_connect_factory(sink))
+    fake = _FakeClient()
+
+    async def _client_for_account(_id):
+        return fake
+
+    monkeypatch.setattr(provision.vultr, "client_for_account", _client_for_account)
+
+    await provision.create_and_provision(
+        account_id=2, region="cdg", plan="vc2-2c-4gb", geo="FR", target_stock=4000,
+        backups="enabled",
+    )
+    assert fake.create_kwargs["backups"] == "enabled"
 
 
 @pytest.mark.asyncio

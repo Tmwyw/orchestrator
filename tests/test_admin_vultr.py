@@ -204,6 +204,31 @@ def test_provision_create_happy_201(monkeypatch: pytest.MonkeyPatch) -> None:
     assert r.json()["vultr_instance_id"] == "iid-9"
 
 
+def test_provision_create_normalizes_backups(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(admin_vultr, "_count_live_nodes", lambda: 0)
+    seen: dict[str, object] = {}
+
+    async def _cap(**kw):
+        seen.update(kw)
+        return {"job_id": "J", "vultr_instance_id": "i", "status": "installing", "main_ip": "1.2.3.4"}
+
+    monkeypatch.setattr(admin_vultr, "create_and_provision", _cap)
+    base = {"account_id": 2, "region": "cdg", "plan": "p", "geo": "FR"}
+
+    # bool true → "enabled"
+    _client().post("/v1/admin/nodes/provision-create", json={**base, "backups": True})
+    assert seen["backups"] == "enabled"
+    # string "yes" → "enabled"
+    _client().post("/v1/admin/nodes/provision-create", json={**base, "backups": "yes"})
+    assert seen["backups"] == "enabled"
+    # absent → "disabled"
+    _client().post("/v1/admin/nodes/provision-create", json=base)
+    assert seen["backups"] == "disabled"
+    # bool false → "disabled"
+    _client().post("/v1/admin/nodes/provision-create", json={**base, "backups": False})
+    assert seen["backups"] == "disabled"
+
+
 def test_provision_create_requires_region_plan_geo() -> None:
     c = _client()
     assert c.post("/v1/admin/nodes/provision-create", json={"account_id": 1, "geo": "FR", "plan": "p"}).status_code == 400
