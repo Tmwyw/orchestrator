@@ -130,3 +130,126 @@ def test_provision_prepare_account_not_found_404(monkeypatch: pytest.MonkeyPatch
     monkeypatch.setattr(admin_vultr, "create_provision_job", _boom)
     r = _client().post("/v1/admin/nodes/provision-prepare", json={"account_id": 9, "geo": "DE"})
     assert r.status_code == 404
+
+
+# ── variant A: regions / plans listings ───────────────────────────────────────
+
+
+class _FakeVultrClient:
+    async def list_regions(self):
+        return [{"id": "cdg", "city": "Paris", "country": "FR", "continent": "Europe"}]
+
+    async def list_plans(self):
+        return [{"id": "vc2-2c-4gb", "vcpu_count": 2, "ram": 4096, "disk": 80, "monthly_cost": 24, "type": "vc2", "locations": []}]
+
+
+def test_list_regions_ok(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def _cfa(_id):
+        return _FakeVultrClient()
+
+    monkeypatch.setattr(admin_vultr.vultr, "client_for_account", _cfa)
+    r = _client().get("/v1/admin/vultr/regions?account_id=2")
+    assert r.status_code == 200
+    assert r.json()["regions"][0]["city"] == "Paris"
+
+
+def test_list_regions_account_not_found_404(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def _cfa(_id):
+        raise admin_vultr.VultrAccountNotFoundError("vultr_account_not_found:9")
+
+    monkeypatch.setattr(admin_vultr.vultr, "client_for_account", _cfa)
+    r = _client().get("/v1/admin/vultr/regions?account_id=9")
+    assert r.status_code == 404
+
+
+def test_list_plans_ok(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def _cfa(_id):
+        return _FakeVultrClient()
+
+    monkeypatch.setattr(admin_vultr.vultr, "client_for_account", _cfa)
+    r = _client().get("/v1/admin/vultr/plans?account_id=2")
+    assert r.status_code == 200
+    assert r.json()["plans"][0]["id"] == "vc2-2c-4gb"
+
+
+def test_list_plans_vultr_error_502(monkeypatch: pytest.MonkeyPatch) -> None:
+    class _Boom:
+        async def list_plans(self):
+            raise admin_vultr.VultrError("vultr_list_failed:/plans:503")
+
+    async def _cfa(_id):
+        return _Boom()
+
+    monkeypatch.setattr(admin_vultr.vultr, "client_for_account", _cfa)
+    r = _client().get("/v1/admin/vultr/plans?account_id=2")
+    assert r.status_code == 502
+
+
+# ── variant A: provision-create (cost-guard + full create) ────────────────────
+
+
+def test_provision_create_happy_201(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(admin_vultr, "_count_live_nodes", lambda: 3)
+
+    async def _cap(**kw):
+        assert kw["region"] == "cdg" and kw["plan"] == "vc2-2c-4gb" and kw["geo"] == "FR"
+        return {"job_id": "JOB1", "vultr_instance_id": "iid-9", "status": "installing", "main_ip": "1.2.3.4"}
+
+    monkeypatch.setattr(admin_vultr, "create_and_provision", _cap)
+    r = _client().post(
+        "/v1/admin/nodes/provision-create",
+        json={"account_id": 2, "region": "cdg", "plan": "vc2-2c-4gb", "geo": "FR"},
+    )
+    assert r.status_code == 201
+    assert r.json()["vultr_instance_id"] == "iid-9"
+
+
+def test_provision_create_requires_region_plan_geo() -> None:
+    c = _client()
+    assert c.post("/v1/admin/nodes/provision-create", json={"account_id": 1, "geo": "FR", "plan": "p"}).status_code == 400
+    assert c.post("/v1/admin/nodes/provision-create", json={"account_id": 1, "region": "cdg", "plan": "p"}).status_code == 400
+    assert c.post("/v1/admin/nodes/provision-create", json={"region": "cdg", "plan": "p", "geo": "FR"}).status_code == 400
+
+
+def test_provision_create_cost_guard_409(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("MAX_NODES", "5")
+    monkeypatch.setattr(admin_vultr, "_count_live_nodes", lambda: 5)
+
+    async def _cap(**kw):  # must NOT be reached
+        raise AssertionError("create_and_provision called past the cost guard")
+
+    monkeypatch.setattr(admin_vultr, "create_and_provision", _cap)
+    r = _client().post(
+        "/v1/admin/nodes/provision-create",
+        json={"account_id": 2, "region": "cdg", "plan": "p", "geo": "FR"},
+    )
+    assert r.status_code == 409
+    assert r.json()["detail"] == "node_limit_reached:5"
+
+
+def test_provision_create_account_disabled_409(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(admin_vultr, "_count_live_nodes", lambda: 0)
+
+    async def _cap(**kw):
+        raise PermissionError("vultr_account_disabled:2")
+
+    monkeypatch.setattr(admin_vultr, "create_and_provision", _cap)
+    r = _client().post(
+        "/v1/admin/nodes/provision-create",
+        json={"account_id": 2, "region": "cdg", "plan": "p", "geo": "FR"},
+    )
+    assert r.status_code == 409
+
+
+def test_provision_create_vultr_error_502(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(admin_vultr, "_count_live_nodes", lambda: 0)
+
+    async def _cap(**kw):
+        raise admin_vultr.VultrError("vultr_create_failed:500")
+
+    monkeypatch.setattr(admin_vultr, "create_and_provision", _cap)
+    r = _client().post(
+        "/v1/admin/nodes/provision-create",
+        json={"account_id": 2, "region": "cdg", "plan": "p", "geo": "FR"},
+    )
+    assert r.status_code == 502
