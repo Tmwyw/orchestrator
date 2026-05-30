@@ -68,6 +68,7 @@ class Config:
     traffic_poll_degrade_after: int
     orch_base_url: str
     cloud_init_template_path: str
+    max_nodes: int
 
 
 def get_config() -> Config:
@@ -110,4 +111,5 @@ def get_config() -> Config:
             "CLOUD_INIT_TEMPLATE_PATH",
             str(PROJECT_ROOT / "deploy" / "node" / "cloud-init.sh.tmpl"),
         ).strip(),
+        max_nodes=_int_env("MAX_NODES", 100),
     )

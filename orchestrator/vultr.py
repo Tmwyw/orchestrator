@@ -47,6 +47,7 @@ class VultrClient:
     def __init__(self, api_key: str, *, timeout: float = 20.0) -> None:
         self._key = api_key
         self._timeout = timeout
+        self._ubuntu_os_id: int | None = None  # resolve_ubuntu_2404_os_id cache
 
     @property
     def _headers(self) -> dict[str, str]:
@@ -104,6 +105,133 @@ class VultrClient:
             resp = await self._request(client, "POST", f"/instances/{instance_id}/reboot")
         if resp.status_code not in (202, 204):
             raise VultrError(f"vultr_reboot_failed:{resp.status_code}")
+
+    # ── PROVISION-2A: cursor-paginated listings + create/destroy ────────────────
+
+    async def _paged(self, path: str, key: str) -> list[dict[str, Any]]:
+        """Collect every item under ``key`` across cursor pages (GET ``path``)."""
+        out: list[dict[str, Any]] = []
+        cursor = ""
+        async with httpx.AsyncClient(timeout=self._timeout) as client:
+            for _ in range(50):  # defensive page cap (os list is large)
+                params: dict[str, object] = {"per_page": 500}
+                if cursor:
+                    params["cursor"] = cursor
+                resp = await self._request(client, "GET", path, params=params)
+                if resp.status_code != 200:
+                    raise VultrError(f"vultr_list_failed:{path}:{resp.status_code}")
+                data = resp.json()
+                out.extend(data.get(key, []))
+                cursor = ((data.get("meta") or {}).get("links") or {}).get("next") or ""
+                if not cursor:
+                    break
+        return out
+
+    async def resolve_ubuntu_2404_os_id(self) -> int:
+        """Vultr os.id for 'Ubuntu 24.04 LTS x64' (cached per client)."""
+        if self._ubuntu_os_id is not None:
+            return self._ubuntu_os_id
+        for os_entry in await self._paged("/os", "os"):
+            name = str(os_entry.get("name") or "")
+            arch = str(os_entry.get("arch") or "")
+            if "Ubuntu 24.04" in name and arch == "x64":
+                os_id = int(os_entry["id"])
+                self._ubuntu_os_id = os_id
+                return os_id
+        raise VultrError("vultr_ubuntu_2404_os_not_found")
+
+    async def list_regions(self) -> list[dict[str, Any]]:
+        """All Vultr regions as [{id, city, country, continent}] (id = slug)."""
+        return [
+            {
+                "id": r.get("id"),
+                "city": r.get("city"),
+                "country": r.get("country"),
+                "continent": r.get("continent"),
+            }
+            for r in await self._paged("/regions", "regions")
+        ]
+
+    async def list_plans(self) -> list[dict[str, Any]]:
+        """Regular cloud-compute plans fit for a node (>=2 vCPU, >=4 GB RAM),
+        sorted by monthly_cost ascending."""
+        usable: list[dict[str, Any]] = []
+        for p in await self._paged("/plans", "plans"):
+            if str(p.get("type") or "") not in ("vc2", "voc"):
+                continue
+            if int(p.get("vcpu_count") or 0) < 2 or int(p.get("ram") or 0) < 4096:
+                continue
+            usable.append(
+                {
+                    "id": p.get("id"),
+                    "vcpu_count": p.get("vcpu_count"),
+                    "ram": p.get("ram"),
+                    "disk": p.get("disk"),
+                    "monthly_cost": p.get("monthly_cost"),
+                    "type": p.get("type"),
+                    "locations": p.get("locations") or [],
+                }
+            )
+        usable.sort(key=lambda p: float(p.get("monthly_cost") or 0))
+        return usable
+
+    async def create_instance(
+        self,
+        *,
+        region: str,
+        plan: str,
+        os_id: int,
+        user_data_b64: str,
+        label: str,
+        hostname: str,
+        enable_ipv6: bool = True,
+        sshkey_ids: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """POST /v2/instances → {id, main_ip, status}. main_ip may be '0.0.0.0'
+        until Vultr assigns one."""
+        body: dict[str, Any] = {
+            "region": region,
+            "plan": plan,
+            "os_id": os_id,
+            "user_data": user_data_b64,
+            "label": label,
+            "hostname": hostname,
+            "enable_ipv6": enable_ipv6,
+            "backups": "disabled",
+        }
+        if sshkey_ids:
+            body["sshkey_id"] = sshkey_ids
+        async with httpx.AsyncClient(timeout=self._timeout) as client:
+            resp = await self._request(client, "POST", "/instances", json=body)
+        if resp.status_code not in (200, 201, 202):
+            raise VultrError(f"vultr_create_failed:{resp.status_code}")
+        inst = (resp.json() or {}).get("instance") or {}
+        return {
+            "id": str(inst.get("id")) if inst.get("id") else None,
+            "main_ip": inst.get("main_ip") or "0.0.0.0",
+            "status": inst.get("status"),
+        }
+
+    async def get_instance(self, instance_id: str) -> dict[str, Any]:
+        """GET /v2/instances/{id} → full instance dict."""
+        async with httpx.AsyncClient(timeout=self._timeout) as client:
+            resp = await self._request(client, "GET", f"/instances/{instance_id}")
+        if resp.status_code != 200:
+            raise VultrError(f"vultr_get_instance_failed:{resp.status_code}")
+        return (resp.json() or {}).get("instance") or {}
+
+    async def destroy_instance(self, instance_id: str) -> bool:
+        """DELETE /v2/instances/{id}. Best-effort: a non-2xx/404 is logged via the
+        returned bool (False) rather than raising — used for cost-guard rollback
+        and future decommission, where a missing instance is already the goal."""
+        try:
+            async with httpx.AsyncClient(timeout=self._timeout) as client:
+                resp = await self._request(
+                    client, "DELETE", f"/instances/{instance_id}"
+                )
+        except VultrError:
+            return False
+        return resp.status_code in (204, 404)
 
 
 async def client_for_account(account_id: int) -> VultrClient:

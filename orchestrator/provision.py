@@ -13,6 +13,7 @@ in node_provisions.shared_secret_hash.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
 import secrets
@@ -20,6 +21,7 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+from orchestrator import vultr
 from orchestrator.config import get_config
 from orchestrator.db import connect, fetch_one
 
@@ -120,6 +122,141 @@ def create_provision_job(
         "secret": secret,  # plaintext — shown ONCE
         "cloud_init_user_data": user_data,
         "oneliner_command": build_oneliner(user_data),
+    }
+
+
+# ── provision-create (variant A: orchestrator creates the Vultr box) ──────────
+
+
+def _insert_installing_job(
+    *,
+    job_id: str,
+    account_id: int,
+    geo: str,
+    region: str | None,
+    plan: str | None,
+    target_stock: int,
+    secret_hash: str,
+) -> None:
+    with connect() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            insert into node_provisions
+              (job_id, account_id, geo, region, plan, target_stock,
+               shared_secret_hash, status)
+            values (%s, %s, %s, %s, %s, %s, %s, 'installing')
+            """,
+            (job_id, account_id, geo, region, plan, target_stock, secret_hash),
+        )
+
+
+def _mark_create_failed(job_id: str) -> None:
+    """create_instance blew up after the job row landed — never leave it hanging
+    in 'installing' (no box was created)."""
+    with connect() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            update node_provisions
+               set status = 'failed',
+                   error = 'vultr_create_failed',
+                   updated_at = now(),
+                   finished_at = now()
+             where job_id = %s
+            """,
+            (job_id,),
+        )
+
+
+def _record_created_instance(*, job_id: str, instance_id: str | None, ip: str | None) -> None:
+    with connect() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            update node_provisions
+               set vultr_instance_id = %s,
+                   ip = %s,
+                   updated_at = now()
+             where job_id = %s
+            """,
+            (instance_id, ip, job_id),
+        )
+
+
+async def create_and_provision(
+    *,
+    account_id: int,
+    region: str,
+    plan: str,
+    geo: str,
+    target_stock: int,
+) -> dict[str, Any]:
+    """Variant A: create the Vultr instance (cloud-init injected via user_data),
+    then let the node self-register via POST /v1/nodes/register.
+
+    Inserts an 'installing' node_provisions row BEFORE the API call so a partial
+    failure is always recorded; if create_instance raises, flips that row to
+    'failed' (error='vultr_create_failed') and re-raises — no box exists in that
+    branch (failure happens at/before the POST), so there is nothing to destroy.
+    """
+    cfg = get_config()
+    if not cfg.orch_base_url:
+        raise RuntimeError("orchestrator_base_url_not_configured")
+
+    account = await asyncio.to_thread(
+        fetch_one, "select id, enabled from vultr_accounts where id = %s", (account_id,)
+    )
+    if not account:
+        raise LookupError(f"vultr_account_not_found:{account_id}")
+    if not account.get("enabled"):
+        raise PermissionError(f"vultr_account_disabled:{account_id}")
+
+    job_id = uuid.uuid4().hex
+    secret = secrets.token_urlsafe(24)
+    secret_hash = hash_secret(secret)
+    await asyncio.to_thread(
+        _insert_installing_job,
+        job_id=job_id,
+        account_id=account_id,
+        geo=geo,
+        region=region,
+        plan=plan,
+        target_stock=target_stock,
+        secret_hash=secret_hash,
+    )
+
+    user_data = render_user_data(orch_url=cfg.orch_base_url, secret=secret, job_id=job_id)
+    user_data_b64 = base64.b64encode(user_data.encode("utf-8")).decode("ascii")
+
+    short = job_id[:8]
+    label = f"netrun-{geo.lower()}-{short}" if geo else f"netrun-{short}"
+    hostname = label
+
+    try:
+        client = await vultr.client_for_account(account_id)
+        os_id = await client.resolve_ubuntu_2404_os_id()
+        inst = await client.create_instance(
+            region=region,
+            plan=plan,
+            os_id=os_id,
+            user_data_b64=user_data_b64,
+            label=label,
+            hostname=hostname,
+        )
+    except Exception:
+        await asyncio.to_thread(_mark_create_failed, job_id)
+        raise
+
+    main_ip = str(inst.get("main_ip") or "0.0.0.0")
+    ip = None if main_ip == "0.0.0.0" else main_ip
+    instance_id = inst.get("id")
+    await asyncio.to_thread(
+        _record_created_instance, job_id=job_id, instance_id=instance_id, ip=ip
+    )
+
+    return {
+        "job_id": job_id,
+        "vultr_instance_id": instance_id,
+        "status": "installing",
+        "main_ip": main_ip,
     }
 
 

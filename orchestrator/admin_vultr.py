@@ -13,9 +13,12 @@ from typing import Any
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import JSONResponse
 
+from orchestrator import vultr
+from orchestrator.config import get_config
 from orchestrator.crypto import FernetKeyError, decrypt_secret, encrypt_secret, mask_secret
 from orchestrator.db import execute, fetch_all, fetch_one
-from orchestrator.provision import create_provision_job, get_provision
+from orchestrator.provision import create_and_provision, create_provision_job, get_provision
+from orchestrator.vultr import VultrAccountNotFoundError, VultrError
 
 admin_vultr_router = APIRouter(prefix="/v1/admin")
 
@@ -193,3 +196,81 @@ async def provision_status(job_id: str) -> JSONResponse:
         if row.get(k) is not None:
             row[k] = str(row[k])
     return JSONResponse(content=row)
+
+
+# ── variant A: region/plan listings + full create-and-provision ───────────────
+
+
+@admin_vultr_router.get("/vultr/regions")
+async def list_vultr_regions(account_id: int) -> JSONResponse:
+    """Real Vultr regions for the account's key (city/country/continent + slug)."""
+    try:
+        client = await vultr.client_for_account(account_id)
+    except VultrAccountNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    try:
+        regions = await client.list_regions()
+    except VultrError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    return JSONResponse(content={"regions": regions})
+
+
+@admin_vultr_router.get("/vultr/plans")
+async def list_vultr_plans(account_id: int) -> JSONResponse:
+    """Node-suitable Vultr plans (>=2 vCPU / >=4 GB), sorted by monthly_cost."""
+    try:
+        client = await vultr.client_for_account(account_id)
+    except VultrAccountNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    try:
+        plans = await client.list_plans()
+    except VultrError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    return JSONResponse(content={"plans": plans})
+
+
+def _count_live_nodes() -> int:
+    """Cost-guard tally: every node row that still represents a billed Vultr box
+    (anything not explicitly disabled)."""
+    row = fetch_one("select count(*) as n from nodes where runtime_status <> 'disabled'")
+    return int(row["n"]) if row else 0
+
+
+@admin_vultr_router.post("/nodes/provision-create")
+async def provision_create(payload: dict[str, Any]) -> JSONResponse:
+    try:
+        account_id = int(payload["account_id"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail="account_id_required") from exc
+    region = str(payload.get("region", "")).strip()
+    plan = str(payload.get("plan", "")).strip()
+    if not region or not plan:
+        raise HTTPException(status_code=400, detail="region_and_plan_required")
+    geo = str(payload.get("geo", "")).strip()
+    if not geo:
+        raise HTTPException(status_code=400, detail="geo_required")
+    target_stock = int(payload.get("target_stock") or 4000)
+
+    # COST-GUARD: refuse to spin up another paid box past the configured ceiling.
+    max_nodes = get_config().max_nodes
+    live = await asyncio.to_thread(_count_live_nodes)
+    if live >= max_nodes:
+        raise HTTPException(status_code=409, detail=f"node_limit_reached:{live}")
+
+    try:
+        result = await create_and_provision(
+            account_id=account_id,
+            region=region,
+            plan=plan,
+            geo=geo,
+            target_stock=target_stock,
+        )
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except PermissionError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except VultrError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    return JSONResponse(status_code=201, content=result)
