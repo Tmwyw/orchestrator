@@ -43,8 +43,8 @@ async def list_vultr_accounts() -> JSONResponse:
             "label": r["label"],
             "enabled": r["enabled"],
             "key_masked": _masked_key(str(r["api_key_enc"])),
-            "created_at": r["created_at"],
-            "updated_at": r["updated_at"],
+            "created_at": str(r["created_at"]) if r["created_at"] is not None else None,
+            "updated_at": str(r["updated_at"]) if r["updated_at"] is not None else None,
         }
         for r in rows
     ]
