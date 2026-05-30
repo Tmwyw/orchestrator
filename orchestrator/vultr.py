@@ -190,9 +190,11 @@ class VultrClient:
         hostname: str,
         enable_ipv6: bool = True,
         sshkey_ids: list[str] | None = None,
+        backups: str = "disabled",
     ) -> dict[str, Any]:
         """POST /v2/instances → {id, main_ip, status}. main_ip may be '0.0.0.0'
-        until Vultr assigns one."""
+        until Vultr assigns one. ``backups`` is the Vultr auto-backup flag
+        ('enabled'/'disabled')."""
         body: dict[str, Any] = {
             "region": region,
             "plan": plan,
@@ -201,7 +203,7 @@ class VultrClient:
             "label": label,
             "hostname": hostname,
             "enable_ipv6": enable_ipv6,
-            "backups": "disabled",
+            "backups": backups,
         }
         if sshkey_ids:
             body["sshkey_id"] = sshkey_ids

@@ -171,6 +171,24 @@ async def test_create_instance_with_sshkeys(monkeypatch: pytest.MonkeyPatch) -> 
 
 
 @pytest.mark.asyncio
+async def test_create_instance_backups_enabled(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        import json as _json
+
+        captured.update(_json.loads(request.content))
+        return httpx.Response(201, json={"instance": {"id": "iid-2", "main_ip": "1.2.3.4"}})
+
+    _install_mock_transport(monkeypatch, handler)
+    await vultr.VultrClient("K").create_instance(
+        region="ord", plan="p", os_id=1, user_data_b64="x", label="l", hostname="h",
+        backups="enabled",
+    )
+    assert captured["backups"] == "enabled"
+
+
+@pytest.mark.asyncio
 async def test_create_instance_error_raises(monkeypatch: pytest.MonkeyPatch) -> None:
     _install_mock_transport(monkeypatch, lambda r: httpx.Response(400, json={"error": "bad plan"}))
     with pytest.raises(vultr.VultrError):
