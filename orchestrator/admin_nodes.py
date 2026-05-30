@@ -74,6 +74,11 @@ async def list_nodes_admin() -> JSONResponse:
         order by n.geo, n.name
         """,
     )
+    # last_heartbeat_at is a datetime — stringify so the stdlib JSON encoder
+    # in JSONResponse can serialize it (mirrors provision_status).
+    for r in rows:
+        if r.get("last_heartbeat_at") is not None:
+            r["last_heartbeat_at"] = str(r["last_heartbeat_at"])
     return JSONResponse(content={"nodes": rows})
 
 
