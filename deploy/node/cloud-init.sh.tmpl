@@ -93,11 +93,15 @@ log "install_ok=${INSTALL_OK} exit_code=${EXIT_CODE}"
 # never appear in log_tail.
 LOG_TAIL="$(tail -n 30 "$PROVISION_LOG" 2>/dev/null || true)"
 
-# ── 6) self IP ────────────────────────────────────────────────────────────────
-SELF_IP="$(curl -s --max-time 10 https://ifconfig.me 2>/dev/null || true)"
+# ── 6) self IP — MUST be IPv4 ─────────────────────────────────────────────────
+# The orchestrator reaches nodes over IPv4 (node-agent url = http://<ip>:8085);
+# ifconfig.me on a dual-stack box returns IPv6, which the orchestrator can't
+# reach AND breaks the Vultr instance-id lookup (main_ip is IPv4). So take the
+# authoritative Vultr-metadata IPv4 first, then ifconfig.me forced to IPv4.
+SELF_IP="$(curl -s --max-time 10 http://169.254.169.254/v1/interfaces/0/ipv4/address 2>/dev/null || true)"
 if [ -z "$SELF_IP" ]; then
-  log "ifconfig.me failed — falling back to Vultr metadata"
-  SELF_IP="$(curl -s --max-time 10 http://169.254.169.254/v1/interfaces/0/ipv4/address 2>/dev/null || true)"
+  log "Vultr metadata IPv4 failed — falling back to ifconfig.me (forced IPv4)"
+  SELF_IP="$(curl -s -4 --max-time 10 https://ifconfig.me 2>/dev/null || true)"
 fi
 log "self_ip=${SELF_IP:-<unknown>}"
 
