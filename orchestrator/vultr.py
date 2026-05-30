@@ -153,11 +153,14 @@ class VultrClient:
         ]
 
     async def list_plans(self) -> list[dict[str, Any]]:
-        """Regular cloud-compute plans fit for a node (>=2 vCPU, >=4 GB RAM),
-        sorted by monthly_cost ascending."""
+        """Shared-CPU plans fit for a node (>=2 vCPU, >=4 GB RAM), sorted by
+        monthly_cost ascending. Families: vc2 (Cloud Compute), vhf (High
+        Frequency), vhp (High Performance) — all Shared CPU. Dedicated (voc)
+        excluded (pricey, not needed for proxy nodes). bandwidth (GB/mo) is
+        returned so the bot can show traffic — the key spec for a proxy."""
         usable: list[dict[str, Any]] = []
         for p in await self._paged("/plans", "plans"):
-            if str(p.get("type") or "") not in ("vc2", "voc"):
+            if str(p.get("type") or "") not in ("vc2", "vhf", "vhp"):
                 continue
             if int(p.get("vcpu_count") or 0) < 2 or int(p.get("ram") or 0) < 4096:
                 continue
@@ -167,6 +170,7 @@ class VultrClient:
                     "vcpu_count": p.get("vcpu_count"),
                     "ram": p.get("ram"),
                     "disk": p.get("disk"),
+                    "bandwidth": p.get("bandwidth"),
                     "monthly_cost": p.get("monthly_cost"),
                     "type": p.get("type"),
                     "locations": p.get("locations") or [],
