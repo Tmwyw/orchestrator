@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
 from typing import Any
@@ -818,6 +819,64 @@ class GeoListResponse(BaseModel):
     model_config = _API_MODEL_CONFIG
 
     items: list[GeoUsageItem]
+
+
+# === /v1/admin/geos/catalog + geo CRUD (PROXY-PARITY-1 Phase A) ===
+#
+# Distinct from GeoUsageItem / GeoListResponse above (those back the
+# legacy GET /geos usage-count endpoint). These carry the full geo
+# DISPLAY metadata rows from the ``geos`` table.
+
+
+class GeoCatalogItem(BaseModel):
+    model_config = _API_MODEL_CONFIG
+
+    code: str
+    flag: str
+    name_ru: str
+    name_en: str | None = None
+    sort_order: int = 0
+    is_active: bool = True
+    sku_count: int = 0  # COUNT of skus carrying this geo_code (0 ok)
+
+
+class GeoCatalogListResponse(BaseModel):
+    model_config = _API_MODEL_CONFIG
+
+    items: list[GeoCatalogItem]
+
+
+class GeoCreateRequest(BaseModel):
+    model_config = _API_MODEL_CONFIG
+
+    code: str = Field(min_length=2, max_length=8)
+    flag: str = Field(default="🌐", min_length=1, max_length=16)
+    name_ru: str = Field(min_length=1, max_length=64)
+    name_en: str | None = Field(default=None, max_length=64)
+    sort_order: int = Field(default=0, ge=0, le=100_000)
+    is_active: bool = True
+
+    @field_validator("code")
+    @classmethod
+    def _normalize_code(cls, v: str) -> str:
+        v = v.strip().upper()
+        if not re.fullmatch(r"[A-Z]{2,8}", v):
+            raise ValueError("code must be 2-8 uppercase letters A-Z")
+        return v
+
+
+class GeoUpdateRequest(BaseModel):
+    """Partial update — every field optional. ``model_dump(exclude_none
+    =True)`` yields only the columns the caller actually sent (``False``
+    / ``0`` are kept; only ``None`` is dropped)."""
+
+    model_config = _API_MODEL_CONFIG
+
+    flag: str | None = Field(default=None, min_length=1, max_length=16)
+    name_ru: str | None = Field(default=None, min_length=1, max_length=64)
+    name_en: str | None = Field(default=None, max_length=64)
+    sort_order: int | None = Field(default=None, ge=0, le=100_000)
+    is_active: bool | None = None
 
 
 class ProductKindItem(BaseModel):
