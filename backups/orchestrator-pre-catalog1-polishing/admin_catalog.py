@@ -12,7 +12,6 @@ so each can be feature-flagged off if needed.
 from __future__ import annotations
 
 import asyncio
-from decimal import Decimal
 from typing import Any
 
 import psycopg
@@ -25,11 +24,7 @@ from orchestrator.api_schemas import (
     BindingItem,
     BindingListResponse,
     BindingUpdateRequest,
-    GeoCatalogItem,
-    GeoCatalogListResponse,
-    GeoCreateRequest,
     GeoListResponse,
-    GeoUpdateRequest,
     GeoUsageItem,
     PergbTierItem,
     PergbTiersPutRequest,
@@ -47,140 +42,6 @@ from orchestrator.api_schemas import (
 from orchestrator.db import connect, fetch_all, fetch_one
 
 admin_catalog_router = APIRouter(prefix="/v1/admin")
-
-
-# ── display_name source-of-truth (CATALOG-1 Phase D-Polishing-A.1) ──
-#
-# Bot used to maintain its own _KIND_LABEL_FALLBACK + _GEO_FLAGS dicts
-# and assemble the same string client-side; centralising here means
-# adding a new kind or geo is a single-place edit + the bot benefits
-# without a redeploy. ``_KIND_DISPLAY_LABELS`` is distinct from the
-# existing ``_PRODUCT_KIND_LABELS`` below because display_name appends
-# protocol as a separate token — keeping "IPv6" without "SOCKS5" baked
-# in avoids double-rendering ("IPv6 SOCKS5 US SOCKS5 (30d)").
-
-_KIND_DISPLAY_LABELS: dict[str, str] = {
-    "ipv6": "IPv6",
-    "datacenter_pergb": "Datacenter Pay-per-GB",
-}
-
-_GEO_FLAGS: dict[str, str] = {
-    "US": "🇺🇸",
-    "GB": "🇬🇧",
-    "UK": "🇬🇧",
-    "DE": "🇩🇪",
-    "FR": "🇫🇷",
-    "RU": "🇷🇺",
-    "UA": "🇺🇦",
-    "PL": "🇵🇱",
-    "JP": "🇯🇵",
-    "IN": "🇮🇳",
-    "NL": "🇳🇱",
-    "CA": "🇨🇦",
-    "MX": "🇲🇽",
-    "ES": "🇪🇸",
-    "IT": "🇮🇹",
-    "SE": "🇸🇪",
-    "BR": "🇧🇷",
-    "AU": "🇦🇺",
-    "SG": "🇸🇬",
-    "KR": "🇰🇷",
-    "TR": "🇹🇷",
-    "RO": "🇷🇴",
-    "IL": "🇮🇱",
-    "AE": "🇦🇪",
-    "ID": "🇮🇩",
-    "CL": "🇨🇱",
-    "ZA": "🇿🇦",
-}
-
-
-# ── Dynamic geo flags (PROXY-PARITY-1 Phase A) ──────────────────────
-#
-# Flags now live in the ``geos`` table (single source of truth) so a new
-# country shows its flag everywhere without a code edit. ``_compute_
-# display_name`` runs per-SKU in listings (4 call-sites), so we never hit
-# the DB per call: the code→flag map is loaded once into a process-global
-# cache and reused. ``invalidate_geo_cache()`` (called from the geo write
-# endpoints) drops it so the next render reloads.
-#
-# The loader uses ``connect()`` directly rather than ``fetch_all`` so a
-# test monkeypatching ``fetch_all`` for the skus path doesn't accidentally
-# intercept (or get asserted against) the geo query. Any load failure
-# (DB unavailable, table not yet migrated) falls back to the static
-# ``_GEO_FLAGS`` below — kept as a safety net until the bot-side data
-# migration lands; do NOT remove it abruptly.
-
-_geo_flag_cache: dict[str, str] | None = None
-
-
-def _load_geo_flags() -> dict[str, str]:
-    """Read the code→flag map from the ``geos`` table."""
-    with connect() as conn, conn.cursor() as cur:
-        cur.execute("SELECT code, flag FROM geos")
-        return {row["code"]: row["flag"] for row in cur.fetchall()}
-
-
-def _geo_flag(code: str | None) -> str:
-    """Flag for a geo code: DB (cached) → static fallback → 🏳️.
-
-    Empty / missing code → 🌐 (preserves the original "no geo" behaviour).
-    A DB-load failure is swallowed and NOT cached, so a transient outage
-    self-heals on the next call instead of poisoning the cache.
-    """
-    global _geo_flag_cache
-    geo_upper = (code or "").upper()
-    if not geo_upper:
-        return "🌐"
-    if _geo_flag_cache is None:
-        try:
-            _geo_flag_cache = _load_geo_flags()
-        except Exception:
-            return _GEO_FLAGS.get(geo_upper, "🏳️")
-    return _geo_flag_cache.get(geo_upper) or _GEO_FLAGS.get(geo_upper, "🏳️")
-
-
-def invalidate_geo_cache() -> None:
-    """Drop the process-global geo-flag cache (call after a geo write)."""
-    global _geo_flag_cache
-    _geo_flag_cache = None
-
-
-def _compute_display_name(
-    *,
-    kind: str,
-    geo_code: str | None,
-    protocol: str | None,
-    duration_days: int | None,
-) -> str:
-    """Build the SKU display label: emoji + kind + geo + protocol + duration.
-
-    Examples (kind == "ipv6"):
-        "🇺🇸 IPv6 US SOCKS5 (30d)"
-        "🇩🇪 IPv6 DE HTTP (7d)"
-    Pergb is geo-agnostic — always a neutral globe + label, NEVER a geo
-    flag or code (the seed SKU ``dc_pergb_de`` carries ``geo_code='DE'``
-    from the legacy Germany pilot but serves any geo, so showing «🇩🇪 … DE»
-    misleads). Wave PERGB-NO-GEO:
-        "🌐 Datacenter Pay-per-GB"   (regardless of the stored geo_code)
-    Unknown geo (not in the ``geos`` table nor the static fallback)
-    falls back to ``🏳️`` so the string never looks "broken" — operator
-    sees flag-or-fallback + code and recognises the SKU.
-    """
-    geo_upper = (geo_code or "").upper()
-    is_pergb = kind == "datacenter_pergb"
-    # pergb: neutral globe, no geo flag/code. Others: real geo flag + code.
-    flag = "🌐" if is_pergb else _geo_flag(geo_upper)
-    kind_label = _KIND_DISPLAY_LABELS.get(kind, kind)
-    parts: list[str] = [flag, kind_label]
-    if geo_upper and not is_pergb:
-        parts.append(geo_upper)
-    if not is_pergb:
-        if protocol:
-            parts.append(protocol.upper())
-        if duration_days:
-            parts.append(f"({duration_days}d)")
-    return " ".join(parts)
 
 
 def _problem(status_code: int, error: str, **extra: Any) -> JSONResponse:
@@ -262,59 +123,9 @@ async def list_skus(
         ORDER BY s.id
     """
     rows = await asyncio.to_thread(fetch_all, sql, tuple(params))
-    items = [
-        SkuAdminItem(
-            **r,
-            display_name=_compute_display_name(
-                kind=r["product_kind"],
-                geo_code=r.get("geo_code"),
-                protocol=r.get("protocol"),
-                duration_days=r.get("duration_days"),
-            ),
-        )
-        for r in rows
-    ]
+    items = [SkuAdminItem(**r) for r in rows]
     response = SkuListResponse(items=items, total=len(items))
     return JSONResponse(content=response.model_dump(mode="json"))
-
-
-# ── Sales-30d aggregation (D-Polishing-A.5) ────────────────────────
-
-
-def _fetch_sales_30d(sku_id: int) -> tuple[int, Decimal]:
-    """Aggregate 30-day sales for a SKU.
-
-    Counts orders in ('committed', 'expired') created within the
-    trailing 30 days. ``committed`` = paid and proxies live;
-    ``expired`` = proxies aged out (still a sale that produced
-    revenue). ``reserved`` and ``released`` are excluded — reserved
-    isn't paid yet, released was either cancelled or refunded.
-
-    The orders table has no ``is_admin_gift`` column (gifts are flagged
-    bot-side in ``orders_local``), so admin-gift filtering is a no-op
-    here — bot's admin-gift orders still hit ``price_amount > 0``
-    when the gift_service paths through reserve+commit, but the
-    refund/release path zeroes it out. If admin gifts ever appear in
-    the catalog stats they're indistinguishable from regular sales.
-
-    Returns ``(count, revenue)`` — revenue is ``Decimal('0')`` when
-    no rows match (COALESCE in SQL).
-    """
-    row = fetch_one(
-        """
-        SELECT
-          COUNT(*)::int AS sales_count,
-          COALESCE(SUM(price_amount), 0) AS sales_revenue
-          FROM orders
-         WHERE sku_id = %s
-           AND status IN ('committed', 'expired')
-           AND created_at >= now() - INTERVAL '30 days'
-        """,
-        (sku_id,),
-    )
-    if not row:
-        return 0, Decimal("0")
-    return int(row["sales_count"]), Decimal(str(row["sales_revenue"] or 0))
 
 
 # === GET /v1/admin/skus/{id} ===
@@ -379,19 +190,10 @@ async def get_sku(sku_id: int) -> JSONResponse:
         "expired_grace": sum(int(r["expired_grace"]) for r in breakdown_rows),
         "pending_validation": sum(int(r["pending_validation"]) for r in breakdown_rows),
     }
-    sales_count, sales_revenue = await asyncio.to_thread(_fetch_sales_30d, sku_id)
     detail = SkuAdminDetail(
         **sku_row,
         stock_total=stock_total,
         stock_breakdown=[SkuStockBreakdownItem(**r) for r in breakdown_rows],
-        display_name=_compute_display_name(
-            kind=sku_row["product_kind"],
-            geo_code=sku_row.get("geo_code"),
-            protocol=sku_row.get("protocol"),
-            duration_days=sku_row.get("duration_days"),
-        ),
-        sales_30d_count=sales_count,
-        sales_30d_revenue=sales_revenue,
     )
     return JSONResponse(content=detail.model_dump(mode="json"))
 
@@ -556,16 +358,14 @@ def _jsonify_scalar(v: Any) -> Any:
     return str(v)
 
 
-def _delete_sku_sync(sku_id: int) -> dict[str, Any] | str | tuple[str, dict[str, Any]]:
+def _delete_sku_sync(sku_id: int) -> dict[str, Any] | str:
     """Soft-delete SKU. Blocks if any non-terminal orders exist.
 
     Returns:
       - dict with deleted row on success
       - ``"sku_not_found"`` if id unknown
-      - ``("pending_orders", {"pending_count": N})`` if any order with
-        status in (``reserved``, ``committed``) still has an active
-        expiry — the count travels back so the route can render the
-        number in the 409 response (D-Polishing-A.2 enrichment)
+      - ``"pending_orders"`` if any order with status in
+        (``reserved``, ``committed``) still has an active expiry
 
     Idempotent: re-deleting an already-inactive SKU returns the row but
     still audits the event (so an operator-initiated re-delete is
@@ -598,7 +398,7 @@ def _delete_sku_sync(sku_id: int) -> dict[str, Any] | str | tuple[str, dict[str,
         pending_row = cur.fetchone()
         pending = int(pending_row["n"]) if pending_row else 0
         if pending > 0:
-            return ("pending_orders", {"pending_count": pending})
+            return "pending_orders"
 
         cur.execute(
             """
@@ -650,8 +450,8 @@ async def delete_sku(sku_id: int) -> JSONResponse:
     result = await asyncio.to_thread(_delete_sku_sync, sku_id)
     if result == "sku_not_found":
         return _problem(404, "sku_not_found")
-    if isinstance(result, tuple) and result[0] == "pending_orders":
-        return _problem(409, "pending_orders", **result[1])
+    if result == "pending_orders":
+        return _problem(409, "pending_orders")
     assert isinstance(result, dict)
     return JSONResponse(content={"success": True, "deleted_id": result["id"]})
 
@@ -696,19 +496,10 @@ async def _fresh_sku_detail(sku_row: dict[str, Any]) -> JSONResponse:
         "expired_grace": sum(int(r["expired_grace"]) for r in breakdown_rows),
         "pending_validation": sum(int(r["pending_validation"]) for r in breakdown_rows),
     }
-    sales_count, sales_revenue = await asyncio.to_thread(_fetch_sales_30d, sku_row["id"])
     detail = SkuAdminDetail(
         **sku_row,
         stock_total=stock_total,
         stock_breakdown=[SkuStockBreakdownItem(**r) for r in breakdown_rows],
-        display_name=_compute_display_name(
-            kind=sku_row["product_kind"],
-            geo_code=sku_row.get("geo_code"),
-            protocol=sku_row.get("protocol"),
-            duration_days=sku_row.get("duration_days"),
-        ),
-        sales_30d_count=sales_count,
-        sales_30d_revenue=sales_revenue,
     )
     return JSONResponse(content=detail.model_dump(mode="json"))
 
@@ -740,12 +531,6 @@ async def create_sku(payload: SkuCreateRequest) -> JSONResponse:
             "pending_validation": 0,
         },
         stock_breakdown=[],
-        display_name=_compute_display_name(
-            kind=result["product_kind"],
-            geo_code=result.get("geo_code"),
-            protocol=result.get("protocol"),
-            duration_days=result.get("duration_days"),
-        ),
     )
     return JSONResponse(status_code=201, content=detail.model_dump(mode="json"))
 
@@ -754,13 +539,6 @@ async def create_sku(payload: SkuCreateRequest) -> JSONResponse:
 
 
 def _list_bindings_sync(sku_id: int) -> list[dict[str, Any]] | str:
-    """List bindings for a SKU with per-node available_count joined in.
-
-    D-Polishing-A.4: scalar sub-SELECT for available_count is preferred
-    over a LEFT JOIN GROUP BY because bindings list is small (≤ N nodes
-    bound to one SKU); the sub-SELECT is index-friendly
-    (proxy_inventory(sku_id, node_id, status)) and keeps the SQL flat.
-    """
     sku = fetch_one("SELECT 1 FROM skus WHERE id = %s", (sku_id,))
     if not sku:
         return "sku_not_found"
@@ -768,11 +546,7 @@ def _list_bindings_sync(sku_id: int) -> list[dict[str, Any]] | str:
         """
         SELECT b.node_id, n.name AS node_name, n.geo AS node_geo,
                b.weight, b.max_batch_size, b.is_active,
-               b.created_at, b.updated_at,
-               (SELECT COUNT(*) FROM proxy_inventory pi
-                 WHERE pi.sku_id = b.sku_id
-                   AND pi.node_id = b.node_id
-                   AND pi.status = 'available')::int AS available_count
+               b.created_at, b.updated_at
           FROM sku_node_bindings b
           JOIN nodes n ON n.id = b.node_id
          WHERE b.sku_id = %s
@@ -1104,18 +878,11 @@ async def list_geos() -> JSONResponse:
     pergb / global SKUs (geo_code='') are intentionally excluded since
     "no geo" isn't a real geo to manage. Returns empty list if no SKUs
     have a populated geo_code.
-
-    D-Polishing-A.3: also reports ``active_count`` (is_active=true subset)
-    so the bot can render "🇺🇸 US — 3 SKU (1 неактивный)" without a
-    follow-up admin_list_skus(geo=US) round-trip.
     """
     rows = await asyncio.to_thread(
         fetch_all,
         """
-        SELECT
-          geo_code,
-          COUNT(*)::int AS sku_count,
-          COALESCE(SUM(CASE WHEN is_active THEN 1 ELSE 0 END), 0)::int AS active_count
+        SELECT geo_code, COUNT(*)::int AS sku_count
           FROM skus
          WHERE geo_code <> ''
          GROUP BY geo_code
@@ -1126,227 +893,26 @@ async def list_geos() -> JSONResponse:
     return JSONResponse(content=GeoListResponse(items=items).model_dump(mode="json"))
 
 
-# === /v1/admin/geos/catalog + geo CRUD (PROXY-PARITY-1 Phase A) ===
-#
-# Manage the geo DISPLAY metadata (flag + name) backing display_name and
-# the bot-side GeoRegistry (Phase B). Distinct from the legacy GET /geos
-# above (usage counts) — that one is left untouched. Write endpoints call
-# invalidate_geo_cache() so a flag/name change shows up on the next
-# render without a restart. skus.geo_code is never touched here.
-
-
-@admin_catalog_router.get("/geos/catalog")
-async def list_geos_catalog() -> JSONResponse:
-    """Full geo metadata list with live SKU counts.
-
-    LEFT JOIN against skus so geos with zero SKUs still appear (an
-    operator may pre-create a country before adding its first SKU).
-    Ordered by ``sort_order`` then ``code``.
-    """
-    rows = await asyncio.to_thread(
-        fetch_all,
-        """
-        SELECT
-          g.code, g.flag, g.name_ru, g.name_en, g.sort_order, g.is_active,
-          COALESCE(s.cnt, 0)::int AS sku_count
-          FROM geos g
-          LEFT JOIN (
-                SELECT geo_code, COUNT(*)::int AS cnt
-                  FROM skus
-                 WHERE geo_code <> ''
-                 GROUP BY geo_code
-               ) s ON s.geo_code = g.code
-         ORDER BY g.sort_order, g.code
-        """,
-    )
-    items = [GeoCatalogItem(**r) for r in rows]
-    return JSONResponse(content=GeoCatalogListResponse(items=items).model_dump(mode="json"))
-
-
-def _create_geo_sync(payload: GeoCreateRequest) -> dict[str, Any] | str:
-    """Insert a geo row. Returns the row, or ``"duplicate_code"`` if the
-    code already exists."""
-    with connect() as conn, conn.cursor() as cur:
-        try:
-            cur.execute(
-                """
-                INSERT INTO geos (code, flag, name_ru, name_en, sort_order, is_active)
-                VALUES (%s, %s, %s, %s, %s, %s)
-                RETURNING code, flag, name_ru, name_en, sort_order, is_active
-                """,
-                (
-                    payload.code,
-                    payload.flag,
-                    payload.name_ru,
-                    payload.name_en,
-                    payload.sort_order,
-                    payload.is_active,
-                ),
-            )
-        except psycopg.errors.UniqueViolation:
-            return "duplicate_code"
-        row = cur.fetchone()
-        assert row is not None
-        _audit(
-            cur,
-            action="geo_created",
-            target_type="geo",
-            target_id=payload.code,
-            details=payload.model_dump(mode="json"),
-        )
-        return dict(row)
-
-
-_GEO_PATCHABLE_FIELDS = ("flag", "name_ru", "name_en", "sort_order", "is_active")
-
-
-def _update_geo_sync(code: str, payload: GeoUpdateRequest) -> dict[str, Any] | str:
-    """Apply a partial update. Returns the updated row, or an error code
-    (``"no_fields_to_update"`` / ``"geo_not_found"``)."""
-    update_fields = payload.model_dump(exclude_none=True)
-    if not update_fields:
-        return "no_fields_to_update"
-    code = code.upper()
-    with connect() as conn, conn.cursor() as cur:
-        cur.execute("SELECT code FROM geos WHERE code = %s FOR UPDATE", (code,))
-        if not cur.fetchone():
-            return "geo_not_found"
-        set_clauses = [f"{col} = %s" for col in update_fields]
-        set_clauses.append("updated_at = now()")
-        params = list(update_fields.values()) + [code]
-        cur.execute(
-            f"""
-            UPDATE geos
-               SET {", ".join(set_clauses)}
-             WHERE code = %s
-            RETURNING code, flag, name_ru, name_en, sort_order, is_active
-            """,
-            tuple(params),
-        )
-        row = cur.fetchone()
-        assert row is not None
-        _audit(
-            cur,
-            action="geo_updated",
-            target_type="geo",
-            target_id=code,
-            details={"fields": list(update_fields.keys())},
-        )
-        return dict(row)
-
-
-def _delete_geo_sync(code: str) -> dict[str, Any] | str | tuple[str, dict[str, Any]]:
-    """Hard-delete a geo. Returns the deleted code, ``"geo_not_found"``,
-    or ``("geo_in_use", {"sku_count": N})`` when SKUs still reference it.
-
-    Deactivation (is_active=false) is a PATCH and is always allowed — only
-    physical removal is guarded, since a SKU's display_name would lose its
-    flag/name otherwise.
-    """
-    with connect() as conn, conn.cursor() as cur:
-        cur.execute("SELECT code FROM geos WHERE code = %s FOR UPDATE", (code,))
-        if not cur.fetchone():
-            return "geo_not_found"
-        cur.execute(
-            "SELECT COUNT(*)::int AS n FROM skus WHERE geo_code = %s",
-            (code,),
-        )
-        used_row = cur.fetchone()
-        used = int(used_row["n"]) if used_row else 0
-        if used > 0:
-            return ("geo_in_use", {"sku_count": used})
-        cur.execute("DELETE FROM geos WHERE code = %s", (code,))
-        _audit(
-            cur,
-            action="geo_deleted",
-            target_type="geo",
-            target_id=code,
-            details={"code": code},
-        )
-        return {"code": code}
-
-
-@admin_catalog_router.post("/geos", status_code=201)
-async def create_geo(payload: GeoCreateRequest) -> JSONResponse:
-    """Create a geo metadata row. 409 ``duplicate_code`` if it exists.
-
-    ``code`` is normalised to uppercase and validated (2-8 A-Z) in the
-    request model. Invalidates the display-name flag cache on success.
-    """
-    result = await asyncio.to_thread(_create_geo_sync, payload)
-    if isinstance(result, str):
-        return _problem(409, result)
-    invalidate_geo_cache()
-    item = GeoCatalogItem(**result, sku_count=0)
-    return JSONResponse(status_code=201, content=item.model_dump(mode="json"))
-
-
-@admin_catalog_router.patch("/geos/{code}")
-async def patch_geo(code: str, payload: GeoUpdateRequest) -> JSONResponse:
-    """Partial update of flag / name_ru / name_en / sort_order /
-    is_active. 400 if no fields, 404 if the code is unknown. Deactivating
-    (``is_active=false``) is allowed here even while SKUs reference it."""
-    result = await asyncio.to_thread(_update_geo_sync, code, payload)
-    if result == "no_fields_to_update":
-        return _problem(400, "no_fields_to_update")
-    if result == "geo_not_found":
-        return _problem(404, "geo_not_found")
-    invalidate_geo_cache()
-    assert isinstance(result, dict)
-    item = GeoCatalogItem(**result)
-    return JSONResponse(content=item.model_dump(mode="json"))
-
-
-@admin_catalog_router.delete("/geos/{code}")
-async def delete_geo(code: str) -> JSONResponse:
-    """Hard-delete a geo. 409 ``geo_in_use`` (with ``sku_count``) if any
-    SKU still references it — deactivate instead. 404 if unknown."""
-    result = await asyncio.to_thread(_delete_geo_sync, code.upper())
-    if result == "geo_not_found":
-        return _problem(404, "geo_not_found")
-    if isinstance(result, tuple) and result[0] == "geo_in_use":
-        return _problem(409, "geo_in_use", **result[1])
-    invalidate_geo_cache()
-    assert isinstance(result, dict)
-    return JSONResponse(content={"success": True, "deleted_code": result["code"]})
-
-
 @admin_catalog_router.get("/product_kinds")
 async def list_product_kinds() -> JSONResponse:
     """List known product_kind values + usage counts.
 
     The list of kinds is hardcoded in ``_PRODUCT_KIND_LABELS`` (mirrors
     the CHECK constraint on ``skus.product_kind``). For each kind we
-    return its human-readable name, sku_count, and aggregate
-    ``total_stock`` (sum of available inventory across all SKUs of
-    this kind) so the bot's "🏷 Типы прокси" page can show "12450 в
-    пуле" without N+1 detail fetches.
-
-    LEFT JOIN proxy_inventory because a kind with zero SKUs still
-    needs a row in the response (sku_count + total_stock both 0).
+    return its human-readable name and how many SKUs use it currently —
+    useful for the bot's "🏷 Типы прокси" read-only page.
     """
     rows = await asyncio.to_thread(
         fetch_all,
         """
-        SELECT
-          s.product_kind,
-          COUNT(DISTINCT s.id)::int AS sku_count,
-          COALESCE(SUM(CASE WHEN pi.status = 'available' THEN 1 ELSE 0 END), 0)::int
-            AS total_stock
-          FROM skus s
-          LEFT JOIN proxy_inventory pi ON pi.sku_id = s.id
-         GROUP BY s.product_kind
+        SELECT product_kind, COUNT(*)::int AS sku_count
+          FROM skus
+         GROUP BY product_kind
         """,
     )
     counts = {r["product_kind"]: int(r["sku_count"]) for r in rows}
-    totals = {r["product_kind"]: int(r["total_stock"]) for r in rows}
     items = [
-        ProductKindItem(
-            kind=kind,
-            name=label,
-            sku_count=counts.get(kind, 0),
-            total_stock=totals.get(kind, 0),
-        )
+        ProductKindItem(kind=kind, name=label, sku_count=counts.get(kind, 0))
         for kind, label in _PRODUCT_KIND_LABELS.items()
     ]
     return JSONResponse(content=ProductKindListResponse(items=items).model_dump(mode="json"))
