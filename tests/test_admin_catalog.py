@@ -961,14 +961,20 @@ def test_display_name_pergb_no_geo() -> None:
     )
 
 
-def test_display_name_pergb_with_geo_keeps_geo_drops_protocol_duration() -> None:
-    """Pergb shows geo when present, but protocol/duration are
-    irrelevant for it."""
+def test_display_name_pergb_drops_geo_flag_and_code() -> None:
+    """Wave PERGB-NO-GEO — pergb is geo-agnostic: even with a stored
+    geo_code (the legacy ``dc_pergb_de`` seed) the label shows a neutral
+    globe and NO flag/code/protocol/duration."""
     from orchestrator.admin_catalog import _compute_display_name
 
     assert (
         _compute_display_name(kind="datacenter_pergb", geo_code="DE", protocol="socks5", duration_days=30)
-        == "🇩🇪 Datacenter Pay-per-GB DE"
+        == "🌐 Datacenter Pay-per-GB"
+    )
+    # No geo at all → identical neutral label (regression with no_geo case).
+    assert (
+        _compute_display_name(kind="datacenter_pergb", geo_code="DE", protocol=None, duration_days=None)
+        == "🌐 Datacenter Pay-per-GB"
     )
 
 
