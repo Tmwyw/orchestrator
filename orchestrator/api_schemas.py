@@ -148,6 +148,32 @@ class ProxiesErrorResponse(BaseModel):
     detail: str | None = None
 
 
+# === /v1/orders/{ref}/proxies/meta — per-port metadata (Wave O-4.A) ===
+# Read-only per-port view for selective extend: the bot lists each live
+# proxy with its inventory_id (the value /extend accepts in inventory_ids),
+# host:port, geo and per-port expires_at so the user can pick which ports
+# to renew. Deliberately NO login/password — the buyer already has those in
+# the delivered .txt; this is metadata for the picker only.
+
+
+class ProxyPortMeta(BaseModel):
+    model_config = _API_MODEL_CONFIG
+
+    inventory_id: int
+    host: str
+    port: int
+    geo: str | None = None
+    expires_at: datetime | None = None
+    status: str
+
+
+class ProxiesMetaResponse(BaseModel):
+    model_config = _API_MODEL_CONFIG
+
+    success: bool = True
+    items: list[ProxyPortMeta] = Field(default_factory=list)
+
+
 # === Generic error (RFC 7807-style) ===
 
 

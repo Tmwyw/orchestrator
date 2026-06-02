@@ -412,6 +412,21 @@ class AllocatorService:
             line_count=line_count,
         )
 
+    async def list_order_proxy_meta(
+        self, *, order_ref: str
+    ) -> list[dict[str, Any]] | None:
+        """Wave O-4.A — per-port metadata for an order's live proxies.
+
+        Returns ``None`` when the order_ref doesn't resolve (caller maps to
+        404). Otherwise a list (possibly empty when the order has no live
+        'sold'/'expired_grace' ports) of per-port dicts — no credentials."""
+        order = await asyncio.to_thread(self._sync_get_order, order_ref)
+        if order is None:
+            return None
+        return await asyncio.to_thread(
+            self._sync_list_inventory_meta_for_order, int(order["id"])
+        )
+
     async def extend_order(
         self,
         *,
@@ -699,6 +714,26 @@ class AllocatorService:
             cur.execute(
                 """
                 select id, host, port, login, password, expires_at, geo_country
+                from proxy_inventory
+                where order_id = %s and status in ('sold', 'expired_grace')
+                order by id
+                """,
+                (order_id,),
+            )
+            return [dict(r) for r in cur.fetchall()]
+
+    def _sync_list_inventory_meta_for_order(self, order_id: int) -> list[dict[str, Any]]:
+        """Wave O-4.A — per-port metadata for the selective-extend picker.
+
+        Same live-port filter as :meth:`_sync_list_inventory_for_order`
+        ('sold' / 'expired_grace', the statuses /extend operates on), but
+        deliberately WITHOUT login/password — the picker only needs the
+        inventory id (what /extend accepts in ``inventory_ids``), host:port,
+        geo and the per-port ``expires_at``."""
+        with connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                select id, host, port, geo_country, expires_at, status
                 from proxy_inventory
                 where order_id = %s and status in ('sold', 'expired_grace')
                 order by id
