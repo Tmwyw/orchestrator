@@ -28,6 +28,8 @@ from orchestrator.api_schemas import (
     OrderResponse,
     ProblemResponse,
     ProxiesErrorResponse,
+    ProxiesMetaResponse,
+    ProxyPortMeta,
     RegisterRequest,
     ReleaseResponse,
     ReserveErrorResponse,
@@ -843,6 +845,39 @@ async def get_order_proxies(order_ref: str, format: str = "socks5_uri"):
         media_type=result.content_type,
         headers=headers,
     )
+
+
+@app.get("/v1/orders/{order_ref}/proxies/meta", dependencies=[Depends(require_api_key)])
+async def get_order_proxies_meta(order_ref: str):
+    """Wave O-4.A — per-port metadata for the selective-extend picker.
+
+    Returns one item per LIVE proxy ('sold' / 'expired_grace') of the order
+    with its ``inventory_id`` (the value /extend accepts in
+    ``inventory_ids``), ``host``/``port``, ``geo`` and the per-port
+    ``expires_at``. NO login/password — the buyer already has those in the
+    delivered .txt; this is metadata for choosing which ports to renew.
+    Unknown order_ref → 404; an order with no live ports → ``items: []``.
+    """
+    rows = await _allocator.list_order_proxy_meta(order_ref=order_ref)
+    if rows is None:
+        return JSONResponse(
+            status_code=404,
+            content=ProblemResponse(error="order_not_found").model_dump(
+                exclude_none=True, mode="json"
+            ),
+        )
+    items = [
+        ProxyPortMeta(
+            inventory_id=int(r["id"]),
+            host=str(r["host"]),
+            port=int(r["port"]),
+            geo=(str(r["geo_country"]) if r.get("geo_country") is not None else None),
+            expires_at=r.get("expires_at"),
+            status=str(r["status"]),
+        )
+        for r in rows
+    ]
+    return JSONResponse(content=ProxiesMetaResponse(items=items).model_dump(mode="json"))
 
 
 @app.post("/v1/orders/{order_ref}/extend", dependencies=[Depends(require_api_key)])

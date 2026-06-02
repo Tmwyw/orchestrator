@@ -224,3 +224,109 @@ def test_extend_endpoint_calls_allocator() -> None:
 # Cleanup so other tests aren't affected by the env var.
 def _cleanup_marker() -> None:
     os.environ.pop("ORCHESTRATOR_API_KEY", None)
+
+
+# === Wave O-4.A: per-port proxy metadata endpoint ===
+
+
+def test_get_proxies_meta_returns_per_port_items() -> None:
+    """N live ports → one item each with inventory_id/host/port/geo/
+    expires_at/status; different per-port expires_at are reflected; NO
+    login/password leak."""
+    t1 = datetime(2026, 7, 1, 12, 0, tzinfo=timezone.utc)
+    t2 = datetime(2026, 8, 15, 9, 30, tzinfo=timezone.utc)
+    rows = [
+        {"id": 11, "host": "1.2.3.4", "port": 30001, "geo_country": "US",
+         "expires_at": t1, "status": "sold",
+         "login": "secretlogin", "password": "secretpass"},
+        {"id": 12, "host": "1.2.3.4", "port": 30002, "geo_country": "DE",
+         "expires_at": t2, "status": "expired_grace",
+         "login": "l2", "password": "p2"},
+    ]
+    with patch(
+        "orchestrator.main._allocator.list_order_proxy_meta",
+        new=AsyncMock(return_value=rows),
+    ):
+        client = _client()
+        response = client.get(
+            "/v1/orders/ord_meta/proxies/meta",
+            headers={"X-NETRUN-API-KEY": "test-api-key"},
+        )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["success"] is True
+    items = body["items"]
+    assert len(items) == 2
+    assert items[0]["inventory_id"] == 11
+    assert items[0]["host"] == "1.2.3.4"
+    assert items[0]["port"] == 30001
+    assert items[0]["geo"] == "US"
+    assert items[0]["status"] == "sold"
+    assert items[0]["expires_at"].startswith("2026-07-01")
+    # Per-port срок differs across ports.
+    assert items[1]["inventory_id"] == 12
+    assert items[1]["status"] == "expired_grace"
+    assert items[1]["expires_at"].startswith("2026-08-15")
+    # NO credentials in the response — neither key present anywhere.
+    raw = response.text
+    assert "login" not in raw
+    assert "password" not in raw
+    assert "secretlogin" not in raw
+    assert "secretpass" not in raw
+
+
+def test_get_proxies_meta_unknown_order_returns_404() -> None:
+    with patch(
+        "orchestrator.main._allocator.list_order_proxy_meta",
+        new=AsyncMock(return_value=None),
+    ):
+        client = _client()
+        response = client.get(
+            "/v1/orders/ord_missing/proxies/meta",
+            headers={"X-NETRUN-API-KEY": "test-api-key"},
+        )
+    assert response.status_code == 404
+    assert response.json()["error"] == "order_not_found"
+
+
+def test_get_proxies_meta_no_live_ports_returns_empty_items() -> None:
+    with patch(
+        "orchestrator.main._allocator.list_order_proxy_meta",
+        new=AsyncMock(return_value=[]),
+    ):
+        client = _client()
+        response = client.get(
+            "/v1/orders/ord_empty/proxies/meta",
+            headers={"X-NETRUN-API-KEY": "test-api-key"},
+        )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["success"] is True
+    assert body["items"] == []
+
+
+def test_get_proxies_meta_null_geo_and_expiry_pass_through() -> None:
+    rows = [
+        {"id": 7, "host": "9.9.9.9", "port": 40001, "geo_country": None,
+         "expires_at": None, "status": "sold"},
+    ]
+    with patch(
+        "orchestrator.main._allocator.list_order_proxy_meta",
+        new=AsyncMock(return_value=rows),
+    ):
+        client = _client()
+        response = client.get(
+            "/v1/orders/ord_nulls/proxies/meta",
+            headers={"X-NETRUN-API-KEY": "test-api-key"},
+        )
+    assert response.status_code == 200
+    item = response.json()["items"][0]
+    assert item["inventory_id"] == 7
+    assert item["geo"] is None
+    assert item["expires_at"] is None
+
+
+def test_get_proxies_meta_requires_auth() -> None:
+    client = _client()
+    response = client.get("/v1/orders/ord_x/proxies/meta")
+    assert response.status_code in (401, 403)
