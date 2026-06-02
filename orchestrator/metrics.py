@@ -53,6 +53,18 @@ WATCHDOG_ACTIONS = Counter(
     ["action"],
 )
 
+# === Egress watchdog (Wave WATCHDOG-EGRESS-CHECK) ===
+
+EGRESS_WATCHDOG_ACTIONS = Counter(
+    "netrun_egress_watchdog_actions_total",
+    "Egress watchdog per-cycle outcomes (probe result / reboot)",
+    ["action"],
+)
+EGRESS_NODES_DOWN = Gauge(
+    "netrun_egress_nodes_down",
+    "Nodes whose last egress probe failed (egress_ok = false)",
+)
+
 # === HTTP middleware (every request) ===
 
 HTTP_REQUESTS = Counter(
