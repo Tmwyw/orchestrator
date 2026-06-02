@@ -284,7 +284,10 @@ async def nodes_health() -> dict[str, Any]:
     Old nodes that never populate it yield ``null`` — purely additive,
     no breakage.
     """
-    rows = fetch_all("select id, name, geo, url, api_key, runtime_status from nodes order by created_at asc")
+    rows = fetch_all(
+        "select id, name, geo, url, api_key, runtime_status, "
+        "egress_ok, egress_checked_at from nodes order by created_at asc"
+    )
 
     if not rows:
         return {"success": True, "items": []}
@@ -324,6 +327,11 @@ async def nodes_health() -> dict[str, Any]:
         runtime_status = node.get("runtime_status") or "unknown"
         if node["id"] in recovered_set:
             runtime_status = "active"
+        # Wave WATCHDOG-EGRESS-CHECK — surface the egress watchdog's last
+        # verdict so the bot «Здоровье» panel can show outbound health, not
+        # just inbound reachability. ``egress_ok`` is None until the egress
+        # watchdog has probed the node at least once.
+        egress_checked_at = node.get("egress_checked_at")
         items.append(
             {
                 "id": node["id"],
@@ -334,6 +342,10 @@ async def nodes_health() -> dict[str, Any]:
                 "latency_ms": latency_ms,
                 "last_check": last_check_iso,
                 "dns": dns,
+                "egress_ok": node.get("egress_ok"),
+                "egress_checked_at": (
+                    egress_checked_at.isoformat() if egress_checked_at is not None else None
+                ),
             }
         )
     return {"success": True, "items": items}

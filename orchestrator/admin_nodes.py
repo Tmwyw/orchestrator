@@ -55,6 +55,69 @@ def _ip_from_url(url: str) -> str | None:
     return m.group(1) if m else None
 
 
+class NodeRebootError(RuntimeError):
+    """Reboot could not be performed. ``detail`` mirrors the HTTP detail
+    strings the endpoint historically returned so callers (endpoint +
+    egress watchdog) can log/translate uniformly."""
+
+    def __init__(self, detail: str) -> None:
+        super().__init__(detail)
+        self.detail = detail
+
+
+async def reboot_node_internal(node_id: str) -> dict[str, Any]:
+    """Reboot the node's Vultr instance using ITS account's key.
+
+    Wave WATCHDOG-EGRESS-CHECK extracted this from :func:`reboot_node` so
+    the egress watchdog can trigger a reboot DIRECTLY (no HTTP self-call).
+    Raises :class:`NodeRebootError` on any failure (the endpoint maps it to
+    the same HTTP statuses it used before; the watchdog catches + logs).
+
+    Per-account: a node tied to ``vultr_account`` is rebooted with that
+    account's decrypted key (a Vultr key only sees its own instances).
+    Legacy nodes with no account fall back to ``VULTR_API_KEY`` env /
+    ``vultr_watchdog.env``. The instance id comes from
+    ``nodes.vultr_instance_id`` when present, else looked up by node IP.
+    """
+    node = await asyncio.to_thread(
+        fetch_one,
+        "select url, vultr_account, vultr_instance_id from nodes where id = %s",
+        (node_id,),
+    )
+    if not node:
+        raise NodeRebootError("node_not_found")
+    ip = _ip_from_url(str(node.get("url") or ""))
+    iid: str | None = (str(node.get("vultr_instance_id") or "").strip()) or None
+    account_id = node.get("vultr_account")
+
+    if account_id is not None:
+        try:
+            client = await vultr.client_for_account(int(account_id))
+        except (vultr.VultrError, FernetKeyError) as exc:
+            raise NodeRebootError(f"vultr_account_key_error:{exc}") from exc
+    else:
+        key = _vultr_api_key()
+        if not key:
+            raise NodeRebootError("vultr_api_key_unavailable")
+        client = vultr.VultrClient(key)
+
+    if not iid:
+        if not ip:
+            raise NodeRebootError("cannot_parse_node_ip")
+        try:
+            iid = await client.find_instance_id_by_main_ip(ip)
+        except vultr.VultrError as exc:
+            raise NodeRebootError(f"vultr_list_failed:{exc}") from exc
+        if not iid:
+            raise NodeRebootError(f"vultr_instance_not_found_for_ip:{ip}")
+
+    try:
+        await client.reboot(iid)
+    except vultr.VultrError as exc:
+        raise NodeRebootError(f"vultr_reboot_failed:{exc}") from exc
+    return {"id": node_id, "ip": ip, "vultr_instance_id": iid, "rebooted": True}
+
+
 @admin_nodes_router.get("/nodes")
 async def list_nodes_admin() -> JSONResponse:
     """Nodes with runtime_status + available proxy count (for the bot node menu)."""
@@ -120,43 +183,24 @@ async def reboot_node(node_id: str) -> JSONResponse:
     no account fall back to the single VULTR_API_KEY env / watchdog.env file.
     The instance id is taken from nodes.vultr_instance_id when present, else
     looked up by the node IP.
+
+    Wave WATCHDOG-EGRESS-CHECK: the body moved to :func:`reboot_node_internal`
+    (shared with the egress watchdog); this endpoint just maps its
+    ``NodeRebootError.detail`` back to the historical HTTP statuses.
     """
-    node = await asyncio.to_thread(
-        fetch_one,
-        "select url, vultr_account, vultr_instance_id from nodes where id = %s",
-        (node_id,),
-    )
-    if not node:
-        raise HTTPException(status_code=404, detail="node_not_found")
-    ip = _ip_from_url(str(node.get("url") or ""))
-    iid: str | None = (str(node.get("vultr_instance_id") or "").strip()) or None
-    account_id = node.get("vultr_account")
-
-    if account_id is not None:
-        try:
-            client = await vultr.client_for_account(int(account_id))
-        except (vultr.VultrError, FernetKeyError) as exc:
-            raise HTTPException(status_code=502, detail=f"vultr_account_key_error:{exc}") from exc
-    else:
-        key = _vultr_api_key()
-        if not key:
-            raise HTTPException(status_code=500, detail="vultr_api_key_unavailable")
-        client = vultr.VultrClient(key)
-
-    if not iid:
-        if not ip:
-            raise HTTPException(status_code=400, detail="cannot_parse_node_ip")
-        try:
-            iid = await client.find_instance_id_by_main_ip(ip)
-        except vultr.VultrError as exc:
-            raise HTTPException(status_code=502, detail=f"vultr_list_failed:{exc}") from exc
-        if not iid:
-            raise HTTPException(status_code=404, detail=f"vultr_instance_not_found_for_ip:{ip}")
-
     try:
-        await client.reboot(iid)
-    except vultr.VultrError as exc:
-        raise HTTPException(status_code=502, detail=f"vultr_reboot_failed:{exc}") from exc
-    return JSONResponse(
-        content={"id": node_id, "ip": ip, "vultr_instance_id": iid, "rebooted": True}
-    )
+        result = await reboot_node_internal(node_id)
+    except NodeRebootError as exc:
+        raise HTTPException(status_code=_reboot_error_status(exc.detail), detail=exc.detail) from exc
+    return JSONResponse(content=result)
+
+
+def _reboot_error_status(detail: str) -> int:
+    """Preserve the original per-failure HTTP status codes."""
+    if detail == "node_not_found" or detail.startswith("vultr_instance_not_found_for_ip"):
+        return 404
+    if detail == "cannot_parse_node_ip":
+        return 400
+    if detail == "vultr_api_key_unavailable":
+        return 500
+    return 502  # vultr_account_key_error / vultr_list_failed / vultr_reboot_failed
