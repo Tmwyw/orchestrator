@@ -162,6 +162,9 @@ def test_get_sku_returns_detail_with_breakdown(monkeypatch: pytest.MonkeyPatch, 
         # primary SKU SELECT — route by table name.
         if "FROM orders" in query:
             return {"sales_count": 0, "sales_revenue": Decimal("0")}
+        # Wave POOL-PER-NODE.A — pool_target SUM over active bindings.
+        if "sku_node_bindings" in query:
+            return {"pool_target": 8000}
         assert "FROM skus" in query
         assert params == (1,)
         return sku_row
@@ -185,6 +188,8 @@ def test_get_sku_returns_detail_with_breakdown(monkeypatch: pytest.MonkeyPatch, 
     assert body["stock_total"]["reserved"] == 50
     assert body["stock_total"]["sold"] == 12340
     assert body["stock_total"]["pending_validation"] == 5
+    # Wave POOL-PER-NODE.A — geo pool target = SUM of active bindings.
+    assert body["pool_target"] == 8000
     assert len(body["stock_breakdown"]) == 2
     assert body["stock_breakdown"][0]["node_id"] == "node-us-1"
     assert body["stock_breakdown"][0]["available"] == 2340
@@ -522,6 +527,7 @@ def _stub_binding(node_id: str = "node-us-1", geo: str = "US") -> dict[str, Any]
         "node_geo": geo,
         "weight": 100,
         "max_batch_size": 1500,
+        "target_stock": 4000,
         "is_active": True,
         "created_at": datetime(2026, 5, 1, tzinfo=timezone.utc),
         "updated_at": datetime(2026, 5, 1, tzinfo=timezone.utc),
@@ -539,6 +545,8 @@ def test_list_bindings_happy(monkeypatch: pytest.MonkeyPatch, _no_auth: None) ->
     body = r.json()
     assert len(body["items"]) == 2
     assert body["items"][0]["node_id"] == "node-us-1"
+    # Wave POOL-PER-NODE.A — per-node target surfaced on the binding row.
+    assert body["items"][0]["target_stock"] == 4000
 
 
 def test_list_bindings_404_sku_missing(monkeypatch: pytest.MonkeyPatch, _no_auth: None) -> None:
@@ -609,6 +617,99 @@ def test_patch_binding_happy(monkeypatch: pytest.MonkeyPatch, _no_auth: None) ->
     r = client.patch("/v1/admin/skus/1/bindings/node-us-1", json={"weight": 200})
     assert r.status_code == 200
     assert r.json()["weight"] == 200
+
+
+def test_patch_binding_sets_target_stock(monkeypatch: pytest.MonkeyPatch, _no_auth: None) -> None:
+    """Wave POOL-PER-NODE.A — the bot (wave B) PATCHes per-node target."""
+    captured: dict[str, Any] = {}
+
+    def fake_update(sku_id: int, node_id: str, payload: Any) -> dict[str, Any]:
+        captured["target_stock"] = payload.target_stock
+        result = _stub_binding(node_id)
+        result["target_stock"] = payload.target_stock
+        return result
+
+    monkeypatch.setattr("orchestrator.admin_catalog._update_binding_sync", fake_update)
+    from orchestrator.main import app
+
+    client = TestClient(app)
+    r = client.patch("/v1/admin/skus/1/bindings/node-us-1", json={"target_stock": 6000})
+    assert r.status_code == 200
+    assert captured["target_stock"] == 6000
+    assert r.json()["target_stock"] == 6000
+
+
+def test_patch_binding_rejects_negative_target_stock(
+    monkeypatch: pytest.MonkeyPatch, _no_auth: None
+) -> None:
+    from orchestrator.main import app
+
+    client = TestClient(app)
+    r = client.patch("/v1/admin/skus/1/bindings/node-us-1", json={"target_stock": -5})
+    assert r.status_code == 422
+
+
+def test_update_binding_sync_writes_target_stock(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The dynamic SET clause includes target_stock and binds the new value."""
+    from orchestrator import admin_catalog
+    from orchestrator.api_schemas import BindingUpdateRequest
+
+    executed: list[tuple[str, Any]] = []
+
+    old_row = {
+        "node_id": "n1",
+        "node_name": "n1",
+        "node_geo": "US",
+        "weight": 100,
+        "max_batch_size": 1500,
+        "target_stock": 1000,
+        "is_active": True,
+    }
+    new_row = {**old_row, "target_stock": 6000}
+    new_row.pop("node_name")
+    new_row.pop("node_geo")
+
+    class _Cur:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def execute(self, sql, params=None):
+            executed.append((sql, params))
+
+        def fetchone(self):
+            # 1st execute = SELECT FOR UPDATE → old; 2nd = UPDATE RETURNING → new.
+            selects = [e for e in executed if "FOR UPDATE" in e[0]]
+            updates = [e for e in executed if e[0].strip().upper().startswith("UPDATE")]
+            if updates:
+                return dict(new_row)
+            if selects:
+                return dict(old_row)
+            return None
+
+    class _Conn:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def cursor(self):
+            return _Cur()
+
+    monkeypatch.setattr(admin_catalog, "connect", lambda: _Conn())
+    monkeypatch.setattr(admin_catalog, "_audit", lambda *a, **k: None)
+
+    result = admin_catalog._update_binding_sync(
+        1, "n1", BindingUpdateRequest(target_stock=6000)
+    )
+    assert isinstance(result, dict)
+    assert result["target_stock"] == 6000
+    update_sql = next(e for e in executed if e[0].strip().upper().startswith("UPDATE"))
+    assert "target_stock = %s" in update_sql[0]
+    assert 6000 in update_sql[1]
 
 
 def test_patch_binding_400_no_fields(monkeypatch: pytest.MonkeyPatch, _no_auth: None) -> None:
