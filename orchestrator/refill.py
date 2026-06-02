@@ -1,4 +1,12 @@
-"""Refill engine: keeps proxy_inventory at target_stock per SKU."""
+"""Refill engine: keeps proxy_inventory at target_stock PER NODE.
+
+Wave POOL-PER-NODE.A — stock is per-node. Each active ``sku_node_bindings``
+row carries its own ``target_stock``; refill tops up every bound node
+independently to its own target. The SKU's pool is the SUM of its active
+bindings' targets. ``skus.target_stock`` is no longer read here (kept for
+back-compat / legacy callers) — the per-SKU deficit + capacity split via
+``equal_share`` is gone.
+"""
 
 from __future__ import annotations
 
@@ -9,7 +17,6 @@ from psycopg.types.json import Jsonb
 
 from orchestrator.config import get_config
 from orchestrator.db import connect
-from orchestrator.distribution import equal_share
 from orchestrator.jobs import allocate_port_range_via_table, log_job_event
 from orchestrator.logging_setup import get_logger
 from shared.contracts import profile_for_sku
@@ -29,10 +36,11 @@ _PRODUCT_BY_KIND: dict[str, str] = {
 class RefillService:
     """One-pass refill engine.
 
-    ``run_once()`` iterates active SKUs, computes deficit, distributes work
-    across active bindings via :func:`equal_share`, and enqueues generation
-    jobs (status='queued', reason='refill') with port ranges reserved through
-    ``node_port_allocations``.
+    ``run_once()`` iterates active SKUs, and for each active binding tops
+    that node up to the binding's own ``target_stock`` — enqueuing
+    generation jobs (status='queued', reason='refill') with port ranges
+    reserved through ``node_port_allocations``. Each node is independent;
+    there is no SKU-level deficit or cross-node split.
     """
 
     def run_once(self) -> dict[str, int]:
@@ -42,14 +50,16 @@ class RefillService:
 
             {
                 "skus_processed": int,
-                "skus_with_deficit": int,
+                "bindings_processed": int,
+                "bindings_with_deficit": int,
                 "jobs_enqueued": int,
                 "nodes_at_capacity": int,
             }
         """
         counters = {
             "skus_processed": 0,
-            "skus_with_deficit": 0,
+            "bindings_processed": 0,
+            "bindings_with_deficit": 0,
             "jobs_enqueued": 0,
             "nodes_at_capacity": 0,
         }
@@ -59,15 +69,6 @@ class RefillService:
             skus = self._list_active_skus(conn, limit=cfg.refill_max_skus_per_cycle)
             for sku in skus:
                 counters["skus_processed"] += 1
-
-                projection = self._get_sku_projection(conn, int(sku["id"]))
-                available = int(projection["available"])
-                deficit = int(sku["target_stock"]) - available
-                if deficit <= 0:
-                    continue
-
-                counters["skus_with_deficit"] += 1
-                to_schedule = min(deficit, int(sku["refill_batch_size"]))
 
                 bindings = self._list_active_bindings_with_capacity(
                     conn,
@@ -82,13 +83,29 @@ class RefillService:
                     )
                     continue
 
-                caps = [int(b["effective_max_batch"]) for b in bindings]
-                distribution = equal_share(to_schedule, caps)
+                for binding in bindings:
+                    counters["bindings_processed"] += 1
 
-                for binding, qty in zip(bindings, distribution, strict=True):
-                    if qty <= 0:
+                    # Per-node target: top this node up to its own target_stock.
+                    target = int(binding["target_stock"])
+                    if target <= 0:
+                        continue
+                    available = self._count_available_on_node(
+                        conn, sku_id=int(sku["id"]), node_id=str(binding["node_id"])
+                    )
+                    deficit = target - available
+                    if deficit <= 0:
                         continue
 
+                    counters["bindings_with_deficit"] += 1
+                    # Per-cycle cap = least(binding.max_batch, node.max_batch).
+                    to_schedule = min(deficit, int(binding["effective_max_batch"]))
+                    if to_schedule <= 0:
+                        continue
+
+                    # Runaway guard (money/stock-critical): a node already at
+                    # its in-flight ceiling is skipped, so a multi-cycle deficit
+                    # is not re-scheduled while a generation job is pending.
                     in_flight = self._count_in_flight_jobs(conn, node_id=binding["node_id"])
                     if in_flight >= int(binding["max_parallel_jobs"]):
                         counters["nodes_at_capacity"] += 1
@@ -102,6 +119,7 @@ class RefillService:
                         )
                         continue
 
+                    qty = to_schedule
                     job_id = str(uuid.uuid4())
                     payload = self._build_refill_payload(sku=sku, count=qty)
                     job_inserted = False
@@ -179,33 +197,21 @@ class RefillService:
             )
             return [dict(r) for r in cur.fetchall()]
 
-    def _get_sku_projection(self, conn, sku_id: int) -> dict[str, int]:
+    def _count_available_on_node(self, conn, *, sku_id: int, node_id: str) -> int:
+        """Wave POOL-PER-NODE.A — count of ``available`` proxies for this
+        (sku, node) pair. This is the per-node stock the binding's
+        ``target_stock`` is measured against."""
         with conn.cursor() as cur:
             cur.execute(
                 """
-                select
-                  count(*) filter (where status = 'available')          as available,
-                  count(*) filter (where status = 'pending_validation') as pending_validation
+                select count(*) as available
                 from proxy_inventory
-                where sku_id = %s
+                where sku_id = %s and node_id = %s and status = 'available'
                 """,
-                (sku_id,),
+                (sku_id, node_id),
             )
-            inv_row = cur.fetchone() or {}
-            cur.execute(
-                """
-                select coalesce(sum(count), 0) as queued_or_running
-                from jobs
-                where sku_id = %s and status in ('queued', 'running')
-                """,
-                (sku_id,),
-            )
-            jobs_row = cur.fetchone() or {}
-        return {
-            "available": int(inv_row.get("available") or 0),
-            "pending_validation": int(inv_row.get("pending_validation") or 0),
-            "queued_or_running": int(jobs_row.get("queued_or_running") or 0),
-        }
+            row = cur.fetchone() or {}
+        return int(row.get("available") or 0)
 
     def _list_active_bindings_with_capacity(
         self, conn, *, sku_id: int, allow_degraded: bool
@@ -217,6 +223,7 @@ class RefillService:
                   b.sku_id,
                   b.node_id,
                   b.weight                                                    as binding_weight,
+                  b.target_stock                                              as target_stock,
                   least(b.max_batch_size, n.max_batch_size)                   as effective_max_batch,
                   n.max_parallel_jobs                                         as max_parallel_jobs,
                   n.runtime_status                                            as runtime_status

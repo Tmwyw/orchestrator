@@ -379,11 +379,24 @@ async def get_sku(sku_id: int) -> JSONResponse:
         "expired_grace": sum(int(r["expired_grace"]) for r in breakdown_rows),
         "pending_validation": sum(int(r["pending_validation"]) for r in breakdown_rows),
     }
+    # Wave POOL-PER-NODE.A — geo pool target = SUM of active bindings'
+    # per-node target_stock (the goal the card compares the fill against).
+    pool_row = await asyncio.to_thread(
+        fetch_one,
+        """
+        SELECT COALESCE(SUM(target_stock), 0)::int AS pool_target
+          FROM sku_node_bindings
+         WHERE sku_id = %s AND is_active = true
+        """,
+        (sku_id,),
+    )
+    pool_target = int((pool_row or {}).get("pool_target") or 0)
     sales_count, sales_revenue = await asyncio.to_thread(_fetch_sales_30d, sku_id)
     detail = SkuAdminDetail(
         **sku_row,
         stock_total=stock_total,
         stock_breakdown=[SkuStockBreakdownItem(**r) for r in breakdown_rows],
+        pool_target=pool_target,
         display_name=_compute_display_name(
             kind=sku_row["product_kind"],
             geo_code=sku_row.get("geo_code"),
@@ -767,7 +780,7 @@ def _list_bindings_sync(sku_id: int) -> list[dict[str, Any]] | str:
     return fetch_all(
         """
         SELECT b.node_id, n.name AS node_name, n.geo AS node_geo,
-               b.weight, b.max_batch_size, b.is_active,
+               b.weight, b.max_batch_size, b.target_stock, b.is_active,
                b.created_at, b.updated_at,
                (SELECT COUNT(*) FROM proxy_inventory pi
                  WHERE pi.sku_id = b.sku_id
@@ -809,12 +822,18 @@ def _add_binding_sync(sku_id: int, payload: BindingCreateRequest) -> dict[str, A
             cur.execute(
                 """
                 INSERT INTO sku_node_bindings
-                    (sku_id, node_id, weight, max_batch_size, is_active)
-                VALUES (%s, %s, %s, %s, true)
-                RETURNING node_id, weight, max_batch_size, is_active,
+                    (sku_id, node_id, weight, max_batch_size, target_stock, is_active)
+                VALUES (%s, %s, %s, %s, %s, true)
+                RETURNING node_id, weight, max_batch_size, target_stock, is_active,
                           created_at, updated_at
                 """,
-                (sku_id, payload.node_id, payload.weight, payload.max_batch_size),
+                (
+                    sku_id,
+                    payload.node_id,
+                    payload.weight,
+                    payload.max_batch_size,
+                    payload.target_stock,
+                ),
             )
         except psycopg.errors.UniqueViolation:
             return "binding_exists"
@@ -835,6 +854,7 @@ def _add_binding_sync(sku_id: int, payload: BindingCreateRequest) -> dict[str, A
                 "node_id": payload.node_id,
                 "weight": payload.weight,
                 "max_batch_size": payload.max_batch_size,
+                "target_stock": payload.target_stock,
             },
         )
         return result
@@ -848,7 +868,7 @@ def _update_binding_sync(sku_id: int, node_id: str, payload: BindingUpdateReques
         cur.execute(
             """
             SELECT b.node_id, n.name AS node_name, n.geo AS node_geo,
-                   b.weight, b.max_batch_size, b.is_active
+                   b.weight, b.max_batch_size, b.target_stock, b.is_active
               FROM sku_node_bindings b
               JOIN nodes n ON n.id = b.node_id
              WHERE b.sku_id = %s AND b.node_id = %s
@@ -868,7 +888,7 @@ def _update_binding_sync(sku_id: int, node_id: str, payload: BindingUpdateReques
             UPDATE sku_node_bindings
                SET {", ".join(set_clauses)}
              WHERE sku_id = %s AND node_id = %s
-            RETURNING node_id, weight, max_batch_size, is_active,
+            RETURNING node_id, weight, max_batch_size, target_stock, is_active,
                       created_at, updated_at
             """,
             tuple(params),

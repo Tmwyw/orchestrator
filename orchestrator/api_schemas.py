@@ -656,6 +656,10 @@ class SkuAdminDetail(BaseModel):
     updated_at: datetime
     stock_total: dict[str, int]
     stock_breakdown: list[SkuStockBreakdownItem]
+    # Wave POOL-PER-NODE.A — the geo pool target = SUM of active bindings'
+    # per-node target_stock. ``stock_total['available']`` is the actual fill;
+    # ``pool_target`` is the goal the card compares against.
+    pool_target: int = 0
     display_name: str
     sales_30d_count: int = 0
     sales_30d_revenue: Decimal = Field(default_factory=lambda: Decimal("0"))
@@ -753,6 +757,9 @@ class BindingItem(BaseModel):
     node_geo: str
     weight: int
     max_batch_size: int
+    # Wave POOL-PER-NODE.A — per-node refill target. The bot card (wave B)
+    # shows/edits this; refill tops the node up to it.
+    target_stock: int = 0
     is_active: bool
     available_count: int = 0
     created_at: datetime
@@ -773,6 +780,9 @@ class BindingCreateRequest(BaseModel):
     node_id: str = Field(min_length=1, max_length=64)
     weight: int = Field(default=100, ge=0, le=10_000)
     max_batch_size: int = Field(default=1500, ge=1, le=1_000_000)
+    # Wave POOL-PER-NODE.A — optional per-node target at bind time (0 = no
+    # refill until set). Existing callers that omit it keep the column default.
+    target_stock: int = Field(default=0, ge=0, le=1_000_000)
 
 
 class BindingUpdateRequest(BaseModel):
@@ -782,6 +792,8 @@ class BindingUpdateRequest(BaseModel):
 
     weight: int | None = Field(default=None, ge=0, le=10_000)
     max_batch_size: int | None = Field(default=None, ge=1, le=1_000_000)
+    # Wave POOL-PER-NODE.A — per-node refill target (the bot edits this).
+    target_stock: int | None = Field(default=None, ge=0, le=1_000_000)
     is_active: bool | None = None
 
 

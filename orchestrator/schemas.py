@@ -169,6 +169,10 @@ class SkuNodeBinding(BaseModel):
     node_id: str
     weight: int = 100
     max_batch_size: int = 1500
+    # Wave POOL-PER-NODE.A — per-node refill target. The SKU's pool is the
+    # SUM of its active bindings' target_stock (was: per-SKU skus.target_stock
+    # split across nodes by capacity).
+    target_stock: int = 0
     is_active: bool = True
     created_at: datetime
     updated_at: datetime
