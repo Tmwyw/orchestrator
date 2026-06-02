@@ -60,6 +60,11 @@ class Config:
     watchdog_interval_sec: int
     watchdog_running_timeout_sec: int
     watchdog_pending_validation_timeout_sec: int
+    egress_watchdog_interval_sec: int
+    egress_fail_threshold: int
+    egress_reboot_cooldown_sec: int
+    egress_probe_url: str
+    egress_probe_timeout_sec: int
     validation_strict_ssl: bool
     geolite2_db_path: str
     traffic_poll_interval_sec: int
@@ -97,6 +102,11 @@ def get_config() -> Config:
         watchdog_interval_sec=_int_env("WATCHDOG_INTERVAL_SEC", 60),
         watchdog_running_timeout_sec=_int_env("WATCHDOG_RUNNING_TIMEOUT_SEC", 1800),
         watchdog_pending_validation_timeout_sec=_int_env("WATCHDOG_PENDING_VALIDATION_TIMEOUT_SEC", 600),
+        egress_watchdog_interval_sec=_int_env("EGRESS_WATCHDOG_INTERVAL_SEC", 120),
+        egress_fail_threshold=_int_env("EGRESS_FAIL_THRESHOLD", 3),
+        egress_reboot_cooldown_sec=_int_env("EGRESS_REBOOT_COOLDOWN_SEC", 1800),
+        egress_probe_url=os.getenv("EGRESS_PROBE_URL", "https://api64.ipify.org").strip(),
+        egress_probe_timeout_sec=_int_env("EGRESS_PROBE_TIMEOUT_SEC", 10),
         validation_strict_ssl=_bool_env("VALIDATION_STRICT_SSL", True),
         geolite2_db_path=os.getenv(
             "GEOLITE2_DB_PATH",
