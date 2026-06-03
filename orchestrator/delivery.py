@@ -13,6 +13,21 @@ def format_socks5_uri(rows: list[dict[str, Any]]) -> str:
     return "\n".join(f"socks5://{r['login']}:{r['password']}@{r['host']}:{r['port']}" for r in rows)
 
 
+def format_http_uri(rows: list[dict[str, Any]]) -> str:
+    """``http://login:password@host:http_port`` (one per line).
+
+    Wave HTTP.B — only rows carrying a non-NULL ``http_port`` (dual
+    proxies) are emitted; legacy socks5-only rows (http_port IS NULL) are
+    skipped, so an order with no dual proxies yields an empty string. The
+    caller (allocator.get_proxies) guards against that case explicitly.
+    """
+    return "\n".join(
+        f"http://{r['login']}:{r['password']}@{r['host']}:{r['http_port']}"
+        for r in rows
+        if r.get("http_port") is not None
+    )
+
+
 def format_host_port_user_pass(rows: list[dict[str, Any]]) -> str:
     """``host:port:login:password`` (one per line)."""
     return "\n".join(f"{r['host']}:{r['port']}:{r['login']}:{r['password']}" for r in rows)
@@ -41,6 +56,7 @@ def format_json(rows: list[dict[str, Any]]) -> str:
 
 _DISPATCH: dict[DeliveryFormat, tuple[Any, str]] = {
     DeliveryFormat.SOCKS5_URI: (format_socks5_uri, "text/plain"),
+    DeliveryFormat.HTTP_URI: (format_http_uri, "text/plain"),
     DeliveryFormat.HOST_PORT_USER_PASS: (format_host_port_user_pass, "text/plain"),
     DeliveryFormat.USER_PASS_AT_HOST_PORT: (format_user_pass_at_host_port, "text/plain"),
     DeliveryFormat.JSON: (format_json, "application/json"),

@@ -8,6 +8,7 @@ from orchestrator.db import connect
 from orchestrator.jobs import (
     allocate_start_port,
     bulk_insert_inventory_pending,
+    collapse_dual_items,
     log_job_event,
     normalize_proxy_items,
     response_diagnostics,
@@ -251,6 +252,10 @@ def process_refill_job(job: dict[str, Any]) -> None:
             start_port=int(start_port),
             timeout_sec=get_config().node_request_timeout_sec,
             profile=job_profile,
+            # Wave HTTP.B — the per-piece pool is dual: every IP gets a
+            # socks5 + paired http listener. A pre-HTTP.A node ignores this
+            # and returns socks5-only (http_port stays NULL on ingest).
+            proxy_type="dual",
         )
 
         event_base = {
@@ -270,7 +275,13 @@ def process_refill_job(job: dict[str, Any]) -> None:
             return
 
         items = result.get("items")
-        if not isinstance(items, list) or len(items) < count:
+        # Wave HTTP.B — a dual report carries TWO items per IP (socks5 +
+        # paired http). Collapse to ONE logical proxy per IP FIRST (the
+        # http line rides on http_port, not a second row → pool not ×2),
+        # THEN validate the count against the logical proxies. A
+        # socks5-only report collapses to itself (http_port=None).
+        logical = collapse_dual_items(items) if isinstance(items, list) else []
+        if not logical or len(logical) < count:
             logger.warning(
                 "worker_refill_node_response_missing_items",
                 job_id=job_id,
@@ -283,7 +294,7 @@ def process_refill_job(job: dict[str, Any]) -> None:
             sku_id=sku_id,
             node_id=node_id,
             generation_job_id=job_id,
-            items=items[:count],
+            items=logical[:count],
         )
         if inserted == 0:
             mark_failed(job_id, "inventory_insert_zero", event_base)

@@ -106,3 +106,45 @@ def test_generate_delivery_content_dispatch() -> None:
         {"host": "h", "port": 1, "login": "u", "password": "p", "expires_at": None, "geo_country": None}
     ]
     assert ctype_json == "application/json"
+
+
+# === Wave HTTP.B — http_uri delivery ===
+
+
+def test_format_http_uri_emits_only_dual_rows() -> None:
+    from orchestrator.delivery import format_http_uri
+
+    rows = [
+        {"host": "h1", "port": 32000, "http_port": 22000, "login": "u1", "password": "p1"},
+        {"host": "h2", "port": 32001, "http_port": None, "login": "u2", "password": "p2"},
+        {"host": "h3", "port": 32002, "http_port": 22002, "login": "u3", "password": "p3"},
+    ]
+    out = format_http_uri(rows)
+    lines = out.split("\n")
+    # Only the two rows carrying http_port are emitted, on their http port.
+    assert lines == ["http://u1:p1@h1:22000", "http://u3:p3@h3:22002"]
+
+
+def test_format_http_uri_empty_when_no_dual_rows() -> None:
+    from orchestrator.delivery import format_http_uri
+
+    rows = [{"host": "h", "port": 1, "http_port": None, "login": "u", "password": "p"}]
+    assert format_http_uri(rows) == ""
+
+
+def test_socks5_uri_unaffected_by_http_port() -> None:
+    """SOCKS5_URI still uses the socks port and ignores http_port."""
+    from orchestrator.delivery import format_socks5_uri
+
+    rows = [{"host": "h", "port": 32000, "http_port": 22000, "login": "u", "password": "p"}]
+    assert format_socks5_uri(rows) == "socks5://u:p@h:32000"
+
+
+def test_http_uri_dispatch() -> None:
+    from orchestrator.delivery import generate_delivery_content
+    from orchestrator.schemas import DeliveryFormat
+
+    rows = [{"host": "h", "port": 32000, "http_port": 22000, "login": "u", "password": "p"}]
+    content, ctype = generate_delivery_content(rows, DeliveryFormat.HTTP_URI)
+    assert content == "http://u:p@h:22000"
+    assert ctype == "text/plain"
