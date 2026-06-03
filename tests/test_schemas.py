@@ -92,7 +92,8 @@ def test_order_status_values() -> None:
 
 
 def test_delivery_format_values() -> None:
-    """DeliveryFormat matches migration 010 CHECK constraint."""
+    """DeliveryFormat matches the delivery_files CHECK constraint
+    (migration 010, widened by 050 to add 'http_uri' for dual proxies)."""
     from orchestrator.schemas import DeliveryFormat
 
     assert {s.value for s in DeliveryFormat} == {
@@ -100,6 +101,7 @@ def test_delivery_format_values() -> None:
         "host_port_user_pass",
         "user_pass_at_host_port",
         "json",
+        "http_uri",
     }
 
 

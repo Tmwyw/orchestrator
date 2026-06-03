@@ -217,6 +217,59 @@ def write_proxies_file(job_id: str, lines: list[str]) -> Path:
     return result_path
 
 
+def collapse_dual_items(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Wave HTTP.B — fold a dual node-agent report (TWO URIs per IP — a
+    socks5 line + a paired http line at ``socks_port - 10000``) into ONE
+    logical proxy per IP, so the pool does NOT double.
+
+    The node-agent (HTTP.A) tags each reported item with ``protocol``
+    ('socks5' | 'http'). We keep the socks5 (or legacy / untagged) items
+    as the canonical inventory rows and attach the paired http port to
+    each as ``http_port`` (matched on same ``host`` + ``port - 10000``).
+    The http items are consumed, never emitted as their own rows.
+
+    Backward-compat: a socks5-only report (old node-agent / single mode)
+    has no http items → every logical row gets ``http_port = None`` and
+    the result is identical to the raw item list.
+    """
+    http_ports: set[tuple[str, int]] = set()
+    socks_items: list[dict[str, Any]] = []
+    for item in items:
+        protocol = str(item.get("protocol") or "socks5").strip().lower()
+        host = str(item.get("host") or "").strip()
+        port_raw = item.get("port")
+        try:
+            port = int(port_raw) if port_raw is not None else 0
+        except (TypeError, ValueError):
+            port = 0
+        if port <= 0:
+            # Keep malformed socks items so the downstream validator skips
+            # them consistently; http items with bad ports are just dropped.
+            if protocol != "http":
+                socks_items.append(item)
+            continue
+        if protocol == "http":
+            http_ports.add((host, port))
+        else:
+            socks_items.append(item)
+
+    logical: list[dict[str, Any]] = []
+    for item in socks_items:
+        host = str(item.get("host") or "").strip()
+        port_raw = item.get("port")
+        try:
+            port = int(port_raw) if port_raw is not None else 0
+        except (TypeError, ValueError):
+            port = 0
+        if port <= 0:
+            logical.append({**item, "http_port": None})
+            continue
+        paired = (host, port - 10000)
+        http_port = port - 10000 if paired in http_ports else None
+        logical.append({**item, "http_port": http_port})
+    return logical
+
+
 def bulk_insert_inventory_pending(
     *,
     sku_id: int,
@@ -226,13 +279,19 @@ def bulk_insert_inventory_pending(
 ) -> int:
     """Insert generated proxies into ``proxy_inventory`` with status='pending_validation'.
 
-    Each item must have: ``host``, ``port``, ``login``, ``password``. Items
-    missing any field are skipped. Duplicate ``(login, password, host, port)``
-    tuples within the same batch are also skipped. Returns the number of rows
-    actually inserted.
+    Each item must have: ``host``, ``port``, ``login``, ``password``, and
+    optionally ``http_port`` (Wave HTTP.B — the paired http listener port
+    for dual proxies; ``None``/absent = socks5-only). Items missing any
+    required field are skipped. Duplicate ``(login, password, host, port)``
+    tuples within the same batch are also skipped. Returns the number of
+    rows actually inserted.
+
+    The caller is expected to pass dual reports through
+    :func:`collapse_dual_items` first so one IP is one row (the http line
+    rides on ``http_port``, not a second row → the pool never doubles).
     """
     seen: set[tuple[str, str, str, int]] = set()
-    rows: list[tuple[int, str, str, str, str, str, int]] = []
+    rows: list[tuple[int, str, str, str, str, str, int, int | None]] = []
     for item in items:
         host = str(item.get("host") or "").strip()
         port_raw = item.get("port")
@@ -246,11 +305,20 @@ def bulk_insert_inventory_pending(
             continue
         if port <= 0 or port > 65535:
             continue
+        http_port_raw = item.get("http_port")
+        http_port: int | None = None
+        if http_port_raw is not None:
+            try:
+                hp = int(http_port_raw)
+            except (TypeError, ValueError):
+                hp = 0
+            if 0 < hp <= 65535:
+                http_port = hp
         key = (login, password, host, port)
         if key in seen:
             continue
         seen.add(key)
-        rows.append((sku_id, node_id, generation_job_id, login, password, host, port))
+        rows.append((sku_id, node_id, generation_job_id, login, password, host, port, http_port))
 
     if not rows:
         return 0
@@ -259,8 +327,8 @@ def bulk_insert_inventory_pending(
         cur.executemany(
             """
             insert into proxy_inventory
-              (sku_id, node_id, generation_job_id, login, password, host, port, status)
-            values (%s, %s, %s, %s, %s, %s, %s, 'pending_validation')
+              (sku_id, node_id, generation_job_id, login, password, host, port, http_port, status)
+            values (%s, %s, %s, %s, %s, %s, %s, %s, 'pending_validation')
             """,
             rows,
         )

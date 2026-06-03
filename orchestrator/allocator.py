@@ -384,6 +384,15 @@ class AllocatorService:
         if not rows:
             return ProxiesResult(success=False, error="inventory_empty")
 
+        # Wave HTTP.B — http delivery only covers dual rows (those with a
+        # paired http_port). Narrow to them up-front so line_count matches
+        # the emitted content; a legacy socks5-only order has none → a
+        # clear error the bot can surface ("http недоступен для заказа").
+        if format == DeliveryFormat.HTTP_URI:
+            rows = [r for r in rows if r.get("http_port") is not None]
+            if not rows:
+                return ProxiesResult(success=False, error="http_not_available_for_order")
+
         content, content_type = generate_delivery_content(rows, format)
         line_count = len(rows)
         checksum = hashlib.sha256(content.encode("utf-8")).hexdigest()
@@ -713,7 +722,7 @@ class AllocatorService:
         with connect() as conn, conn.cursor() as cur:
             cur.execute(
                 """
-                select id, host, port, login, password, expires_at, geo_country
+                select id, host, port, http_port, login, password, expires_at, geo_country
                 from proxy_inventory
                 where order_id = %s and status in ('sold', 'expired_grace')
                 order by id

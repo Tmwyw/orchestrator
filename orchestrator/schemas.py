@@ -84,6 +84,9 @@ class DeliveryFormat(str, Enum):
     HOST_PORT_USER_PASS = "host_port_user_pass"
     USER_PASS_AT_HOST_PORT = "user_pass_at_host_port"
     JSON = "json"
+    # Wave HTTP.B — http://login:pass@host:http_port (dual proxies). Only
+    # rows with a paired http_port are emitted; socks5-only rows skipped.
+    HTTP_URI = "http_uri"
 
 
 # === Models ===

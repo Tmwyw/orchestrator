@@ -49,14 +49,25 @@ def generate(
     start_port: int,
     timeout_sec: int,
     profile: dict[str, Any] | None = None,
+    proxy_type: str = "socks5",
 ) -> dict[str, Any]:
+    """Wave HTTP.B — ``proxy_type`` defaults to socks5 (backward-compat:
+    the simple/pergb generate path is unchanged). The per-piece refill
+    path passes ``"dual"`` so each IP gets a socks5 + paired http listener
+    (http = socks - 10000); a pre-HTTP.A node-agent ignores the field and
+    still returns socks5-only.
+
+    NOTE: ``start_port`` comes from the per-node sequential allocator
+    (ORCHESTRATOR_START_PORT_MIN=32000), which already clears the node's
+    dual guard (>= 15000) and yields http = socks - 10000 in [22000+).
+    """
     endpoint = f"{url.rstrip('/')}/generate"
     profile = profile or PRODUCTION_PROFILE
     payload = {
         "jobId": job_id,
         "proxyCount": count,
         "startPort": start_port,
-        "proxyType": "socks5",
+        "proxyType": proxy_type,
         "random": True,
         "ipv6Policy": profile["ipv6_policy"],
         "networkProfile": profile["network_profile"],
