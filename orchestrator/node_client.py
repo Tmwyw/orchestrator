@@ -88,41 +88,59 @@ def generate(
 # === Pay-per-GB endpoints (Wave B-8.2) ===
 
 
+# Node-agent encodes requested ports in the GET query string
+# (?ports=p1,p2,...). A node with a large pool (1000+ ports) overflows the
+# node-agent's request-line/header limit → HTTP 431 Request Header Fields Too
+# Large → the WHOLE node's accounting fails and pay-per-GB usage never advances
+# (observed in prod 2026-06: a ~1500-port node returned 431 every cycle,
+# bytes_observed_total=0). Chunk the ports so each request URL stays small.
+_ACCOUNTING_PORT_CHUNK = 100
+
+
 def get_accounting(
     url: str,
     api_key: str | None,
     ports: list[int],
     timeout_sec: int = 10,
 ) -> dict[str, dict[str, int]]:
-    """GET /accounting?ports=PORT[,PORT...] per design § 3.1.
+    """GET /accounting?ports=PORT[,PORT...] per design § 3.1, chunked.
 
     Returns ``{port_str: {bytes_in, bytes_out, bytes_in6, bytes_out6}}``.
-    The node-agent's defensive contract may return a 200 with a partial map
-    (only some of the requested ports) — caller is expected to handle that.
-    Raises ``NodeAgentError`` on transport failure, 5xx, or 4xx.
+    Requested ports are split into ``_ACCOUNTING_PORT_CHUNK``-sized batches
+    (one GET each, results merged) so a large pool can't overflow the
+    node-agent's URL/header limit (HTTP 431). The node-agent's defensive
+    contract may return a 200 with a partial map (only some of the requested
+    ports) — caller is expected to handle that. Raises ``NodeAgentError`` on
+    transport failure, 5xx, or 4xx of ANY chunk.
     """
     if not ports:
         return {}
     endpoint = f"{url.rstrip('/')}/accounting"
-    params = {"ports": ",".join(str(p) for p in ports)}
+    merged: dict[str, dict[str, int]] = {}
     try:
         with httpx.Client(timeout=timeout_sec) as client:
-            response = client.get(endpoint, params=params, headers=_node_headers(api_key))
+            for start in range(0, len(ports), _ACCOUNTING_PORT_CHUNK):
+                chunk = ports[start : start + _ACCOUNTING_PORT_CHUNK]
+                params = {"ports": ",".join(str(p) for p in chunk)}
+                response = client.get(endpoint, params=params, headers=_node_headers(api_key))
+                if response.status_code != 200:
+                    raise NodeAgentError(
+                        f"accounting_status_{response.status_code}",
+                        status_code=response.status_code,
+                    )
+                try:
+                    body = response.json()
+                except ValueError as exc:
+                    raise NodeAgentError(f"accounting_invalid_json: {exc}") from exc
+                counters = body.get("counters") if isinstance(body, dict) else None
+                # Newer node-agent wraps as {"success": true, "counters": {...}};
+                # older variants returned the bare map. Accept both shapes.
+                chunk_map = counters if counters is not None else body
+                if isinstance(chunk_map, dict):
+                    merged.update(cast(dict[str, dict[str, int]], chunk_map))
     except httpx.HTTPError as exc:
         raise NodeAgentError(f"accounting_request_failed: {exc}") from exc
-    if response.status_code != 200:
-        raise NodeAgentError(
-            f"accounting_status_{response.status_code}",
-            status_code=response.status_code,
-        )
-    try:
-        body = response.json()
-    except ValueError as exc:
-        raise NodeAgentError(f"accounting_invalid_json: {exc}") from exc
-    counters = body.get("counters") if isinstance(body, dict) else None
-    # Newer node-agent wraps as {"success": true, "counters": {...}}; older
-    # variants returned the bare map. Accept both shapes.
-    return cast(dict[str, dict[str, int]], counters if counters is not None else body)
+    return merged
 
 
 def post_disable(

@@ -75,6 +75,49 @@ def test_get_accounting_happy_bare_map(monkeypatch: pytest.MonkeyPatch) -> None:
     assert result["32001"]["bytes_out6"] == 4
 
 
+def test_get_accounting_chunks_large_port_lists(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Wave ACCOUNTING-CHUNK — a large pool is split into ≤100-port batches so
+    the GET URL never overflows the node-agent limit (prod HTTP 431 on a
+    ~1500-port node). Every chunk's counters are merged into one map."""
+    seen: list[list[str]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        ports = request.url.params["ports"].split(",")
+        seen.append(ports)
+        return httpx.Response(
+            200,
+            json={
+                "counters": {
+                    p: {"bytes_in": 1, "bytes_out": 0, "bytes_in6": 0, "bytes_out6": 0} for p in ports
+                }
+            },
+        )
+
+    _install_transport(monkeypatch, httpx.MockTransport(handler))
+
+    requested = list(range(50000, 50250))  # 250 ports → 3 chunks (100 + 100 + 50)
+    result = node_client.get_accounting("http://node-x:8085", "k1", requested)
+
+    assert len(seen) == 3
+    assert all(len(chunk) <= 100 for chunk in seen)  # no chunk overflows the limit
+    assert len(result) == 250  # all ports merged across chunks
+    assert result["50000"]["bytes_in"] == 1
+    assert result["50249"]["bytes_in"] == 1
+
+
+def test_get_accounting_raises_on_chunk_431(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A 431 (or any non-200) on a chunk still raises NodeAgentError — the
+    per-node failure path in the poller stays intact."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(431)
+
+    _install_transport(monkeypatch, httpx.MockTransport(handler))
+
+    with pytest.raises(NodeAgentError):
+        node_client.get_accounting("http://node-x:8085", "k1", [32001])
+
+
 def test_get_accounting_no_api_key_omits_header(monkeypatch: pytest.MonkeyPatch) -> None:
     seen: list[httpx.Request] = []
 
