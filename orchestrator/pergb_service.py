@@ -901,7 +901,10 @@ class PergbService:
                   t.bytes_used    as bytes_used,
                   t.expires_at    as expires_at
                 from orders o
-                join traffic_accounts t on t.order_id = o.id
+                -- Wave PERGB-POOL-1: traffic_accounts is now per-USER (one pool).
+                -- Resolve via the order's owner, NOT order_id, so ANY of the
+                -- user's order_refs maps to their single pool.
+                join traffic_accounts t on t.user_id = o.user_id
                 where o.order_ref = %s
                 """,
                 (parent_order_ref,),
@@ -1135,7 +1138,10 @@ class PergbService:
                        (select count(*) from proxy_inventory i
                           where i.traffic_account_id = t.id) as port_count
                 from orders o
-                left join traffic_accounts t on t.order_id = o.id
+                -- Wave PERGB-POOL-1: per-USER pool — resolve via owner so any
+                -- of the user's order_refs returns their single pool (+ all
+                -- linked ports across batches).
+                left join traffic_accounts t on t.user_id = o.user_id
                 where o.order_ref = %s
                 """,
                 (parent_order_ref,),

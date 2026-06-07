@@ -115,7 +115,9 @@ def _fetch_pergb_stats() -> PergbStatsSubsection:
                count(distinct t.id)::int as accounts
         from orders o
         join skus s on s.id = o.sku_id
-        left join traffic_accounts t on t.order_id = o.id
+        -- Wave PERGB-POOL-1: per-USER pool — distinct accounts ≈ distinct
+        -- paying users per SKU (join via owner, order_id is canonical-only now).
+        left join traffic_accounts t on t.user_id = o.user_id
         where s.product_kind = 'datacenter_pergb'
           and o.created_at > now() - interval '7 days'
         group by s.code
@@ -289,7 +291,9 @@ def _sync_set_quota(order_ref: str, bytes_quota: int) -> dict[str, Any]:
             """
             select ta.id, ta.bytes_used, ta.status, ta.expires_at
               from traffic_accounts ta
-              join orders o on o.id = ta.order_id
+              -- Wave PERGB-POOL-1: per-USER pool — resolve via order owner,
+              -- not order_id, so any of the user's order_refs hits the pool.
+              join orders o on o.user_id = ta.user_id
              where o.order_ref = %s
              for update of ta
             """,
