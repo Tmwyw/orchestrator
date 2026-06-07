@@ -252,7 +252,11 @@ def test_watchdog_retries_pending_blocks_success(_cfg: None) -> None:
     # Phase 5.4 cursor saw: account-ids SELECT + linked-ports SELECT + UPDATE
     # (success branch with node_blocked=true).
     sql_calls = [c.args[0] for c in cursors[7].execute.call_args_list]
-    assert any("status = 'depleted'" in s and "node_blocked = false" in s for s in sql_calls)
+    # Wave PERGB-POOL-1 D.2: block-retry now covers depleted (GB) AND expired (time).
+    assert any(
+        "status in ('depleted', 'expired')" in s and "node_blocked = false" in s
+        for s in sql_calls
+    )
     assert any("from proxy_inventory" in s and "traffic_account_id = %s" in s for s in sql_calls)
     assert any("node_blocked = true" in s and "where id = %s" in s for s in sql_calls)
 
@@ -342,7 +346,7 @@ def test_watchdog_retry_select_uses_throttle_and_limit(_cfg: None) -> None:
         WatchdogService().run_once()
 
     block_select_sql = cursors[7].execute.call_args_list[0].args[0]
-    assert "status = 'depleted'" in block_select_sql
+    assert "status in ('depleted', 'expired')" in block_select_sql  # D.2: GB + time
     assert "node_blocked = false" in block_select_sql
     assert "last_block_attempt_at < now() - (%s || ' minutes')::interval" in block_select_sql
     assert "limit %s" in block_select_sql

@@ -270,11 +270,19 @@ class WatchdogService:
     # === safety-net retries (Wave D) ===
 
     def _retry_pending_blocks(self, counters: dict[str, int]) -> None:
-        """Find depleted accounts whose post_disable hasn't been acked and retry.
+        """Find dead accounts whose post_disable hasn't been acked and retry.
 
         Wave PERGB-RFCT-A: one account → N ports. We fetch the account list
         first, then per account fan out post_disable across every linked port.
         Account is considered "blocked" only when *every* linked port acks.
+
+        Wave PERGB-POOL-1 (D.2): includes ``expired`` (time-lease elapsed), not
+        just ``depleted`` (GB=0). GB-depletion already disables ports inline in
+        traffic_poll, but time-expiry (watchdog 5.1) only flipped the DB status
+        and never called post_disable → expired pergb ports physically kept
+        serving (revenue leak). Picking them up here disables them on the node
+        during the grace window (unblock-retry only re-enables ``active`` pools,
+        so they stay off until archived).
         """
         with connect() as conn:
             with conn.cursor() as cur:
@@ -282,7 +290,7 @@ class WatchdogService:
                     """
                     select t.id as account_id
                     from traffic_accounts t
-                    where t.status = 'depleted'
+                    where t.status in ('depleted', 'expired')
                       and t.node_blocked = false
                       and (t.last_block_attempt_at is null
                            or t.last_block_attempt_at < now() - (%s || ' minutes')::interval)
