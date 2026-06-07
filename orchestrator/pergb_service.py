@@ -71,6 +71,10 @@ class GeneratedPortRow:
     login: str
     password: str
     geo_code: str
+    # Wave PROXY-FORMAT.A — paired HTTP port for dual proxies (NULL on
+    # socks5-only ports). Carried so the formatted-batch endpoint can emit
+    # https:// lines; the legacy raw /ports responses do not expose it.
+    http_port: int | None = None
 
 
 @dataclass(slots=True)
@@ -733,6 +737,7 @@ class PergbService:
                 login=str(r["login"]),
                 password=str(r["password"]),
                 geo_code=str(r["geo_code"] or ""),
+                http_port=(int(r["http_port"]) if r.get("http_port") is not None else None),
             )
             for r in rows
         ]
@@ -746,7 +751,7 @@ class PergbService:
         with connect() as conn, conn.cursor() as cur:
             cur.execute(
                 """
-                select pi.port, pi.host, pi.login, pi.password,
+                select pi.port, pi.http_port, pi.host, pi.login, pi.password,
                        s.geo_code
                 from proxy_inventory pi
                 join skus s on s.id = pi.sku_id
@@ -815,6 +820,7 @@ class PergbService:
                 login=str(r["login"]),
                 password=str(r["password"]),
                 geo_code=str(r["geo_code"] or ""),
+                http_port=(int(r["http_port"]) if r.get("http_port") is not None else None),
             )
             for r in rows
         ]
@@ -856,7 +862,7 @@ class PergbService:
         with connect() as conn, conn.cursor() as cur:
             cur.execute(
                 """
-                select pi.port, pi.host, pi.login, pi.password,
+                select pi.port, pi.http_port, pi.host, pi.login, pi.password,
                        s.geo_code
                 from proxy_inventory pi
                 join skus s on s.id = pi.sku_id

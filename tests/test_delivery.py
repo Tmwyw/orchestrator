@@ -148,3 +148,129 @@ def test_http_uri_dispatch() -> None:
     content, ctype = generate_delivery_content(rows, DeliveryFormat.HTTP_URI)
     assert content == "http://u:p@h:22000"
     assert ctype == "text/plain"
+
+
+# === Wave PROXY-FORMAT.A — parametrized template × protocol delivery ===
+
+
+def _dual_row(
+    *, host: str, port: int, http_port: int | None, login: str, password: str
+) -> dict:
+    return {
+        "host": host,
+        "port": port,
+        "http_port": http_port,
+        "login": login,
+        "password": password,
+    }
+
+
+def test_format_template_socks5_all_layouts() -> None:
+    from orchestrator.delivery import format_template
+
+    rows = [_dual_row(host="h", port=1080, http_port=8080, login="u", password="p")]
+    expect = {
+        1: "socks5://u:p:h:1080",
+        2: "socks5://u:p@h:1080",
+        3: "socks5://h:1080@u:p",
+        4: "socks5://h:1080:u:p",
+    }
+    for tmpl, line in expect.items():
+        assert format_template(rows, template=tmpl, scheme="socks5", port_field="port") == line
+
+
+def test_format_template_https_uses_http_port() -> None:
+    from orchestrator.delivery import format_template
+
+    rows = [_dual_row(host="h", port=1080, http_port=8080, login="u", password="p")]
+    expect = {
+        1: "https://u:p:h:8080",
+        2: "https://u:p@h:8080",
+        3: "https://h:8080@u:p",
+        4: "https://h:8080:u:p",
+    }
+    for tmpl, line in expect.items():
+        assert format_template(rows, template=tmpl, scheme="https", port_field="http_port") == line
+
+
+def test_format_template_https_skips_null_http_port() -> None:
+    from orchestrator.delivery import format_template
+
+    rows = [
+        _dual_row(host="h1", port=1080, http_port=8080, login="u1", password="p1"),
+        _dual_row(host="h2", port=1081, http_port=None, login="u2", password="p2"),
+        _dual_row(host="h3", port=1082, http_port=8082, login="u3", password="p3"),
+    ]
+    out = format_template(rows, template=2, scheme="https", port_field="http_port")
+    assert out.split("\n") == ["https://u1:p1@h1:8080", "https://u3:p3@h3:8082"]
+
+
+def test_format_template_https_empty_when_all_null() -> None:
+    from orchestrator.delivery import format_template
+
+    rows = [_dual_row(host="h", port=1080, http_port=None, login="u", password="p")]
+    assert format_template(rows, template=1, scheme="https", port_field="http_port") == ""
+
+
+def test_format_template_socks5_ignores_null_http_port() -> None:
+    """socks5 uses the always-present socks port — http_port=None is fine."""
+    from orchestrator.delivery import format_template
+
+    rows = [_dual_row(host="h", port=1080, http_port=None, login="u", password="p")]
+    assert format_template(rows, template=2, scheme="socks5", port_field="port") == "socks5://u:p@h:1080"
+
+
+def test_format_template_rejects_invalid_template() -> None:
+    import pytest
+
+    from orchestrator.delivery import format_template
+
+    rows = [_dual_row(host="h", port=1, http_port=2, login="u", password="p")]
+    with pytest.raises(ValueError):
+        format_template(rows, template=5, scheme="socks5", port_field="port")
+
+
+def test_resolve_protocol() -> None:
+    import pytest
+
+    from orchestrator.delivery import resolve_protocol
+
+    assert resolve_protocol("socks5") == ("socks5", "port")
+    assert resolve_protocol("https") == ("https", "http_port")
+    with pytest.raises(ValueError):
+        resolve_protocol("ftp")
+
+
+def test_generate_template_content() -> None:
+    from orchestrator.delivery import generate_template_content
+
+    rows = [_dual_row(host="h", port=1080, http_port=8080, login="u", password="p")]
+    content, ctype = generate_template_content(rows, template=3, protocol="https")
+    assert content == "https://h:8080@u:p"
+    assert ctype == "text/plain"
+
+
+def test_parse_template_protocol_ok() -> None:
+    from orchestrator.delivery import parse_template_protocol
+
+    assert parse_template_protocol("2", "socks5") == (2, "socks5")
+    assert parse_template_protocol(4, "https") == (4, "https")
+
+
+def test_parse_template_protocol_errors() -> None:
+    import pytest
+
+    from orchestrator.delivery import parse_template_protocol
+
+    with pytest.raises(ValueError, match="template_and_protocol_required"):
+        parse_template_protocol(None, "socks5")
+    with pytest.raises(ValueError, match="template_and_protocol_required"):
+        parse_template_protocol("1", None)
+    with pytest.raises(ValueError, match="invalid_template"):
+        parse_template_protocol("0", "socks5")
+    with pytest.raises(ValueError, match="invalid_template"):
+        parse_template_protocol("9", "socks5")
+    with pytest.raises(ValueError, match="invalid_template"):
+        parse_template_protocol("abc", "socks5")
+    with pytest.raises(ValueError, match="invalid_protocol"):
+        parse_template_protocol("1", "ftp")

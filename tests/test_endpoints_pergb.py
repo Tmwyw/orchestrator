@@ -541,3 +541,90 @@ def test_list_batch_ports_not_found(_no_auth: None, _mock_service) -> None:
 
     assert r.status_code == 404
     assert r.json()["error"] == "batch_not_found"
+
+
+# === Wave PROXY-FORMAT.A — formatted batch proxies endpoint ===
+
+
+def test_list_batch_proxies_socks5(_no_auth: None, _mock_service) -> None:
+    from orchestrator.main import app
+
+    _mock_service.list_batch_ports.return_value = [
+        GeneratedPortRow(port=32001, host="2001:db8::1", login="u1", password="p1", geo_code="us"),
+        GeneratedPortRow(port=32002, host="2001:db8::1", login="u2", password="p2", geo_code="us"),
+    ]
+    client = TestClient(app)
+    r = client.get("/v1/pergb/ord_abc/batches/abc123/proxies?template=1&protocol=socks5")
+
+    assert r.status_code == 200
+    assert r.headers["content-type"].startswith("text/plain")
+    assert r.headers["x-line-count"] == "2"
+    assert r.text == "socks5://u1:p1:2001:db8::1:32001\nsocks5://u2:p2:2001:db8::1:32002"
+    _mock_service.list_batch_ports.assert_awaited_once_with(order_ref="ord_abc", batch_id="abc123")
+
+
+def test_list_batch_proxies_https_uses_http_port(_no_auth: None, _mock_service) -> None:
+    from orchestrator.main import app
+
+    _mock_service.list_batch_ports.return_value = [
+        GeneratedPortRow(
+            port=32001, host="h", login="u1", password="p1", geo_code="us", http_port=8001
+        ),
+        GeneratedPortRow(
+            port=32002, host="h", login="u2", password="p2", geo_code="us", http_port=None
+        ),
+    ]
+    client = TestClient(app)
+    r = client.get("/v1/pergb/ord_abc/batches/abc123/proxies?template=2&protocol=https")
+
+    assert r.status_code == 200
+    # Only the row with a non-NULL http_port is emitted, on its http port.
+    assert r.headers["x-line-count"] == "1"
+    assert r.text == "https://u1:p1@h:8001"
+
+
+def test_list_batch_proxies_https_not_available_409(_no_auth: None, _mock_service) -> None:
+    from orchestrator.main import app
+
+    _mock_service.list_batch_ports.return_value = [
+        GeneratedPortRow(
+            port=32001, host="h", login="u1", password="p1", geo_code="us", http_port=None
+        ),
+    ]
+    client = TestClient(app)
+    r = client.get("/v1/pergb/ord_abc/batches/abc123/proxies?template=2&protocol=https")
+
+    assert r.status_code == 409
+    assert r.json()["error"] == "https_not_available_for_order"
+
+
+def test_list_batch_proxies_batch_not_found_404(_no_auth: None, _mock_service) -> None:
+    from orchestrator.main import app
+
+    _mock_service.list_batch_ports.return_value = None
+    client = TestClient(app)
+    r = client.get("/v1/pergb/ord_abc/batches/missing/proxies?template=1&protocol=socks5")
+
+    assert r.status_code == 404
+    assert r.json()["error"] == "batch_not_found"
+
+
+def test_list_batch_proxies_invalid_template_422(_no_auth: None, _mock_service) -> None:
+    from orchestrator.main import app
+
+    client = TestClient(app)
+    r = client.get("/v1/pergb/ord_abc/batches/abc123/proxies?template=9&protocol=socks5")
+
+    assert r.status_code == 422
+    assert r.json()["error"] == "invalid_template"
+    _mock_service.list_batch_ports.assert_not_awaited()
+
+
+def test_list_batch_proxies_missing_protocol_422(_no_auth: None, _mock_service) -> None:
+    from orchestrator.main import app
+
+    client = TestClient(app)
+    r = client.get("/v1/pergb/ord_abc/batches/abc123/proxies?template=1")
+
+    assert r.status_code == 422
+    assert r.json()["error"] == "template_and_protocol_required"
