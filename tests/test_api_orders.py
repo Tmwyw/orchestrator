@@ -186,6 +186,107 @@ def test_get_proxies_endpoint_format_locked() -> None:
     assert body["locked_format"] == "socks5_uri"
 
 
+# === Wave PROXY-FORMAT.A — template × protocol on the order endpoint ===
+
+
+def test_get_proxies_templated_socks5_returns_text() -> None:
+    from orchestrator.allocator import ProxiesResult
+
+    fake = ProxiesResult(
+        success=True,
+        content="socks5://u:p:h:1080",
+        content_type="text/plain",
+        line_count=1,
+    )
+    with patch(
+        "orchestrator.main._allocator.get_proxies_templated",
+        new=AsyncMock(return_value=fake),
+    ) as mock:
+        client = _client()
+        response = client.get(
+            "/v1/orders/ord_ok/proxies?template=1&protocol=socks5",
+            headers={"X-NETRUN-API-KEY": "test-api-key"},
+        )
+
+    assert response.status_code == 200
+    assert response.headers["x-line-count"] == "1"
+    assert response.text == "socks5://u:p:h:1080"
+    mock.assert_awaited_once_with(order_ref="ord_ok", template=1, protocol="socks5")
+
+
+def test_get_proxies_templated_https_not_available_returns_409() -> None:
+    from orchestrator.allocator import ProxiesResult
+
+    fake = ProxiesResult(success=False, error="https_not_available_for_order")
+    with patch(
+        "orchestrator.main._allocator.get_proxies_templated",
+        new=AsyncMock(return_value=fake),
+    ):
+        client = _client()
+        response = client.get(
+            "/v1/orders/ord_socks_only/proxies?template=2&protocol=https",
+            headers={"X-NETRUN-API-KEY": "test-api-key"},
+        )
+
+    assert response.status_code == 409
+    assert response.json()["error"] == "https_not_available_for_order"
+
+
+def test_get_proxies_templated_invalid_template_returns_422() -> None:
+    client = _client()
+    response = client.get(
+        "/v1/orders/ord_x/proxies?template=9&protocol=socks5",
+        headers={"X-NETRUN-API-KEY": "test-api-key"},
+    )
+    assert response.status_code == 422
+    assert response.json()["error"] == "invalid_template"
+
+
+def test_get_proxies_templated_invalid_protocol_returns_422() -> None:
+    client = _client()
+    response = client.get(
+        "/v1/orders/ord_x/proxies?template=1&protocol=ftp",
+        headers={"X-NETRUN-API-KEY": "test-api-key"},
+    )
+    assert response.status_code == 422
+    assert response.json()["error"] == "invalid_protocol"
+
+
+def test_get_proxies_templated_requires_both_params_returns_422() -> None:
+    client = _client()
+    response = client.get(
+        "/v1/orders/ord_x/proxies?template=1",
+        headers={"X-NETRUN-API-KEY": "test-api-key"},
+    )
+    assert response.status_code == 422
+    assert response.json()["error"] == "template_and_protocol_required"
+
+
+def test_get_proxies_legacy_format_unaffected_by_template_support() -> None:
+    """With neither template nor protocol, the legacy ?format= path runs."""
+    from orchestrator.allocator import ProxiesResult
+
+    fake = ProxiesResult(
+        success=True,
+        content="socks5://u:p@h:1080",
+        content_type="text/plain",
+        line_count=1,
+    )
+    with patch(
+        "orchestrator.main._allocator.get_proxies",
+        new=AsyncMock(return_value=fake),
+    ) as mock:
+        client = _client()
+        response = client.get(
+            "/v1/orders/ord_ok/proxies?format=socks5_uri",
+            headers={"X-NETRUN-API-KEY": "test-api-key"},
+        )
+
+    assert response.status_code == 200
+    assert response.text == "socks5://u:p@h:1080"
+    mock.assert_awaited_once()
+
+
 def test_extend_endpoint_validates_mutually_exclusive_selectors() -> None:
     client = _client()
     response = client.post(

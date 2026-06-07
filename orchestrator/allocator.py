@@ -14,7 +14,7 @@ from psycopg.types.json import Jsonb
 
 from orchestrator.config import get_config
 from orchestrator.db import connect
-from orchestrator.delivery import generate_delivery_content
+from orchestrator.delivery import generate_delivery_content, generate_template_content
 from orchestrator.distribution import equal_share
 from orchestrator.logging_setup import get_logger
 from orchestrator.metrics import (
@@ -419,6 +419,49 @@ class AllocatorService:
             content=content,
             content_type=content_type,
             line_count=line_count,
+        )
+
+    async def get_proxies_templated(
+        self, *, order_ref: str, template: int, protocol: str
+    ) -> ProxiesResult:
+        """Wave PROXY-FORMAT.A — render an order's live proxies in a chosen
+        ``template`` (1-4) × ``protocol`` (socks5|https), on the fly.
+
+        Unlike :meth:`get_proxies`, this path does NOT touch the
+        ``delivery_files`` cache / format-lock — the buyer picks a layout
+        per download, so re-downloading in a different template is allowed.
+        The proxy credentials (host/port/login/password) are identical
+        across templates; only the line layout differs.
+
+        For ``protocol="https"`` only rows carrying a non-NULL ``http_port``
+        (dual proxies) are emitted; an order with none yields
+        ``https_not_available_for_order`` (409), mirroring the legacy
+        http_uri path. ``template``/``protocol`` are validated by the
+        handler before this is called.
+        """
+        order = await asyncio.to_thread(self._sync_get_order, order_ref)
+        if order is None:
+            return ProxiesResult(success=False, error="order_not_found")
+        if str(order["status"]) != OrderStatus.COMMITTED.value:
+            return ProxiesResult(success=False, error="order_not_committed")
+
+        rows = await asyncio.to_thread(self._sync_list_inventory_for_order, int(order["id"]))
+        if not rows:
+            return ProxiesResult(success=False, error="inventory_empty")
+
+        if protocol == "https":
+            rows = [r for r in rows if r.get("http_port") is not None]
+            if not rows:
+                return ProxiesResult(success=False, error="https_not_available_for_order")
+
+        content, content_type = generate_template_content(
+            rows, template=template, protocol=protocol
+        )
+        return ProxiesResult(
+            success=True,
+            content=content,
+            content_type=content_type,
+            line_count=len(rows),
         )
 
     async def list_order_proxy_meta(

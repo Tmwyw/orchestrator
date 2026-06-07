@@ -41,6 +41,7 @@ from orchestrator.api_schemas import (
 from orchestrator.config import get_config
 from orchestrator.crypto import FernetKeyError
 from orchestrator.db import connect, fetch_all, fetch_one
+from orchestrator.delivery import parse_template_protocol
 from orchestrator.jobs import log_job_event, node_health_diagnostics, node_health_ready, public_job
 from orchestrator.logging_setup import configure_logging, get_logger
 from orchestrator.metrics import HTTP_DURATION_SEC, HTTP_REQUESTS
@@ -817,7 +818,44 @@ async def get_order(order_ref: str):
 
 
 @app.get("/v1/orders/{order_ref}/proxies", dependencies=[Depends(require_api_key)])
-async def get_order_proxies(order_ref: str, format: str = "socks5_uri"):
+async def get_order_proxies(
+    order_ref: str,
+    format: str = "socks5_uri",
+    template: str | None = None,
+    protocol: str | None = None,
+):
+    # Wave PROXY-FORMAT.A — when template/protocol are supplied the buyer
+    # picks one of 4 layouts × {socks5,https} per download (no format-lock).
+    # The legacy ?format= path is untouched when neither is present.
+    if template is not None or protocol is not None:
+        try:
+            tmpl, proto = parse_template_protocol(template, protocol)
+        except ValueError as exc:
+            return JSONResponse(
+                status_code=422,
+                content=ProblemResponse(
+                    error=str(exc),
+                    detail=f"template={template} protocol={protocol}",
+                ).model_dump(exclude_none=True, mode="json"),
+            )
+        result = await _allocator.get_proxies_templated(
+            order_ref=order_ref, template=tmpl, protocol=proto
+        )
+        if not result.success:
+            status_code = 404 if result.error in ("order_not_found", "inventory_empty") else 409
+            return JSONResponse(
+                status_code=status_code,
+                content=ProxiesErrorResponse(
+                    error=result.error or "unknown",
+                    locked_format=result.locked_format,
+                ).model_dump(exclude_none=True, mode="json"),
+            )
+        return Response(
+            content=result.content,
+            media_type=result.content_type,
+            headers={"X-Line-Count": str(result.line_count)},
+        )
+
     try:
         format_enum = DeliveryFormat(format)
     except ValueError:

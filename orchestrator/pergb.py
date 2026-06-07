@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Response
 from fastapi.responses import JSONResponse
 
 from orchestrator.api_schemas import (
@@ -28,6 +28,7 @@ from orchestrator.api_schemas import (
     TopupPergbResponse,
     TrafficResponse,
 )
+from orchestrator.delivery import generate_template_content, parse_template_protocol
 from orchestrator.pergb_service import PergbService
 
 pergb_router = APIRouter()
@@ -275,6 +276,60 @@ async def list_batch_ports(order_ref: str, batch_id: str) -> JSONResponse:
             ],
             "total": len(ports),
         }
+    )
+
+
+@pergb_router.get("/v1/pergb/{order_ref}/batches/{batch_id}/proxies")
+async def list_batch_proxies(
+    order_ref: str,
+    batch_id: str,
+    template: str | None = None,
+    protocol: str | None = None,
+) -> Response:
+    """Wave PROXY-FORMAT.A — formatted .txt of one generation batch.
+
+    Same batch resolution as ``/batches/{batch_id}/ports`` (raw, kept for
+    backward compat), but renders the rows server-side in a chosen
+    ``template`` (1-4) × ``protocol`` (socks5|https) via the shared
+    delivery generators — so the bot no longer formats pergb ports itself.
+
+    Errors: 422 on missing/invalid template|protocol; 404 when the batch
+    has no ports under this order's traffic_account; 409
+    ``https_not_available_for_order`` when protocol=https but no port in the
+    batch carries an ``http_port`` (socks5-only pool)."""
+    try:
+        tmpl, proto = parse_template_protocol(template, protocol)
+    except ValueError as exc:
+        return _error_response(
+            status=422,
+            error=str(exc),
+            detail=f"template={template} protocol={protocol}",
+        )
+
+    ports = await _service.list_batch_ports(order_ref=order_ref, batch_id=batch_id)
+    if ports is None:
+        return _error_response(status=404, error="batch_not_found")
+
+    rows = [
+        {
+            "host": p.host,
+            "port": p.port,
+            "http_port": p.http_port,
+            "login": p.login,
+            "password": p.password,
+        }
+        for p in ports
+    ]
+    if proto == "https":
+        rows = [r for r in rows if r.get("http_port") is not None]
+        if not rows:
+            return _error_response(status=409, error="https_not_available_for_order")
+
+    content, content_type = generate_template_content(rows, template=tmpl, protocol=proto)
+    return Response(
+        content=content,
+        media_type=content_type,
+        headers={"X-Line-Count": str(len(rows))},
     )
 
 
