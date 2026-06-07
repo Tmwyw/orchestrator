@@ -33,7 +33,13 @@ def _make_phased_connect(*phases: list[dict[str, Any]]):
 
     @contextmanager
     def fake_connect():
-        yield next(iterator)
+        try:
+            conn = next(iterator)
+        except StopIteration:
+            # Wave PERGB-POOL-1: tolerate watchdog phases beyond the staged set
+            # (the new GB-depletion-archive tail phase) — unexercised → empty.
+            conn = _make_conn(_make_cursor(fetchall_queue=[]))
+        yield conn
 
     return fake_connect, cursors
 

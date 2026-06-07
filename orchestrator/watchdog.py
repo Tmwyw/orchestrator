@@ -226,6 +226,45 @@ class WatchdogService:
                 unblocks_succeeded=counters["pergb_unblock_retries_succeeded"],
             )
 
+        # === Phase 5.6 (Wave PERGB-POOL-1): GB-depletion grace → archive ===
+        # A pool emptied of GB (traffic_poll flipped it 'depleted' + disabled
+        # its ports on the node) gets the SAME 3-day window to top up as a
+        # time-expired one, counted from depleted_at. Past the grace → archive
+        # the pool + cascade its still-allocated ports to archived. Topping up
+        # within the window (reserve / topup / admin add) reactivates it before
+        # this fires. Runs LAST (after the block/unblock retries) so the ports
+        # are reconciled before we clear them. Without it a GB-exhausted pool
+        # lingered 'depleted' until its time-lease elapsed instead of clearing
+        # 3 days after running dry.
+        with connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                update traffic_accounts
+                set status = 'archived', updated_at = now()
+                where status = 'depleted'
+                  and depleted_at is not null
+                  and depleted_at < now() - (%s || ' days')::interval
+                returning id
+                """,
+                (_PERGB_GRACE_DAYS,),
+            )
+            gb_archived_rows = list(cur.fetchall())
+            counters["pergb_accounts_archived"] += len(gb_archived_rows)
+            if gb_archived_rows:
+                account_ids = [int(r["id"]) for r in gb_archived_rows]
+                cur.execute(
+                    """
+                    update proxy_inventory
+                    set status = 'archived', archived_at = now(), updated_at = now()
+                    where traffic_account_id = any(%s)
+                      and status in ('allocated_pergb', 'expired_grace')
+                    """,
+                    (account_ids,),
+                )
+                logger.info(
+                    "watchdog_pergb_gb_depletion_archived", accounts=len(gb_archived_rows)
+                )
+
         return counters
 
     # === safety-net retries (Wave D) ===

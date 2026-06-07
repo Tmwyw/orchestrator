@@ -50,7 +50,14 @@ def _make_phased_connect(*phases: list[dict[str, Any]]):
 
     @contextmanager
     def fake_connect():
-        yield next(iterator)
+        try:
+            conn = next(iterator)
+        except StopIteration:
+            # Wave PERGB-POOL-1: tolerate watchdog phases beyond the staged
+            # set (e.g. the new GB-depletion-archive tail phase) — a test that
+            # doesn't exercise them just gets an empty cursor (no-op).
+            conn = _make_conn(_make_cursor(fetchall_queue=[]))
+        yield conn
 
     return fake_connect, cursors
 
@@ -345,3 +352,37 @@ def test_watchdog_retry_select_uses_throttle_and_limit(_cfg: None) -> None:
     assert "node_blocked = true" in unblock_select_sql
     assert "last_unblock_attempt_at < now() - (%s || ' minutes')::interval" in unblock_select_sql
     assert "limit %s" in unblock_select_sql
+
+
+def test_watchdog_archives_gb_depleted_past_grace(_cfg: None) -> None:
+    """Phase 5.6 (Wave PERGB-POOL-1): a pool flipped 'depleted' by running out
+    of GB and left untopped past the 3-day grace (depleted_at) is archived +
+    its still-allocated ports cascaded to archived."""
+    from orchestrator.watchdog import WatchdogService
+
+    fake_connect, cursors = _make_phased_connect(
+        [[]],  # 1 jobs
+        [[]],  # 2 orders
+        [[]],  # 3 pending validation
+        [[]],  # 4 delivery
+        [[]],  # 5.1 pergb time-expire
+        [[]],  # 5.2 pergb time-archive
+        [[]],  # 5.3 samples pruned
+        [[]],  # 5.4 block retries
+        [[]],  # 5.5 unblock retries
+        [[{"id": 7}]],  # 5.6 GB-depletion archive: 1 account past grace
+    )
+    with patch("orchestrator.watchdog.connect", new=fake_connect):
+        counters = WatchdogService().run_once()
+
+    assert counters["pergb_accounts_archived"] == 1
+    sql_calls = [c.args[0] for c in cursors[9].execute.call_args_list]
+    # Archives depleted pools past the depleted_at grace …
+    assert any(
+        "status = 'depleted'" in s and "depleted_at < now()" in s for s in sql_calls
+    )
+    # … and cascades their still-allocated ports to archived.
+    assert any(
+        "update proxy_inventory" in s and "archived" in s and "allocated_pergb" in s
+        for s in sql_calls
+    )
