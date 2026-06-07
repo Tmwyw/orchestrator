@@ -209,6 +209,15 @@ class PergbService:
             idempotency_key=idempotency_key,
         )
 
+        # Wave PERGB-POOL-1: a purchase that folded into a DEPLETED/EXPIRED
+        # pool reactivated it — fan out post_enable across the pool's existing
+        # ports (a fresh pool has none yet, so this is a no-op on first buy).
+        if created.get("reactivated"):
+            await asyncio.to_thread(
+                self._best_effort_post_enable_all,
+                account_id=int(created["traffic_account_id"]),
+            )
+
         result = ReservePergbResult(
             success=True,
             order_ref=created["order_ref"],
@@ -575,27 +584,67 @@ class PergbService:
             assert order_row is not None
             order_id = int(order_row["id"])
 
-            # 2. Insert traffic_account (inventory_id NULL — ports come later)
+            # 2. Fold into the user's ONE GB pool (Wave PERGB-POOL-1). Every
+            #    pergb purchase adds to a single per-user traffic_account:
+            #    first buy inserts it; repeat buys ADD GB and EXTEND days
+            #    (greatest(expires_at, now()) + duration → days accumulate, not
+            #    cap) and reactivate a depleted/expired pool. The pool row is
+            #    locked FOR UPDATE so concurrent reserve/topup can't race.
             cur.execute(
                 """
-                insert into traffic_accounts (
-                  order_id, inventory_id, bytes_quota, bytes_used,
-                  status, expires_at
-                )
-                values (%s, NULL, %s, 0, 'active', %s)
-                returning id
+                select id, status, bytes_used, bytes_quota
+                  from traffic_accounts
+                 where user_id = %s
+                 for update
                 """,
-                (order_id, bytes_quota, traffic_expires_at),
+                (user_id,),
             )
-            ta_row = cur.fetchone()
-            assert ta_row is not None
-            traffic_account_id = int(ta_row["id"])
+            pool = cur.fetchone()
+            reactivated = False
+            if pool is None:
+                cur.execute(
+                    """
+                    insert into traffic_accounts (
+                      user_id, order_id, inventory_id, bytes_quota, bytes_used,
+                      status, expires_at
+                    )
+                    values (%s, %s, NULL, %s, 0, 'active', %s)
+                    returning id
+                    """,
+                    (user_id, order_id, bytes_quota, traffic_expires_at),
+                )
+                ta_row = cur.fetchone()
+                assert ta_row is not None
+                traffic_account_id = int(ta_row["id"])
+            else:
+                traffic_account_id = int(pool["id"])
+                new_quota = int(pool["bytes_quota"]) + bytes_quota
+                # Reactivate iff the pool was dead but the added GB puts the
+                # quota back ahead of usage (mirrors _sync_apply_topup).
+                reactivated = (
+                    str(pool["status"]) in ("depleted", "expired")
+                    and int(pool["bytes_used"]) < new_quota
+                )
+                cur.execute(
+                    """
+                    update traffic_accounts
+                       set bytes_quota = bytes_quota + %s,
+                           expires_at  = greatest(expires_at, now())
+                                         + (%s || ' days')::interval,
+                           status      = case when %s then 'active' else status end,
+                           depleted_at = case when %s then null else depleted_at end,
+                           updated_at  = now()
+                     where id = %s
+                    """,
+                    (bytes_quota, duration_days, reactivated, reactivated, traffic_account_id),
+                )
 
         return {
             "order_ref": order_ref,
             "order_id": order_id,
             "traffic_account_id": traffic_account_id,
             "proxies_expires_at": proxies_expires_at,
+            "reactivated": reactivated,
         }
 
     def _sync_atomic_allocate_ports(
@@ -1037,7 +1086,11 @@ class PergbService:
                 """
                 update traffic_accounts
                 set bytes_quota = bytes_quota + %s,
-                    expires_at = greatest(expires_at, now() + (%s || ' days')::interval),
+                    -- Wave PERGB-POOL-1: days ACCUMULATE — add the package's
+                    -- duration to whichever is later (remaining expiry or now),
+                    -- so 30d + (15d-left, +30d) = 45d. The old
+                    -- greatest(expires, now()+dur) capped the result at `dur`.
+                    expires_at = greatest(expires_at, now()) + (%s || ' days')::interval,
                     status = case
                       when status = 'depleted' and bytes_used < (bytes_quota + %s) then 'active'
                       else status

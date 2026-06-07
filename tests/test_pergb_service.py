@@ -103,7 +103,10 @@ def test_reserve_pergb_happy_path() -> None:
             {"nextval": 7},
             # 1. Order INSERT RETURNING id
             {"id": 999},
-            # 2. traffic_accounts INSERT RETURNING id
+            # 2. Wave PERGB-POOL-1: SELECT user's pool FOR UPDATE — None = first
+            #    buy → INSERT a fresh pool below.
+            None,
+            # 3. traffic_accounts INSERT RETURNING id
             {"id": 42},
         ],
     )
@@ -131,6 +134,49 @@ def test_reserve_pergb_happy_path() -> None:
     assert result.price_amount == Decimal("9.50000000")
     # Idempotency cache write
     redis.set.assert_awaited()
+
+
+def test_reserve_pergb_folds_into_existing_pool() -> None:
+    """Wave PERGB-POOL-1: a repeat buy finds the user's existing pool
+    (SELECT ... FOR UPDATE returns a row) and ADDS GB to it via UPDATE —
+    no new traffic_account is inserted; the existing pool id is returned."""
+    sku_cursor = _make_cursor(
+        fetchone_queue=[
+            {
+                "id": 5,
+                "code": "sku_pergb_us",
+                "product_kind": "datacenter_pergb",
+                "metadata": _PERGB_SKU_METADATA,
+                "duration_days": 30,
+                "is_active": True,
+            }
+        ],
+    )
+    create_cursor = _make_cursor(
+        fetchone_queue=[
+            {"nextval": 8},  # 0. order_ref seq
+            {"id": 1000},  # 1. order INSERT id
+            # 2. existing ACTIVE pool (id 42) → UPDATE path (no INSERT, the
+            #    UPDATE has no RETURNING so no further fetchone).
+            {"id": 42, "status": "active", "bytes_used": 0, "bytes_quota": 5 * 1024**3},
+        ],
+    )
+    fake_connect = _make_phased_connect(_make_conn(sku_cursor), _make_conn(create_cursor))
+    redis = _make_redis_mock()
+
+    with (
+        patch("orchestrator.pergb_service.connect", new=fake_connect),
+        patch("orchestrator.pergb_service.get_redis", new=AsyncMock(return_value=redis)),
+    ):
+        result = _run(
+            PergbService().reserve_pergb(user_id=1, sku_id=5, gb_amount=10, idempotency_key="K2")
+        )
+
+    assert result.success is True
+    assert result.traffic_account_id == 42  # existing pool, not a new account
+    # The pool UPDATE ("bytes_quota = bytes_quota + %s") ran on the create txn.
+    update_sqls = [c.args[0] for c in create_cursor.execute.call_args_list if c.args]
+    assert any("bytes_quota = bytes_quota + %s" in s for s in update_sqls)
 
 
 def test_reserve_pergb_idem_cache_hit_skips_db() -> None:

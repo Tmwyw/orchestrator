@@ -29,3 +29,26 @@ def test_get_traffic_and_status_resolve_account_by_user() -> None:
     assert _PERGB_SVC.count("on t.user_id = o.user_id") >= 2
     # The legacy per-order join must be gone from these read paths.
     assert "join traffic_accounts t on t.order_id = o.id" not in _PERGB_SVC
+
+
+# ── Phase B: buy/topup fold into the per-user pool ────────────────
+
+
+def test_reserve_folds_into_user_pool_not_new_account() -> None:
+    """A pergb purchase must find-or-create the user's ONE pool (lock it
+    FOR UPDATE, INSERT on first buy, else ADD GB) — not blindly INSERT a
+    fresh per-order traffic_account each time."""
+    sql = " ".join(_PERGB_SVC.lower().split())  # whitespace-insensitive
+    assert "from traffic_accounts where user_id = %s for update" in sql
+    assert "set bytes_quota = bytes_quota + %s" in sql  # repeat-buy adds GB
+
+
+def test_pergb_days_accumulate_not_capped() -> None:
+    """Both the reserve-pool fold AND topup must EXTEND days
+    (greatest(expires_at, now()) + duration → 30d + 15d-left + 30d = 45d),
+    never the old greatest(expires_at, now()+duration) which capped the
+    result at a single package's duration."""
+    sql = " ".join(_PERGB_SVC.split())  # whitespace-insensitive
+    assert "greatest(expires_at, now()) + (%s || ' days')::interval" in sql
+    # The capping form must be gone everywhere.
+    assert "greatest(expires_at, now() + (%s || ' days')::interval)" not in sql
