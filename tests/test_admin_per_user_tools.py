@@ -221,3 +221,130 @@ def test_change_expiry_validates_days_range(_no_auth: None) -> None:
         "/v1/admin/orders/ord_x/expiry", json={"mode": "add", "days": 0}
     )
     assert r.status_code == 422
+
+
+# ── Wave PERGB-POOL-1: per-USER pool ops (set/add/gift/subtract) ──
+
+
+def test_user_traffic_add_active_no_transition_skips_fanout(
+    monkeypatch: pytest.MonkeyPatch, _no_auth: None
+) -> None:
+    """No status change → no port fan-out (ports already in the right state)."""
+    expires = datetime.now(tz=UTC) + timedelta(days=30)
+    calls: list[Any] = []
+    monkeypatch.setattr(
+        "orchestrator.admin._sync_apply_user_traffic_op",
+        lambda uid, op, b: {
+            "error": "",
+            "account_id": 42,
+            "old_status": "active",
+            "new_status": "active",
+            "bytes_quota": b,
+            "bytes_used": 1_000,
+            "expires_at": expires,
+        },
+    )
+    monkeypatch.setattr(
+        "orchestrator.admin._fan_out_account_ports",
+        lambda *a, **k: calls.append((a, k)),
+    )
+    r = _client().patch("/v1/admin/users/7/traffic", json={"op": "add", "gb_amount": 2})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["user_id"] == 7
+    assert body["status"] == "active"
+    assert body["bytes_remaining"] == body["bytes_quota"] - 1_000
+    assert calls == []  # no transition → no fan-out
+
+
+def test_user_traffic_subtract_to_depleted_disables_ports(
+    monkeypatch: pytest.MonkeyPatch, _no_auth: None
+) -> None:
+    expires = datetime.now(tz=UTC) + timedelta(days=30)
+    calls: list[tuple[int, bool]] = []
+    monkeypatch.setattr(
+        "orchestrator.admin._sync_apply_user_traffic_op",
+        lambda uid, op, b: {
+            "error": "",
+            "account_id": 42,
+            "old_status": "active",
+            "new_status": "depleted",
+            "bytes_quota": 100,
+            "bytes_used": 500,
+            "expires_at": expires,
+        },
+    )
+    monkeypatch.setattr(
+        "orchestrator.admin._fan_out_account_ports",
+        lambda account_id, *, enable: calls.append((account_id, enable)),
+    )
+    r = _client().patch(
+        "/v1/admin/users/7/traffic", json={"op": "subtract", "gb_amount": 2}
+    )
+    assert r.status_code == 200
+    assert r.json()["status"] == "depleted"
+    assert r.json()["bytes_remaining"] == 0  # clamped
+    assert calls == [(42, False)]  # disable ports on →depleted
+
+
+def test_user_traffic_reactivate_enables_ports(
+    monkeypatch: pytest.MonkeyPatch, _no_auth: None
+) -> None:
+    expires = datetime.now(tz=UTC) + timedelta(days=30)
+    calls: list[tuple[int, bool]] = []
+    monkeypatch.setattr(
+        "orchestrator.admin._sync_apply_user_traffic_op",
+        lambda uid, op, b: {
+            "error": "",
+            "account_id": 42,
+            "old_status": "depleted",
+            "new_status": "active",
+            "bytes_quota": 5_000,
+            "bytes_used": 1_000,
+            "expires_at": expires,
+        },
+    )
+    monkeypatch.setattr(
+        "orchestrator.admin._fan_out_account_ports",
+        lambda account_id, *, enable: calls.append((account_id, enable)),
+    )
+    r = _client().patch("/v1/admin/users/7/traffic", json={"op": "gift", "gb_amount": 5})
+    assert r.status_code == 200
+    assert calls == [(42, True)]  # enable ports on →active
+
+
+def test_user_traffic_subtract_missing_pool_404(
+    monkeypatch: pytest.MonkeyPatch, _no_auth: None
+) -> None:
+    monkeypatch.setattr(
+        "orchestrator.admin._sync_apply_user_traffic_op",
+        lambda *_a, **_k: {"error": "not_found"},
+    )
+    r = _client().patch(
+        "/v1/admin/users/9/traffic", json={"op": "subtract", "gb_amount": 1}
+    )
+    assert r.status_code == 404
+
+
+def test_user_traffic_archived_409(
+    monkeypatch: pytest.MonkeyPatch, _no_auth: None
+) -> None:
+    monkeypatch.setattr(
+        "orchestrator.admin._sync_apply_user_traffic_op",
+        lambda *_a, **_k: {"error": "closed", "status": "archived"},
+    )
+    r = _client().patch("/v1/admin/users/9/traffic", json={"op": "set", "gb_amount": 1})
+    assert r.status_code == 409
+
+
+def test_user_traffic_validates_op_and_gb(_no_auth: None) -> None:
+    assert (
+        _client().patch("/v1/admin/users/9/traffic", json={"op": "set", "gb_amount": 0}).status_code
+        == 422
+    )
+    assert (
+        _client()
+        .patch("/v1/admin/users/9/traffic", json={"op": "bogus", "gb_amount": 1})
+        .status_code
+        == 422
+    )

@@ -6,19 +6,18 @@ import asyncio
 from datetime import datetime, timezone
 from typing import Any
 
-# Mypy on py310 doesn't recognise ``datetime.UTC`` (added in 3.11);
-# keep the alias compatible with both runtime + type-check.
-UTC = timezone.utc
-
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import JSONResponse
 
+from orchestrator import node_client
 from orchestrator.api_schemas import (
     AdminChangeExpiryRequest,
     AdminChangeExpiryResponse,
     AdminSetQuotaRequest,
     AdminSetQuotaResponse,
     AdminTrafficPollResponse,
+    AdminUserTrafficRequest,
+    AdminUserTrafficResponse,
     ArchiveExportItem,
     ArchiveExportResponse,
     OrderListItem,
@@ -31,7 +30,14 @@ from orchestrator.api_schemas import (
     StatsSales,
 )
 from orchestrator.db import connect, fetch_all, fetch_one
+from orchestrator.logging_setup import get_logger
 from orchestrator.traffic_poll import TrafficPollService
+
+# Mypy on py310 doesn't recognise ``datetime.UTC`` (added in 3.11);
+# keep the alias compatible with both runtime + type-check.
+UTC = timezone.utc
+
+logger = get_logger("netrun-orchestrator-admin")
 
 admin_router = APIRouter(prefix="/v1/admin")
 
@@ -325,6 +331,168 @@ def _sync_set_quota(order_ref: str, bytes_quota: int) -> dict[str, Any]:
             "status": updated["status"],
             "expires_at": updated["expires_at"],
         }
+
+
+# ── Wave PERGB-POOL-1: per-USER GB pool ops (set/add/gift/subtract) ──
+
+_DEFAULT_GIFT_DURATION_DAYS = 30
+
+
+@admin_router.patch("/users/{user_id}/traffic")
+async def admin_set_user_traffic(
+    user_id: int, payload: AdminUserTrafficRequest
+) -> JSONResponse:
+    """SET / ADD / GIFT / SUBTRACT GB on the user's ONE pool (addressed by
+    user_id — no order picker). bytes_used preserved; status recomputes and
+    the pool's ports are enabled/disabled on an active↔depleted transition
+    IMMEDIATELY (not waiting for the watchdog)."""
+    delta_bytes = round(payload.gb_amount * (1024**3))
+    result = await asyncio.to_thread(
+        _sync_apply_user_traffic_op, user_id, payload.op, delta_bytes
+    )
+    if result["error"] == "not_found":
+        raise HTTPException(status_code=404, detail="user has no pergb traffic pool")
+    if result["error"] == "closed":
+        raise HTTPException(
+            status_code=409,
+            detail=f"traffic pool status={result['status']} — refusing to mutate",
+        )
+    # Port fan-out on transition: enable on →active, disable on →depleted.
+    if result["old_status"] != result["new_status"]:
+        await asyncio.to_thread(
+            _fan_out_account_ports,
+            int(result["account_id"]),
+            enable=(result["new_status"] == "active"),
+        )
+    response = AdminUserTrafficResponse(
+        user_id=user_id,
+        bytes_quota=result["bytes_quota"],
+        bytes_used=result["bytes_used"],
+        bytes_remaining=max(0, result["bytes_quota"] - result["bytes_used"]),
+        status=result["new_status"],
+        expires_at=result["expires_at"],
+    )
+    return JSONResponse(content=response.model_dump(mode="json"))
+
+
+def _sync_apply_user_traffic_op(user_id: int, op: str, delta_bytes: int) -> dict[str, Any]:
+    """Apply a set/add/gift/subtract op to the user's single GB pool.
+
+    Creates the pool on set/add/gift when the user has none (default
+    30-day window — a gift to a never-bought user still works); subtract on
+    a missing pool returns ``not_found``. archived/expired pools are refused
+    (409) — those are revived by a re-purchase, not an admin tweak. Returns
+    pre/post status so the caller fans out enable/disable on a transition.
+    """
+    with connect() as conn, conn.cursor() as cur:
+        cur.execute(
+            "select id, bytes_quota, bytes_used, status from traffic_accounts "
+            "where user_id = %s for update",
+            (user_id,),
+        )
+        row = cur.fetchone()
+        if row is None:
+            if op == "subtract":
+                return {"error": "not_found"}
+            cur.execute(
+                """
+                insert into traffic_accounts
+                  (user_id, order_id, inventory_id, bytes_quota, bytes_used,
+                   status, expires_at)
+                values (%s, NULL, NULL, %s, 0, 'active',
+                        now() + (%s || ' days')::interval)
+                returning id, bytes_quota, bytes_used, status, expires_at
+                """,
+                (user_id, delta_bytes, _DEFAULT_GIFT_DURATION_DAYS),
+            )
+            created = cur.fetchone()
+            assert created is not None
+            return {
+                "error": "",
+                "account_id": int(created["id"]),
+                "old_status": "active",
+                "new_status": str(created["status"]),
+                "bytes_quota": int(created["bytes_quota"]),
+                "bytes_used": int(created["bytes_used"]),
+                "expires_at": created["expires_at"],
+            }
+        if str(row["status"]) in ("archived", "expired"):
+            return {"error": "closed", "status": str(row["status"])}
+        old_status = str(row["status"])
+        used = int(row["bytes_used"])
+        if op == "set":
+            new_quota = delta_bytes
+        elif op in ("add", "gift"):
+            new_quota = int(row["bytes_quota"]) + delta_bytes
+        else:  # subtract
+            new_quota = max(0, int(row["bytes_quota"]) - delta_bytes)
+        new_status = "active" if new_quota > used else "depleted"
+        cur.execute(
+            """
+            update traffic_accounts
+               set bytes_quota = %s,
+                   status = %s,
+                   depleted_at = case when %s = 'depleted' then now() else null end,
+                   updated_at = now()
+             where id = %s
+            returning bytes_quota, bytes_used, expires_at
+            """,
+            (new_quota, new_status, new_status, int(row["id"])),
+        )
+        updated = cur.fetchone()
+        assert updated is not None
+        return {
+            "error": "",
+            "account_id": int(row["id"]),
+            "old_status": old_status,
+            "new_status": new_status,
+            "bytes_quota": int(updated["bytes_quota"]),
+            "bytes_used": int(updated["bytes_used"]),
+            "expires_at": updated["expires_at"],
+        }
+
+
+def _fan_out_account_ports(account_id: int, *, enable: bool) -> None:
+    """Best-effort post_enable/post_disable on every port linked to the pool.
+    Mirrors traffic_poll's fan-out. ``node_blocked`` is set so the watchdog
+    reconciles any port that didn't ack: enable → blocked iff some failed
+    (retry-unblock); disable → blocked iff all acked (else retry-block)."""
+    with connect() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            select i.port, n.url as node_url, n.api_key as node_api_key
+              from proxy_inventory i
+              join nodes n on n.id = i.node_id
+             where i.traffic_account_id = %s
+            """,
+            (account_id,),
+        )
+        ports = list(cur.fetchall())
+    all_ok = bool(ports)
+    for p in ports:
+        node_url = str(p["node_url"])
+        api_key = str(p["node_api_key"]) if p.get("node_api_key") else None
+        port = int(p["port"])
+        try:
+            if enable:
+                node_client.post_enable(node_url, api_key, port)
+            else:
+                node_client.post_disable(node_url, api_key, port)
+        except node_client.NodeAgentError as exc:
+            all_ok = False
+            logger.warning(
+                "admin_traffic_fanout_failed",
+                account_id=account_id,
+                port=port,
+                enable=enable,
+                error=str(exc),
+            )
+    node_blocked = (not all_ok) if enable else all_ok
+    with connect() as conn, conn.cursor() as cur:
+        cur.execute(
+            "update traffic_accounts set node_blocked = %s, updated_at = now() where id = %s",
+            (node_blocked, account_id),
+        )
 
 
 @admin_router.patch("/orders/{order_ref}/expiry")

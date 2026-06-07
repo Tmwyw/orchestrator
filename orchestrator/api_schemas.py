@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -518,6 +518,36 @@ class AdminSetQuotaResponse(BaseModel):
     model_config = _API_MODEL_CONFIG
 
     order_ref: str
+    bytes_quota: int
+    bytes_used: int
+    bytes_remaining: int
+    status: str
+    expires_at: datetime
+
+
+class AdminUserTrafficRequest(BaseModel):
+    """Body for PATCH /v1/admin/users/{user_id}/traffic — Wave PERGB-POOL-1.
+
+    Operates on the user's single GB pool (one number per user, no order
+    picker). ``op`` semantics on ``bytes_quota``:
+      * ``set``      — replace with ``gb_amount`` GiB;
+      * ``add``      — += ``gb_amount`` GiB;
+      * ``gift``     — same as ``add`` mechanically (the bot audits it as a
+                       gift); kept distinct so the API reads intent-clearly;
+      * ``subtract`` — −= ``gb_amount`` GiB, floored at 0.
+    ``bytes_used`` is preserved; status recomputes (active↔depleted) and the
+    pool's ports are enabled/disabled on the transition."""
+
+    model_config = _API_MODEL_CONFIG
+
+    op: Literal["set", "add", "gift", "subtract"]
+    gb_amount: float = Field(gt=0, le=100_000)
+
+
+class AdminUserTrafficResponse(BaseModel):
+    model_config = _API_MODEL_CONFIG
+
+    user_id: int
     bytes_quota: int
     bytes_used: int
     bytes_remaining: int
