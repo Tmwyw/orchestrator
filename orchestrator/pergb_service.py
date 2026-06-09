@@ -421,10 +421,12 @@ class PergbService:
             idempotency_key=idempotency_key,
         )
         if outcome.get("error") == "duplicate_idempotency_key":
-            # UNIQUE-violation Path B (D6.4) — fetch and return existing top-up's response
-            existing = outcome.get("existing")
-            assert existing is not None
-            return self._result_from_existing_topup(existing)
+            # UNIQUE-violation Path B (D6.4) — idempotent replay: return the
+            # existing top-up's response. SMOKE-FIX (A2): NO assert here — if the
+            # fetch ever misses, _result_from_existing_topup(None) degrades to a
+            # graceful conflict instead of raising AssertionError → 500 (a 500
+            # makes the bot refund an already-applied top-up = revenue leak).
+            return self._result_from_existing_topup(outcome.get("existing"))
 
         # Reactivation: if account flipped depleted → active, fan out
         # post_enable across all linked ports (Wave PERGB-RFCT-A: 1 → N).
@@ -1132,9 +1134,14 @@ class PergbService:
                 select o.order_ref, o.metadata, o.price_amount, o.proxies_expires_at,
                        t.bytes_quota, t.bytes_used
                 from orders o
-                join traffic_accounts t on t.order_id = (
-                    select id from orders where order_ref = (o.metadata ->> 'parent_order_ref')
-                )
+                -- SMOKE-FIX (A2) — resolve the traffic_account by USER (the
+                -- PERGB-POOL per-user pool, UNIQUE user_id), mirroring the
+                -- reserve/snapshot queries above. The old join
+                -- (t.order_id = parent.id) broke after migration 051 made
+                -- order_id nullable/non-canonical → this fetch returned NULL on
+                -- an idempotent retry → caller 500'd → the bot refunded an
+                -- ALREADY-APPLIED top-up (revenue leak + «купил 1 → дало 2»).
+                join traffic_accounts t on t.user_id = o.user_id
                 where o.idempotency_key = %s
                 """,
                 (idempotency_key,),
