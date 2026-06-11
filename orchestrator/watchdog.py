@@ -463,6 +463,20 @@ class WatchdogService:
         try:
             node_client.post_disable(node_url, node_api_key, port)
         except NodeAgentError as exc:
+            if exc.status_code == 404:
+                # Port no longer exists on the node (stale proxy_inventory row).
+                # The block goal — "this port is not serving" — is already met,
+                # so count it as success. Otherwise a single phantom port pins
+                # the whole account at node_blocked=false forever (a 532-port
+                # pool with 2 dead ports never converged + re-disabled all 532
+                # every cycle).
+                logger.info(
+                    "watchdog_pergb_block_port_absent",
+                    account_id=account_id,
+                    node_id=node_id,
+                    port=port,
+                )
+                return True
             logger.warning(
                 "watchdog_pergb_block_retry_failed",
                 account_id=account_id,

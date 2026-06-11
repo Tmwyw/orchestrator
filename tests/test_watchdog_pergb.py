@@ -164,3 +164,46 @@ def test_phase5_no_op_when_clean_does_not_cascade() -> None:
     # NOT a second cascade execute.
     assert cursors[4].execute.call_count == 1
     assert cursors[5].execute.call_count == 1
+
+
+# ── Block-retry 404 handling (prod #2: 532-port pool, 2 dead ports) ──
+def test_call_disable_treats_404_as_success(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A 404 (port gone on the node — stale proxy_inventory row) must count as
+    success. Otherwise one phantom port pins the whole account at
+    node_blocked=false forever and the watchdog re-disables the entire pool
+    every cycle (prod account #2: 532 ports, ports 47407/42001 → 404)."""
+    from orchestrator import node_client
+    from orchestrator.watchdog import WatchdogService
+
+    def _raise_404(*_a: Any, **_k: Any) -> None:
+        raise node_client.NodeAgentError("disable_status_404", status_code=404)
+
+    monkeypatch.setattr(node_client, "post_disable", _raise_404)
+    ok = WatchdogService()._call_disable(
+        node_url="http://node:8085",
+        node_api_key=None,
+        port=42001,
+        account_id=2,
+        node_id="us-chicago-01",
+    )
+    assert ok is True
+
+
+def test_call_disable_non_404_still_fails(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A genuine error (5xx / transport) still returns False so the account
+    stays node_blocked=false and the watchdog keeps retrying."""
+    from orchestrator import node_client
+    from orchestrator.watchdog import WatchdogService
+
+    def _raise_500(*_a: Any, **_k: Any) -> None:
+        raise node_client.NodeAgentError("disable_status_500", status_code=500)
+
+    monkeypatch.setattr(node_client, "post_disable", _raise_500)
+    ok = WatchdogService()._call_disable(
+        node_url="http://node:8085",
+        node_api_key=None,
+        port=1,
+        account_id=2,
+        node_id="us-chicago-01",
+    )
+    assert ok is False

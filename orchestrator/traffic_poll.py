@@ -368,6 +368,19 @@ class TrafficPollService:
                     port=p["port"],
                 )
             except NodeAgentError as exc:
+                if exc.status_code == 404:
+                    # Port gone on the node (stale row) → already not serving,
+                    # so the disable goal is met. Count as success; otherwise a
+                    # phantom port pins node_blocked=false and the watchdog
+                    # re-disables the whole pool forever (see watchdog 404 fix).
+                    counters.accounts_disabled += 1
+                    logger.info(
+                        "traffic_account_depleted_port_absent",
+                        account_id=account_id,
+                        node_id=p["node_id"],
+                        port=p["port"],
+                    )
+                    continue
                 all_ok = False
                 logger.warning(
                     "traffic_account_disable_failed",
