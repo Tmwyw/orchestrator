@@ -141,8 +141,8 @@ def test_run_once_happy_path_two_accounts_one_node(monkeypatch: pytest.MonkeyPat
     def fake_get_accounting(url, api_key, ports, timeout_sec=10):
         assert sorted(ports) == [32001, 32002]
         return {
-            "32001": {"bytes_in": 200, "bytes_out": 200, "bytes_in6": 0, "bytes_out6": 0},
-            "32002": {"bytes_in": 50, "bytes_out": 50, "bytes_in6": 0, "bytes_out6": 0},
+            "32001": {"bytes_in": 200, "bytes_out": 200},
+            "32002": {"bytes_in": 50, "bytes_out": 50},
         }
 
     monkeypatch.setattr(traffic_poll.node_client, "get_accounting", fake_get_accounting)
@@ -216,7 +216,7 @@ def test_run_once_partial_node_response(monkeypatch: pytest.MonkeyPatch) -> None
     )
 
     def fake_get_accounting(url, api_key, ports, timeout_sec=10):
-        return {"32001": {"bytes_in": 100, "bytes_out": 100, "bytes_in6": 0, "bytes_out6": 0}}
+        return {"32001": {"bytes_in": 100, "bytes_out": 100}}
         # 32002 missing — defensive partial response
 
     monkeypatch.setattr(traffic_poll.node_client, "get_accounting", fake_get_accounting)
@@ -304,7 +304,7 @@ def test_run_once_counter_reset_detected(monkeypatch: pytest.MonkeyPatch) -> Non
 
     # New reading is LOWER than the anchor → counter reset
     def fake_get_accounting(url, api_key, ports, timeout_sec=10):
-        return {"32001": {"bytes_in": 10, "bytes_out": 20, "bytes_in6": 0, "bytes_out6": 0}}
+        return {"32001": {"bytes_in": 10, "bytes_out": 20}}
 
     monkeypatch.setattr(traffic_poll.node_client, "get_accounting", fake_get_accounting)
 
@@ -381,7 +381,7 @@ def test_run_once_depletion_trigger_calls_post_disable(monkeypatch: pytest.Monke
     def fake_get_accounting(url, api_key, ports, timeout_sec=10):
         # +200 over the snapshot will be aggregated, but for this test the
         # aggregate cursor returns the post-aggregate state directly.
-        return {"32001": {"bytes_in": 100, "bytes_out": 100, "bytes_in6": 0, "bytes_out6": 0}}
+        return {"32001": {"bytes_in": 100, "bytes_out": 100}}
 
     disable_calls: list[tuple[Any, ...]] = []
 
@@ -458,7 +458,7 @@ def test_run_once_depletion_disable_failure_is_logged_not_fatal(
     monkeypatch.setattr(
         traffic_poll.node_client,
         "get_accounting",
-        lambda *a, **kw: {"32001": {"bytes_in": 100, "bytes_out": 100, "bytes_in6": 0, "bytes_out6": 0}},
+        lambda *a, **kw: {"32001": {"bytes_in": 100, "bytes_out": 100}},
     )
 
     def boom_disable(*a, **kw):
@@ -519,7 +519,7 @@ def test_run_once_polls_reactivated_account_with_preserved_anchor(
     monkeypatch.setattr(
         traffic_poll.node_client,
         "get_accounting",
-        lambda *a, **kw: {"32001": {"bytes_in": 600, "bytes_out": 700, "bytes_in6": 0, "bytes_out6": 0}},
+        lambda *a, **kw: {"32001": {"bytes_in": 600, "bytes_out": 700}},
     )
 
     with patch("orchestrator.traffic_poll.connect", new=fake_connect):
@@ -663,7 +663,7 @@ def test_consecutive_failures_reset_on_success(monkeypatch: pytest.MonkeyPatch) 
     monkeypatch.setattr(
         traffic_poll.node_client,
         "get_accounting",
-        lambda *a, **kw: {"32001": {"bytes_in": 0, "bytes_out": 0, "bytes_in6": 0, "bytes_out6": 0}},
+        lambda *a, **kw: {"32001": {"bytes_in": 0, "bytes_out": 0}},
     )
     with patch(
         "orchestrator.traffic_poll.connect",

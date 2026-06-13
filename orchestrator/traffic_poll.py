@@ -223,8 +223,12 @@ class TrafficPollService:
         happen in _aggregate_and_flip_depleted after every port for the cycle
         is processed (so SUM is correct).
         """
-        bytes_in_total = int(sample.get("bytes_in", 0)) + int(sample.get("bytes_in6", 0))
-        bytes_out_total = int(sample.get("bytes_out", 0)) + int(sample.get("bytes_out6", 0))
+        # Wave PERGB-METER-FIX — node-agent now emits client-port counters:
+        # bytes_in = client->proxy upload, bytes_out = proxy->client download
+        # (billable), both family-agnostic. The old bytes_in6/bytes_out6 fields
+        # were never actually emitted (dead reads); billing stays up+down.
+        bytes_in_total = int(sample.get("bytes_in", 0))
+        bytes_out_total = int(sample.get("bytes_out", 0))
 
         last_in = account.last_polled_bytes_in
         last_out = account.last_polled_bytes_out

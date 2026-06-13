@@ -105,7 +105,10 @@ def get_accounting(
 ) -> dict[str, dict[str, int]]:
     """GET /accounting?ports=PORT[,PORT...] per design § 3.1, chunked.
 
-    Returns ``{port_str: {bytes_in, bytes_out, bytes_in6, bytes_out6}}``.
+    Returns ``{port_str: {bytes_in, bytes_out}}`` (Wave PERGB-METER-FIX —
+    client-port counters: bytes_in = client→proxy upload, bytes_out =
+    proxy→client download/billable, both family-agnostic; legacy
+    ``bytes_in6``/``bytes_out6`` egress-IPv6 fields retired).
     Requested ports are split into ``_ACCOUNTING_PORT_CHUNK``-sized batches
     (one GET each, results merged) so a large pool can't overflow the
     node-agent's URL/header limit (HTTP 431). The node-agent's defensive
